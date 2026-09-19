@@ -34,3 +34,6 @@ backend/db_export/
 backend/db_export.zip
 backend/mentoramp_backup_*.sql
 backend/mentoramp_backup_*.zip
+
+# Frontend is maintained as a separate Git repository
+/MentorAmp-frontend/
