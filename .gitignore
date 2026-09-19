@@ -1,0 +1,36 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+*.egg
+
+# Environment
+.env
+*.env.local
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Database
+*.db
+*.sqlite3
+pgdata/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data and database backups
+backend/uploads/
+backend/db_export/
+backend/db_export.zip
+backend/mentoramp_backup_*.sql
+backend/mentoramp_backup_*.zip
