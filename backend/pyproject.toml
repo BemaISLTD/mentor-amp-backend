@@ -1,5 +1,5 @@
 [project]
-name = "mentoramp"
+name = "mentoramp-backend"
 version = "0.1.0"
 description = "MentorAmp - actuarial modeling platform"
 requires-python = ">=3.11"
