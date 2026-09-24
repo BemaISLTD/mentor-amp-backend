@@ -13,6 +13,7 @@ dist/
 # IDE
 .vscode/settings.json
 .idea/
+test_data/
 
 # Testing
 .pytest_cache/
