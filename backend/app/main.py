@@ -8,6 +8,9 @@ from app.api.errors import register_exception_handlers
 from app.api.formulas import router as formulas_router
 from app.api.imports import router as imports_router
 from app.api.projects import router as projects_router
+from app.api.results import router as results_router
+from app.api.runs import router as runs_router
+from app.api.trace import router as trace_router
 from app.api.users import router as users_router
 from app.api.variables import router as variables_router
 from app.config import settings
@@ -42,6 +45,9 @@ actuarial_access = [Depends(require_roles("admin", "actuary"))]
 app.include_router(imports_router, prefix=API_PREFIX, dependencies=actuarial_access)
 app.include_router(variables_router, prefix=API_PREFIX, dependencies=actuarial_access)
 app.include_router(formulas_router, prefix=API_PREFIX, dependencies=actuarial_access)
+app.include_router(runs_router, prefix=API_PREFIX, dependencies=actuarial_access)
+app.include_router(results_router, prefix=API_PREFIX, dependencies=actuarial_access)
+app.include_router(trace_router, prefix=API_PREFIX, dependencies=actuarial_access)
 
 
 @app.get("/health", tags=["health"])

@@ -103,6 +103,24 @@ ARTIFACT_STORAGE_PATH=/app/artifacts
 CODE_VERSION=<deployment revision>
 ```
 
+### Projection Runs
+
+Authenticated users with the `admin` or `actuary` role can use:
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/runs/` | Queue a projection run |
+| `GET` | `/v1/runs/` | List and filter runs |
+| `GET` | `/v1/runs/{run_id}` | Poll run status |
+| `GET` | `/v1/runs/{run_id}/manifest` | Read the immutable input manifest |
+| `GET` | `/v1/runs/{run_id}/summary` | Read result summary metrics |
+| `GET` | `/v1/runs/{run_id}/results` | Read filtered, paginated outputs |
+| `GET` | `/v1/runs/{run_id}/events` | Read filtered debug traces |
+
+The current local adapter executes queued runs in an in-process FastAPI
+background task. A durable external worker queue is still required before
+multi-instance production deployment.
+
 ## Running Tests
 To run unit and integration tests inside the Docker container:
 ```bash

@@ -79,6 +79,32 @@ def get_artifact_store() -> LocalParquetArtifactStore:
     return LocalParquetArtifactStore(settings.artifact_storage_path)
 
 
+def read_artifact_rows(
+    db: Session,
+    run_id: str,
+    artifact_type: str,
+    store: LocalParquetArtifactStore | None = None,
+) -> list[dict[str, Any]]:
+    configured_store = store or get_artifact_store()
+    artifacts = (
+        db.query(RunArtifact)
+        .filter(
+            RunArtifact.run_id == run_id,
+            RunArtifact.artifact_type == artifact_type,
+        )
+        .order_by(RunArtifact.created_at, RunArtifact.id)
+        .all()
+    )
+    rows: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        if artifact.storage_backend != configured_store.backend_name:
+            raise ValueError(
+                f"Artifact backend '{artifact.storage_backend}' is not configured."
+            )
+        rows.extend(configured_store.read_rows(artifact.storage_uri))
+    return rows
+
+
 class RunArtifactBuffer:
     """Buffers one policy partition while preserving prior-period lookups."""
 

@@ -5,6 +5,7 @@ from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.core import artifacts
 from app.core.artifacts import LocalParquetArtifactStore, RunArtifactBuffer
 from app.core.output import storage as output_storage
 from app.core.projection_engine import runner
@@ -19,18 +20,18 @@ def test_output_buffer_writes_parquet_and_reads_results(tmp_path, monkeypatch):
     RunArtifact.__table__.create(engine)
     db = sessionmaker(bind=engine)()
     store = LocalParquetArtifactStore(tmp_path)
-    monkeypatch.setattr(output_storage, "get_artifact_store", lambda: store)
+    monkeypatch.setattr(artifacts, "get_artifact_store", lambda: store)
 
     buffer = RunArtifactBuffer("run-001", store=store)
     buffer.add_output("P001", "base", 1, "reserve", 100.5, product="fia")
     buffer.add_output("P001", "base", 2, "reserve", 110.25, product="fia")
-    artifacts = buffer.flush_policy(db, "P001")
+    written_artifacts = buffer.flush_policy(db, "P001")
     db.commit()
 
-    assert len(artifacts) == 1
-    assert artifacts[0].row_count == 2
-    assert len(artifacts[0].checksum_sha256) == 64
-    relative = artifacts[0].storage_uri.removeprefix("local://")
+    assert len(written_artifacts) == 1
+    assert written_artifacts[0].row_count == 2
+    assert len(written_artifacts[0].checksum_sha256) == 64
+    relative = written_artifacts[0].storage_uri.removeprefix("local://")
     assert (Path(tmp_path) / relative).exists()
     assert output_storage.get_output(db, "run-001", "P001", "base", 2, "reserve") == 110.25
     assert output_storage.get_run_results(db, "run-001") == [
@@ -94,7 +95,7 @@ def test_projection_runner_writes_outputs_without_run_output_rows(
         "RunArtifactBuffer",
         lambda run_id: RunArtifactBuffer(run_id, store=store),
     )
-    monkeypatch.setattr(output_storage, "get_artifact_store", lambda: store)
+    monkeypatch.setattr(artifacts, "get_artifact_store", lambda: store)
     monkeypatch.setitem(FORMULA_FUNCTIONS, "test_constant_reserve", lambda: 42.0)
 
     result = runner.run_projection(

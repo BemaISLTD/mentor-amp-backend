@@ -6,9 +6,8 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.core.artifacts import RunArtifactBuffer, get_artifact_store
+from app.core.artifacts import RunArtifactBuffer, read_artifact_rows
 from app.db.models.run import Run
-from app.db.models.run_artifact import RunArtifact
 
 
 def save_output(
@@ -29,24 +28,7 @@ def save_output(
 
 
 def _output_rows(db: Session, run_id: str) -> list[dict[str, Any]]:
-    artifacts = (
-        db.query(RunArtifact)
-        .filter(
-            RunArtifact.run_id == run_id,
-            RunArtifact.artifact_type == "outputs",
-        )
-        .order_by(RunArtifact.created_at, RunArtifact.id)
-        .all()
-    )
-    store = get_artifact_store()
-    rows: list[dict[str, Any]] = []
-    for artifact in artifacts:
-        if artifact.storage_backend != store.backend_name:
-            raise ValueError(
-                f"Artifact backend '{artifact.storage_backend}' is not configured."
-            )
-        rows.extend(store.read_rows(artifact.storage_uri))
-    return rows
+    return read_artifact_rows(db, run_id, "outputs")
 
 
 def _decoded_value(row: dict[str, Any]) -> Any:
@@ -116,6 +98,8 @@ def update_run_status(db: Session, run_id: str, status: str) -> None:
     run = db.query(Run).filter(Run.id == run_id).first()
     if run:
         run.status = status
+        if status == "running" and run.started_at is None:
+            run.started_at = datetime.now(timezone.utc)
         if status in ("success", "partial_success", "failed"):
             run.completed_at = datetime.now(timezone.utc)
         db.flush()
