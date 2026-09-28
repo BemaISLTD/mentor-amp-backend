@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     jwt_secret_key: str = DEVELOPMENT_JWT_SECRET
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
+    artifact_storage_backend: str = "local"
+    artifact_storage_path: Path = (
+        Path(__file__).resolve().parent.parent / "artifacts"
+    )
+    code_version: str = "development"
 
     @model_validator(mode="after")
     def reject_development_secret_in_production(self):

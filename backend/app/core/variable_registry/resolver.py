@@ -5,6 +5,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.variable_registry.registry import get_by_name
+from app.core.artifacts import RunArtifactBuffer
 from app.db.models.assumption import AssumptionTable
 from app.db.models.factor import FactorTable
 from app.db.models.inforce import InforceRecord
@@ -97,10 +98,23 @@ def _scenario_lookup(db: Session, scenario_id: str, variable_name: str, context:
     return None
 
 
-def _prior_period_lookup(db: Session, variable_name: str, context: ProjectionContext, offset: int = 1) -> Any:
+def _prior_period_lookup(
+    db: Session,
+    variable_name: str,
+    context: ProjectionContext,
+    offset: int = 1,
+    output_buffer: RunArtifactBuffer | None = None,
+) -> Any:
     prev_month = context.projection_month - offset
     if prev_month < 0:
         return None
+    if output_buffer is not None:
+        return output_buffer.get_output(
+            context.policy_id,
+            context.scenario_id,
+            prev_month,
+            variable_name,
+        )
     output = db.query(RunOutput).filter(
         RunOutput.run_id == context.run_id,
         RunOutput.policy_id == context.policy_id,
@@ -118,6 +132,7 @@ def resolve(
     context: ProjectionContext,
     db: Session,
     trace_logger=None,
+    output_buffer: RunArtifactBuffer | None = None,
 ) -> VariableResolutionResult:
     definition = get_by_name(db, variable_name)
 
@@ -172,15 +187,19 @@ def resolve(
 
         elif source_type == "prior_output":
             offset = _get_source_attr(source, "offset_periods", 1)
-            value = _prior_period_lookup(db, variable_name, context, offset)
-            source_table = "run_outputs"
+            value = _prior_period_lookup(
+                db, variable_name, context, offset, output_buffer=output_buffer
+            )
+            source_table = "run_artifacts"
 
         elif source_type == "manual":
             value = _get_source_attr(source, "value")
             source_table = "manual"
 
         elif source_type == "formula":
-            value = _prior_period_lookup(db, variable_name, context, offset=0)
+            value = _prior_period_lookup(
+                db, variable_name, context, offset=0, output_buffer=output_buffer
+            )
             source_table = "formula_output"
 
         else:

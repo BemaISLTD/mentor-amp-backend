@@ -88,6 +88,21 @@ curl -X POST http://localhost:8001/v1/auth/token \
 
 Set a unique `JWT_SECRET_KEY` of at least 32 bytes whenever `DEBUG=false`.
 
+### Analytical Artifact Storage
+
+Projection outputs and debug traces are written as compressed Parquet files.
+PostgreSQL stores immutable run manifests and artifact metadata rather than
+individual calculated values.
+
+Local Docker development uses `/app/artifacts`, backed by the ignored
+`backend/artifacts/` workspace directory. Configure it with:
+
+```text
+ARTIFACT_STORAGE_BACKEND=local
+ARTIFACT_STORAGE_PATH=/app/artifacts
+CODE_VERSION=<deployment revision>
+```
+
 ## Running Tests
 To run unit and integration tests inside the Docker container:
 ```bash

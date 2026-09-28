@@ -19,8 +19,8 @@ it is considered complete.
 | Error contract | Default FastAPI `detail` responses were used | **Complete:** standardized error envelope added |
 | Projects | POST and GET only | **Complete:** PATCH and DELETE added |
 | Run APIs | `runs.py`, `results.py`, and `trace.py` are empty | Open |
-| Large outputs | `run_outputs` and `trace_logs` use PostgreSQL | Open; replace before production run APIs |
-| Run manifests | Runs do not snapshot inputs/configuration | Open |
+| Large outputs | Runner previously wrote outputs and traces to PostgreSQL | **In progress:** runner now writes Parquet; legacy tables remain |
+| Run manifests | Runs did not snapshot inputs/configuration | **Complete:** immutable version snapshot added |
 | Reconciliation | No service, persistence, or API exists | Open |
 
 ## 1. Environment, Recovery, and Testing
@@ -95,13 +95,13 @@ it is considered complete.
 > This is the primary architectural risk. The analytical storage boundary must
 > be completed before production run/result/trace APIs are built.
 
-- **[REPLACE] PostgreSQL `run_outputs` and `trace_logs` — OPEN**
+- **[REPLACE] PostgreSQL `run_outputs` and `trace_logs` — IN PROGRESS**
   - Write compressed, partitioned Parquet to a local data lake or S3-compatible
     object storage. Keep only metadata, locations, fingerprints, and summaries
     in PostgreSQL.
   - Define an interface supporting local development and production object
     storage without changing engine code.
-- **[BUILD] Immutable Run Manifests — OPEN**
+- **[BUILD] Immutable Run Manifests — COMPLETE**
   - Snapshot data-file, assumption, factor, scenario, formula/model, code, and
     storage versions when a run is queued.
 - **[BUILD] Run, Result, and Trace APIs — BLOCKED BY STORAGE/MANIFESTS**
@@ -118,7 +118,8 @@ it is considered complete.
 2. Users/RBAC schema, authentication endpoints, JWT configuration, and router
    authorization tests. **Complete.**
 3. Audit logs and project actor fields. **Complete.**
-4. Local/S3 Parquet storage interface and immutable run manifests.
+4. Local/S3 Parquet storage interface and immutable run manifests. **In progress:**
+   local Parquet and manifests are complete; S3 and legacy table removal remain.
 5. Run, status, result, trace, and reconciliation services.
 6. Product, asset, workflow, reporting, dashboard, and record-viewer domains.
 7. Conditional `/files` and `/tables` adapters after frontend confirmation.
@@ -144,4 +145,6 @@ Before an item moves to complete, record:
 - Authentication tests: `backend/tests/integration/test_auth_api.py`
 - Audit migration: `backend/app/db/migrations/versions/7c3f19ad0e82_add_audit_logging.py`
 - Audit API: `backend/app/api/audit_logs.py`
+- Artifact metadata migration: `backend/app/db/migrations/versions/91b4e26d7fa0_add_run_manifests_and_artifacts.py`
+- Parquet storage tests: `backend/tests/unit/test_artifact_storage.py`
 - Verification command: `docker compose exec -T api pytest -q`

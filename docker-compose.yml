@@ -27,6 +27,9 @@ services:
       - APP_NAME=MentorAmp
       - DEBUG=true
       - JWT_SECRET_KEY=development-only-change-me-at-least-32-bytes
+      - ARTIFACT_STORAGE_BACKEND=local
+      - ARTIFACT_STORAGE_PATH=/app/artifacts
+      - CODE_VERSION=development
     volumes:
       # Mount the local backend folder to /app for hot-reloading
       - ./backend:/app
