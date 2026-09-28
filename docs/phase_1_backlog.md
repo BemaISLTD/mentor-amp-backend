@@ -18,7 +18,7 @@ it is considered complete.
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
 | Error contract | Default FastAPI `detail` responses were used | **Complete:** standardized error envelope added |
 | Projects | POST and GET only | **Complete:** PATCH and DELETE added |
-| Run APIs | `runs.py`, `results.py`, and `trace.py` are empty | Open |
+| Run APIs | `runs.py`, `results.py`, and `trace.py` were empty | **Complete for local execution:** queue, status, manifest, result, summary, and trace APIs added |
 | Large outputs | Runner previously wrote outputs and traces to PostgreSQL | **In progress:** runner now writes Parquet; legacy tables remain |
 | Run manifests | Runs did not snapshot inputs/configuration | **Complete:** immutable version snapshot added |
 | Reconciliation | No service, persistence, or API exists | Open |
@@ -104,9 +104,11 @@ it is considered complete.
 - **[BUILD] Immutable Run Manifests — COMPLETE**
   - Snapshot data-file, assumption, factor, scenario, formula/model, code, and
     storage versions when a run is queued.
-- **[BUILD] Run, Result, and Trace APIs — BLOCKED BY STORAGE/MANIFESTS**
+- **[BUILD] Run, Result, and Trace APIs — COMPLETE FOR LOCAL EXECUTION**
   - Build execution, status polling, summary, cashflow, event, and trace
     endpoints after the target persistence boundary exists.
+  - Replace the in-process background-task adapter with a durable worker queue
+    before multi-instance production deployment.
 - **[BUILD] Reconciliation Service — BLOCKED BY ANALYTICAL STORAGE**
   - Compare prior/current output datasets and return reserve bridges and exact
     variance components.
@@ -120,7 +122,8 @@ it is considered complete.
 3. Audit logs and project actor fields. **Complete.**
 4. Local/S3 Parquet storage interface and immutable run manifests. **In progress:**
    local Parquet and manifests are complete; S3 and legacy table removal remain.
-5. Run, status, result, trace, and reconciliation services.
+5. Run, status, result, and trace APIs. **Complete for local execution.**
+   Durable workers and reconciliation remain open.
 6. Product, asset, workflow, reporting, dashboard, and record-viewer domains.
 7. Conditional `/files` and `/tables` adapters after frontend confirmation.
 
