@@ -10,6 +10,7 @@ from app.db.models.formula_dependency import FormulaDependency  # noqa: F401
 from app.db.models.run import Run  # noqa: F401
 from app.db.models.run_output import RunOutput  # noqa: F401
 from app.db.models.trace_log import TraceLog  # noqa: F401
+from app.db.models.audit_log import AuditLog  # noqa: F401
 from app.db.models.user import (  # noqa: F401
     Permission,
     Role,

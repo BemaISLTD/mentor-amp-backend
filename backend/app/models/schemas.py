@@ -249,6 +249,8 @@ class ProjectResponse(BaseModel):
     id: str
     name: str
     description: Optional[str] = None
+    created_by: Optional[str] = None
+    updated_by: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     model_config = {"from_attributes": True}

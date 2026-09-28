@@ -67,11 +67,13 @@ it is considered complete.
 - **[BUILD] User and RBAC Schemas — COMPLETE**
   - Build `users`, `roles`, `permissions`, `user_roles`, and
     `role_permissions` with uniqueness and foreign-key constraints.
-- **[BUILD] Audit Logs — OPEN**
+- **[BUILD] Audit Logs — COMPLETE**
   - Track actor, action, entity, before/after values, and timestamp for metadata
     mutations.
-- **[IMPROVE] Actor Audit Fields — BLOCKED BY USERS**
-  - Add `created_by` and `updated_by` to auditable metadata after users exist.
+- **[IMPROVE] Actor Audit Fields — IN PROGRESS**
+  - Projects now record `created_by` and `updated_by`. Extend the same contract
+    to the remaining auditable actuarial metadata as their mutation APIs are
+    implemented.
 - **[IMPROVE] Soft Deletes — OPEN**
   - Define retention rules and add `deleted_at` to auditable actuarial metadata;
     avoid accidental hard deletion of governed records.
@@ -115,7 +117,7 @@ it is considered complete.
    endpoint tests. **Complete.**
 2. Users/RBAC schema, authentication endpoints, JWT configuration, and router
    authorization tests. **Complete.**
-3. Audit logs and actor fields.
+3. Audit logs and project actor fields. **Complete.**
 4. Local/S3 Parquet storage interface and immutable run manifests.
 5. Run, status, result, trace, and reconciliation services.
 6. Product, asset, workflow, reporting, dashboard, and record-viewer domains.
@@ -140,4 +142,6 @@ Before an item moves to complete, record:
 - Contract tests: `backend/tests/integration/test_api_contract.py`
 - Auth/RBAC migration: `backend/app/db/migrations/versions/2f6d51e920a4_add_users_and_rbac.py`
 - Authentication tests: `backend/tests/integration/test_auth_api.py`
+- Audit migration: `backend/app/db/migrations/versions/7c3f19ad0e82_add_audit_logging.py`
+- Audit API: `backend/app/api/audit_logs.py`
 - Verification command: `docker compose exec -T api pytest -q`

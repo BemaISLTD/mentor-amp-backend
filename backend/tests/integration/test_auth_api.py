@@ -7,6 +7,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db.database import get_db
+from app.db.models.audit_log import AuditLog
 from app.db.models.user import Permission, Role, User, role_permissions, user_roles
 from app.main import app
 
@@ -22,6 +23,7 @@ def auth_client():
         table.create(engine)
     user_roles.create(engine)
     role_permissions.create(engine)
+    AuditLog.__table__.create(engine)
     session = sessionmaker(bind=engine)()
 
     def override_get_db():
@@ -112,6 +114,16 @@ def test_admin_can_create_and_list_actuary(auth_client):
         "actuary@example.com",
     }
 
+    audit_response = auth_client.get("/v1/audit-logs/", headers=headers)
+    assert audit_response.status_code == 200
+    audit_body = audit_response.json()
+    assert audit_body["total"] == 2
+    assert {entry["action"] for entry in audit_body["entries"]} == {"user.created"}
+    assert {entry["context"]["source"] for entry in audit_body["entries"]} == {
+        "bootstrap",
+        "admin",
+    }
+
 
 def test_actuary_cannot_access_admin_user_list(auth_client):
     admin_token = _bootstrap_and_login(auth_client)
@@ -140,3 +152,8 @@ def test_actuary_cannot_access_admin_user_list(auth_client):
 
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "FORBIDDEN"
+
+    audit_response = auth_client.get(
+        "/v1/audit-logs/", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert audit_response.status_code == 403

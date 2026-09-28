@@ -8,6 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db.database import get_db
+from app.db.models.audit_log import AuditLog
 from app.db.models.project import Project
 from app.api.dependencies import get_current_user
 from app.main import app
@@ -21,6 +22,7 @@ def db_session():
         poolclass=StaticPool,
     )
     Project.__table__.create(engine)
+    AuditLog.__table__.create(engine)
     session = sessionmaker(bind=engine)()
     try:
         yield session
@@ -43,7 +45,7 @@ def client(db_session):
     app.dependency_overrides.clear()
 
 
-def test_projects_crud_uses_v1_prefix(client):
+def test_projects_crud_uses_v1_prefix(client, db_session):
     created = client.post(
         "/v1/projects/",
         json={"name": "Valuation", "description": "Initial"},
@@ -71,6 +73,18 @@ def test_projects_crud_uses_v1_prefix(client):
             "message": f"Project with id '{project_id}' not found.",
         }
     }
+
+    entries = db_session.query(AuditLog).order_by(AuditLog.id).all()
+    assert [entry.action for entry in entries] == [
+        "project.created",
+        "project.updated",
+        "project.deleted",
+    ]
+    assert all(entry.actor_user_id == "test-user" for entry in entries)
+    assert entries[0].after_state["description"] == "Initial"
+    assert entries[1].before_state["description"] == "Initial"
+    assert entries[1].after_state["description"] == "Updated"
+    assert entries[2].after_state is None
 
 
 def test_validation_errors_use_standard_envelope(client):

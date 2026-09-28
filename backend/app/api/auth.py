@@ -7,6 +7,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
+from app.core.audit import record_audit
 from app.core.security import create_access_token, hash_password, verify_password
 from app.db.database import get_db
 from app.db.models.user import Permission, Role, User
@@ -84,6 +85,21 @@ def bootstrap_admin(payload: BootstrapAdminCreate, db: Session = Depends(get_db)
         roles=[roles["admin"]],
     )
     db.add(user)
+    db.flush()
+    record_audit(
+        db,
+        actor_user_id=user.id,
+        action="user.created",
+        entity_type="user",
+        entity_id=user.id,
+        after_state={
+            "email": user.email,
+            "full_name": user.full_name,
+            "is_active": user.is_active,
+            "roles": ["admin"],
+        },
+        context={"source": "bootstrap"},
+    )
     db.commit()
     db.refresh(user)
     return _user_response(user)

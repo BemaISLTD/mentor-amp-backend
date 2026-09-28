@@ -2,6 +2,7 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.auth import router as auth_router
+from app.api.audit_logs import router as audit_logs_router
 from app.api.dependencies import get_current_user, require_roles
 from app.api.errors import register_exception_handlers
 from app.api.formulas import router as formulas_router
@@ -31,6 +32,7 @@ register_exception_handlers(app)
 API_PREFIX = "/v1"
 app.include_router(auth_router, prefix=API_PREFIX)
 app.include_router(users_router, prefix=API_PREFIX)
+app.include_router(audit_logs_router, prefix=API_PREFIX)
 app.include_router(
     projects_router,
     prefix=API_PREFIX,
