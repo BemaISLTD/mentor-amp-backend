@@ -1,10 +1,14 @@
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.projects import router as projects_router
-from app.api.imports import router as imports_router
-from app.api.variables import router as variables_router
+from app.api.auth import router as auth_router
+from app.api.dependencies import get_current_user, require_roles
+from app.api.errors import register_exception_handlers
 from app.api.formulas import router as formulas_router
+from app.api.imports import router as imports_router
+from app.api.projects import router as projects_router
+from app.api.users import router as users_router
+from app.api.variables import router as variables_router
 from app.config import settings
 
 app = FastAPI(
@@ -22,10 +26,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(projects_router)
-app.include_router(imports_router)
-app.include_router(variables_router)
-app.include_router(formulas_router)
+register_exception_handlers(app)
+
+API_PREFIX = "/v1"
+app.include_router(auth_router, prefix=API_PREFIX)
+app.include_router(users_router, prefix=API_PREFIX)
+app.include_router(
+    projects_router,
+    prefix=API_PREFIX,
+    dependencies=[Depends(get_current_user)],
+)
+actuarial_access = [Depends(require_roles("admin", "actuary"))]
+app.include_router(imports_router, prefix=API_PREFIX, dependencies=actuarial_access)
+app.include_router(variables_router, prefix=API_PREFIX, dependencies=actuarial_access)
+app.include_router(formulas_router, prefix=API_PREFIX, dependencies=actuarial_access)
 
 
 @app.get("/health", tags=["health"])

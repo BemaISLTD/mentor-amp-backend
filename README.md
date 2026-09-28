@@ -61,12 +61,35 @@ If you prefer to run the API directly on your machine, you can use a virtual env
 
 ### Accessing the API
 - **Base API URL:** `http://localhost:8001` (Docker) or `http://localhost:8000` (Local)
+- **Versioned API prefix:** `/v1` (for example, `GET /v1/projects/`)
+- **Health check:** `GET /health` (intentionally unversioned for infrastructure probes)
 - **Swagger Documentation:** `http://localhost:8001/docs` (Docker) or `http://localhost:8000/docs` (Local)
+
+### Initial Administrator and Authentication
+
+On a new database, create the first administrator once:
+
+```bash
+curl -X POST http://localhost:8001/v1/auth/bootstrap \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","full_name":"Admin User","password":"replace-with-a-secure-password"}'
+```
+
+After the first user exists, the bootstrap endpoint returns `409` and only an
+administrator can create additional users through `POST /v1/users/`.
+
+Obtain a bearer token using OAuth2 form fields (`username` is the email):
+
+```bash
+curl -X POST http://localhost:8001/v1/auth/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=admin@example.com&password=replace-with-a-secure-password"
+```
+
+Set a unique `JWT_SECRET_KEY` of at least 32 bytes whenever `DEBUG=false`.
 
 ## Running Tests
 To run unit and integration tests inside the Docker container:
 ```bash
 docker-compose exec -T api pytest
 ```
-
-

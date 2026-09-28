@@ -23,9 +23,10 @@ services:
     depends_on:
       - db
     environment:
-      - DATABASE_URL=postgresql://user:password@db:5432/mentor_amp
+      - DATABASE_URL=postgresql+psycopg2://user:password@db:5432/mentor_amp
       - APP_NAME=MentorAmp
       - DEBUG=true
+      - JWT_SECRET_KEY=development-only-change-me-at-least-32-bytes
     volumes:
       # Mount the local backend folder to /app for hot-reloading
       - ./backend:/app

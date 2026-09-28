@@ -1,71 +1,143 @@
 # Phase 1: Actionable Backlog
 
-This document serves as the final deliverable for Phase 0 (Day 5). It compiles all the gaps discovered during our Verify -> Compare -> Classify process into an extensive, detailed, yet easy-to-understand backlog.
+This document is the consolidated Phase 1 backlog produced from the Phase 0
+task document, the API/database/persistence assessments in `test_data/`, and a
+verification of the live backend source on 2026-09-28.
 
-The goal of Phase 1 is to close the gap between the backend's current state and the Launch Release 1.0 requirements defined by the frontend team.
+The goal is to close the gap between the current backend and the Launch Release
+1.0 requirements. Each item must be re-verified with executable evidence before
+it is considered complete.
 
----
+## Verified Baseline
 
-## 1. Environment & Testing
+| Area | Verified state | Status |
+| --- | --- | --- |
+| Tests | Original `test_*.py` modules are empty placeholders | Test suite remains open; first API tests added |
+| Seed data | No seed script exists | Open |
+| Authentication/RBAC | No auth dependency or user/RBAC models existed | **Complete:** JWT and role enforcement implemented |
+| API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
+| Error contract | Default FastAPI `detail` responses were used | **Complete:** standardized error envelope added |
+| Projects | POST and GET only | **Complete:** PATCH and DELETE added |
+| Run APIs | `runs.py`, `results.py`, and `trace.py` are empty | Open |
+| Large outputs | `run_outputs` and `trace_logs` use PostgreSQL | Open; replace before production run APIs |
+| Run manifests | Runs do not snapshot inputs/configuration | Open |
+| Reconciliation | No service, persistence, or API exists | Open |
 
-> [!TIP]
-> **Context:** The environment is mostly healthy, but testing is completely absent.
+## 1. Environment, Recovery, and Testing
 
-*   **[BUILD] Implement the Pytest Suite**
-    *   **Detail:** The `pytest` command currently returns `0 items collected`. We must build out a full test suite covering database connectivity, model validation, and API endpoint behavior.
-*   **[IMPROVE] Database Seeding Scripts**
-    *   **Detail:** There are currently no scripts to seed the database with mock users, products, or roles. We need to write a `seed.py` script so developers can instantly spin up a populated local environment.
+- **[BUILD] Implement the Pytest Suite — IN PROGRESS**
+  - Build coverage for database connectivity, migrations, model constraints,
+    validation, authentication/authorization, API behavior, engine behavior,
+    and golden policies.
+  - Current evidence: API contract and authentication suites;
+    `docker compose exec -T api pytest -q` returned `7 passed`.
+- **[IMPROVE] Database Seeding Scripts — OPEN**
+  - Add an idempotent `seed.py` using synthetic users, roles, permissions,
+    projects, products, and representative actuarial metadata.
+- **[IMPROVE] Upload Recovery — OPEN**
+  - Define transaction boundaries and cleanup behavior for partially failed
+    uploads, including orphaned local/object-storage files.
 
----
+## 2. API Contract and Security
 
-## 2. API Contract & Security
+- **[BUILD] Global Authentication and Authorization (JWT) — COMPLETE**
+  - Build users/RBAC persistence, token issuance, `/v1/auth/me`, and `/v1/users`.
+  - Require authenticated users on public application routers and restrict
+    uploads/run execution to actuary/admin roles.
+- **[IMPROVE] API Versioning and Error Handling — COMPLETE**
+  - Public application routers are mounted below `/v1`.
+  - Errors use `{"error": {"code": "...", "message": "..."}}`, with optional
+    structured details.
+- **[IMPROVE] Project Mutation Endpoints — COMPLETE**
+  - Added `PATCH /v1/projects/{project_id}` and
+    `DELETE /v1/projects/{project_id}`.
+- **[BUILD] File Record Viewers — OPEN**
+  - Add paginated, filterable record endpoints suitable for spreadsheet-style
+    viewers. Define safe filter operators and maximum page sizes.
+- **[BUILD] Dashboard Contract — OPEN**
+  - Build `GET /v1/dashboard/stats` or explicitly defer it in the Launch 1.0
+    frontend contract.
+- **[CONDITIONAL] `/imports` to `/files` Adapter — DEFERRED**
+  - Implement only after the frontend architecture is finalized.
+- **[CONDITIONAL] `/formulas` to `/tables` Adapter — DEFERRED**
+  - Implement only after the frontend architecture is finalized.
 
-> [!WARNING]
-> **Context:** The API currently has zero security, no versioning, and several major missing domains.
+## 3. Database Schema and Governance
 
-*   **[BUILD] Global Authentication & Authorization (JWT)**
-    *   **Detail:** Every endpoint is completely open to the public. Implement an OAuth2/JWT middleware and a `/auth/me` endpoint. Secure all routers so that only authenticated actuaries/admins can trigger runs or upload files.
-*   **[IMPROVE] API Versioning & Error Handling**
-    *   **Detail:** Move all endpoints under a `/v1/` prefix (e.g., `/v1/projects`). Implement a global Exception Handler so that when the backend throws an error, it returns a standardized JSON payload (e.g., `{"error": {"code": "NOT_FOUND", "message": "..."}}`) that the frontend can reliably parse.
-*   **[BUILD] File Record Viewers**
-    *   **Detail:** Any UI will require spreadsheet-style modal viewers to look at individual rows of data. We must build pagination and filtering to support this.
+- **[BUILD] User and RBAC Schemas — COMPLETE**
+  - Build `users`, `roles`, `permissions`, `user_roles`, and
+    `role_permissions` with uniqueness and foreign-key constraints.
+- **[BUILD] Audit Logs — OPEN**
+  - Track actor, action, entity, before/after values, and timestamp for metadata
+    mutations.
+- **[IMPROVE] Actor Audit Fields — BLOCKED BY USERS**
+  - Add `created_by` and `updated_by` to auditable metadata after users exist.
+- **[IMPROVE] Soft Deletes — OPEN**
+  - Define retention rules and add `deleted_at` to auditable actuarial metadata;
+    avoid accidental hard deletion of governed records.
+- **[BUILD] Products and Assets — OPEN**
+  - Build `products`, `asset_positions`, and `product_mappings`.
+- **[BUILD] Actuarial Workflows — OPEN**
+  - Build `rollforward_templates`, `rollforward_jobs`, and `rollforward_steps`.
+- **[BUILD] Reporting Metadata — OPEN**
+  - Build metadata persistence for reports and derived datasets; large report
+    bodies belong in analytical storage.
+- **[BUILD] Execution Metadata — OPEN**
+  - Add `run_steps`; decide whether projection keys require a normalized model.
+- **[BUILD] Model Versioning — OPEN**
+  - Add model-level version tracking beyond individual formula versions.
 
-> [!NOTE]
-> **Frontend Dependent API Refactors:** The following refactors were identified to match the existing frontend mock API. If the current frontend is scrapped, these namespaces (`/imports` and `/formulas`) can likely remain as they are, and the new UI can simply adapt to the backend's current structure.
-
-*   **[REPLACE] Refactor `/imports` to `/files` Data Manager** (Conditional)
-    *   **Detail:** The backend uses isolated routes (`/imports/inforce`). The old frontend expects a unified Data Manager API (`/files`). 
-*   **[REFACTOR] Refactor `/formulas` to `/tables` Registry** (Conditional)
-    *   **Detail:** The backend built a `/formulas` namespace, but the old frontend expects an interactive Actuarial Table Registry at `/tables`. 
-
----
-
-## 3. Database Schema & Domain Modeling
-
-> [!IMPORTANT]
-> **Context:** The database schema is missing several critical domain areas required by the product specs.
-
-*   **[BUILD] User & RBAC Schemas**
-    *   **Detail:** Build the `users`, `roles`, and `permissions` tables required to support the new Authentication API.
-*   **[BUILD] Products & Assets Schemas**
-    *   **Detail:** Build the `products`, `asset_positions`, and `product_mappings` tables so the frontend can populate its Product Mix and Dashboard charts.
-*   **[BUILD] Actuarial Workflow Schemas**
-    *   **Detail:** Build the `rollforward_templates`, `rollforward_jobs`, and `rollforward_steps` tables to support automated month-end reporting workflows.
-*   **[BUILD] Audit Logs**
-    *   **Detail:** Create a system-wide `audit_logs` table to track who modified what (e.g., "User A updated Assumption B at 10:00 AM").
-
----
-
-## 4. Actuarial Execution & Big Data (The "Run" Engine)
+## 4. Actuarial Execution and Large Data
 
 > [!CAUTION]
-> **Context:** This is the most critical architectural risk. If left as-is, the engine will crash the PostgreSQL database at scale.
+> This is the primary architectural risk. The analytical storage boundary must
+> be completed before production run/result/trace APIs are built.
 
-*   **[REPLACE] Offload `run_outputs` and `trace_logs` to Parquet/S3**
-    *   **Detail:** Currently, the database tries to write cashflow outputs and debug traces as individual rows in PostgreSQL. At production scale, this will generate billions of rows and crash the database. We MUST remove these tables from PostgreSQL and re-architect the engine to write compressed Parquet files directly to S3 or a local data lake.
-*   **[BUILD] Missing Execution APIs**
-    *   **Detail:** The `runs.py`, `results.py`, and `trace.py` files exist but have 0 bytes of code. We must build the actual endpoints that trigger projection runs, check their status, and fetch the resulting cashflows.
-*   **[BUILD] Run Manifests (Reproducibility)**
-    *   **Detail:** When a run is executed, the `runs` table must lock in a "Manifest"—an immutable snapshot of the exact data file versions and assumption versions used. This guarantees that if an assumption is changed later, old runs remain perfectly reproducible.
-*   **[BUILD] Reconciliation Service (Reserve Bridges)**
-    *   **Detail:** The frontend requires a "Prior vs Current" variance report. We must build a reconciliation engine that can compare two Parquet output datasets and calculate the exact financial variance between them.
+- **[REPLACE] PostgreSQL `run_outputs` and `trace_logs` — OPEN**
+  - Write compressed, partitioned Parquet to a local data lake or S3-compatible
+    object storage. Keep only metadata, locations, fingerprints, and summaries
+    in PostgreSQL.
+  - Define an interface supporting local development and production object
+    storage without changing engine code.
+- **[BUILD] Immutable Run Manifests — OPEN**
+  - Snapshot data-file, assumption, factor, scenario, formula/model, code, and
+    storage versions when a run is queued.
+- **[BUILD] Run, Result, and Trace APIs — BLOCKED BY STORAGE/MANIFESTS**
+  - Build execution, status polling, summary, cashflow, event, and trace
+    endpoints after the target persistence boundary exists.
+- **[BUILD] Reconciliation Service — BLOCKED BY ANALYTICAL STORAGE**
+  - Compare prior/current output datasets and return reserve bridges and exact
+    variance components.
+
+## Implementation Order
+
+1. API foundation: versioning, error contract, project mutations, and initial
+   endpoint tests. **Complete.**
+2. Users/RBAC schema, authentication endpoints, JWT configuration, and router
+   authorization tests. **Complete.**
+3. Audit logs and actor fields.
+4. Local/S3 Parquet storage interface and immutable run manifests.
+5. Run, status, result, trace, and reconciliation services.
+6. Product, asset, workflow, reporting, dashboard, and record-viewer domains.
+7. Conditional `/files` and `/tables` adapters after frontend confirmation.
+
+## Completion Requirements for Every Item
+
+Before an item moves to complete, record:
+
+- owner and dependencies;
+- acceptance criteria tied to a Launch 1.0 requirement;
+- migration/API compatibility impact;
+- automated test or reproducible verification command;
+- implementation and evidence paths;
+- follow-up risks or explicitly deferred behavior.
+
+## Current Evidence
+
+- Versioned routes: `backend/app/main.py`
+- Standard error handlers: `backend/app/api/errors.py`
+- Project PATCH/DELETE: `backend/app/api/projects.py`
+- Contract tests: `backend/tests/integration/test_api_contract.py`
+- Auth/RBAC migration: `backend/app/db/migrations/versions/2f6d51e920a4_add_users_and_rbac.py`
+- Authentication tests: `backend/tests/integration/test_auth_api.py`
+- Verification command: `docker compose exec -T api pytest -q`
