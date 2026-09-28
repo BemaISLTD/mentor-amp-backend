@@ -12,6 +12,7 @@ from app.db.models.run_output import RunOutput  # noqa: F401
 from app.db.models.trace_log import TraceLog  # noqa: F401
 from app.db.models.audit_log import AuditLog  # noqa: F401
 from app.db.models.run_artifact import RunArtifact, RunManifest  # noqa: F401
+from app.db.models.product import AssetPosition, Product, ProductMapping  # noqa: F401
 from app.db.models.user import (  # noqa: F401
     Permission,
     Role,

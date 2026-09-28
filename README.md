@@ -126,6 +126,17 @@ Reconciliation requires two completed runs from the same project. Pass the
 prior run as `baseline_run_id`; optional policy, scenario, variable, and month
 filters are applied before calculating detail variances and variable bridges.
 
+### Products and Assets
+
+Authenticated `admin` and `actuary` users can manage:
+
+- `/v1/products/` for project-scoped product definitions;
+- `/v1/products/{product_id}/mappings` for effective-dated source mappings;
+- `/v1/asset-positions/` for dated product asset positions.
+
+Product codes are unique within a project. Deletes are soft deletes and product
+deletion also retires its active mappings and asset positions.
+
 ## Running Tests
 To run unit and integration tests inside the Docker container:
 ```bash

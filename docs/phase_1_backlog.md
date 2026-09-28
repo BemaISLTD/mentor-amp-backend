@@ -71,13 +71,13 @@ it is considered complete.
   - Track actor, action, entity, before/after values, and timestamp for metadata
     mutations.
 - **[IMPROVE] Actor Audit Fields — IN PROGRESS**
-  - Projects now record `created_by` and `updated_by`. Extend the same contract
+  - Projects, products, and asset positions now record actors. Extend the same contract
     to the remaining auditable actuarial metadata as their mutation APIs are
     implemented.
-- **[IMPROVE] Soft Deletes — OPEN**
+- **[IMPROVE] Soft Deletes — IN PROGRESS**
   - Define retention rules and add `deleted_at` to auditable actuarial metadata;
     avoid accidental hard deletion of governed records.
-- **[BUILD] Products and Assets — OPEN**
+- **[BUILD] Products and Assets — COMPLETE**
   - Build `products`, `asset_positions`, and `product_mappings`.
 - **[BUILD] Actuarial Workflows — OPEN**
   - Build `rollforward_templates`, `rollforward_jobs`, and `rollforward_steps`.
@@ -124,7 +124,8 @@ it is considered complete.
    local Parquet and manifests are complete; S3 and legacy table removal remain.
 5. Run, status, result, and trace APIs. **Complete for local execution.**
    Durable workers remain open; reconciliation is complete.
-6. Product, asset, workflow, reporting, dashboard, and record-viewer domains.
+6. Product and asset domains. **Complete.** Workflow, reporting, dashboard,
+   and record-viewer domains remain open.
 7. Conditional `/files` and `/tables` adapters after frontend confirmation.
 
 ## Completion Requirements for Every Item
@@ -150,4 +151,6 @@ Before an item moves to complete, record:
 - Audit API: `backend/app/api/audit_logs.py`
 - Artifact metadata migration: `backend/app/db/migrations/versions/91b4e26d7fa0_add_run_manifests_and_artifacts.py`
 - Parquet storage tests: `backend/tests/unit/test_artifact_storage.py`
+- Products/assets migration: `backend/app/db/migrations/versions/c48a2d7159be_add_products_and_assets.py`
+- Products/assets tests: `backend/tests/integration/test_products_api.py`
 - Verification command: `docker compose exec -T api pytest -q`
