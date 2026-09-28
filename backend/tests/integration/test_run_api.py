@@ -1,5 +1,6 @@
 """Integration tests for run management and analytical read APIs."""
 
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -48,7 +49,7 @@ def run_api_client(tmp_path, monkeypatch):
     def fake_manifest(db, definition):
         record = RunManifest(
             run_id=definition.id,
-            fingerprint="a" * 64,
+            fingerprint=hashlib.sha256(definition.id.encode()).hexdigest(),
             manifest={"run_definition": definition.model_dump(mode="json")},
         )
         db.add(record)
@@ -106,7 +107,7 @@ def test_queue_list_detail_and_manifest(run_api_client):
 
     manifest = client.get(f"/v1/runs/{run_id}/manifest")
     assert manifest.status_code == 200
-    assert manifest.json()["fingerprint"] == "a" * 64
+    assert len(manifest.json()["fingerprint"]) == 64
     assert session.query(AuditLog).filter(AuditLog.action == "run.queued").count() == 1
 
 
@@ -164,3 +165,49 @@ def test_queue_rejects_unknown_project(run_api_client):
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_reconciliation_compares_completed_runs(run_api_client):
+    client, session, store = run_api_client
+    baseline_id = _queue_run(client)
+    current_id = _queue_run(client)
+
+    baseline = RunArtifactBuffer(baseline_id, store=store)
+    baseline.add_output("P001", "base", 1, "reserve", 100.0)
+    baseline.add_output("P001", "base", 2, "reserve", 120.0)
+    baseline.flush_policy(session, "P001")
+
+    current = RunArtifactBuffer(current_id, store=store)
+    current.add_output("P001", "base", 1, "reserve", 110.0)
+    current.add_output("P001", "base", 2, "reserve", 120.0)
+    current.flush_policy(session, "P001")
+
+    for run_id in (baseline_id, current_id):
+        session.query(Run).filter(Run.id == run_id).one().status = "success"
+    session.commit()
+
+    response = client.get(
+        f"/v1/runs/{current_id}/reports/reconciliation",
+        params={"baseline_run_id": baseline_id, "variable": "reserve"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"]["changed_points"] == 1
+    assert body["summary"]["unchanged_points"] == 1
+    assert body["total"] == 2
+    assert body["bridges"][0]["variance"] == 10.0
+
+
+def test_reconciliation_requires_completed_runs(run_api_client):
+    client, _, _ = run_api_client
+    baseline_id = _queue_run(client)
+    current_id = _queue_run(client)
+
+    response = client.get(
+        f"/v1/runs/{current_id}/reports/reconciliation",
+        params={"baseline_run_id": baseline_id},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "CONFLICT"
