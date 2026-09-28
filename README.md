@@ -116,10 +116,15 @@ Authenticated users with the `admin` or `actuary` role can use:
 | `GET` | `/v1/runs/{run_id}/summary` | Read result summary metrics |
 | `GET` | `/v1/runs/{run_id}/results` | Read filtered, paginated outputs |
 | `GET` | `/v1/runs/{run_id}/events` | Read filtered debug traces |
+| `GET` | `/v1/runs/{run_id}/reports/reconciliation` | Compare against a baseline run |
 
 The current local adapter executes queued runs in an in-process FastAPI
 background task. A durable external worker queue is still required before
 multi-instance production deployment.
+
+Reconciliation requires two completed runs from the same project. Pass the
+prior run as `baseline_run_id`; optional policy, scenario, variable, and month
+filters are applied before calculating detail variances and variable bridges.
 
 ## Running Tests
 To run unit and integration tests inside the Docker container:

@@ -21,7 +21,7 @@ it is considered complete.
 | Run APIs | `runs.py`, `results.py`, and `trace.py` were empty | **Complete for local execution:** queue, status, manifest, result, summary, and trace APIs added |
 | Large outputs | Runner previously wrote outputs and traces to PostgreSQL | **In progress:** runner now writes Parquet; legacy tables remain |
 | Run manifests | Runs did not snapshot inputs/configuration | **Complete:** immutable version snapshot added |
-| Reconciliation | No service, persistence, or API exists | Open |
+| Reconciliation | No comparison service or API existed | **Complete:** deterministic on-demand comparison over immutable artifacts |
 
 ## 1. Environment, Recovery, and Testing
 
@@ -109,7 +109,7 @@ it is considered complete.
     endpoints after the target persistence boundary exists.
   - Replace the in-process background-task adapter with a durable worker queue
     before multi-instance production deployment.
-- **[BUILD] Reconciliation Service — BLOCKED BY ANALYTICAL STORAGE**
+- **[BUILD] Reconciliation Service — COMPLETE**
   - Compare prior/current output datasets and return reserve bridges and exact
     variance components.
 
@@ -123,7 +123,7 @@ it is considered complete.
 4. Local/S3 Parquet storage interface and immutable run manifests. **In progress:**
    local Parquet and manifests are complete; S3 and legacy table removal remain.
 5. Run, status, result, and trace APIs. **Complete for local execution.**
-   Durable workers and reconciliation remain open.
+   Durable workers remain open; reconciliation is complete.
 6. Product, asset, workflow, reporting, dashboard, and record-viewer domains.
 7. Conditional `/files` and `/tables` adapters after frontend confirmation.
 
