@@ -12,12 +12,12 @@ it is considered complete.
 
 | Area | Verified state | Status |
 | --- | --- | --- |
-| Tests | Original `test_*.py` modules are empty placeholders | Test suite remains open; first API tests added |
+| Tests | Original `test_*.py` modules are empty placeholders | Test suite remains open; 12 API tests added |
 | Seed data | No seed script exists | Open |
-| Authentication/RBAC | No auth dependency or user/RBAC models existed | **Complete:** JWT and role enforcement implemented |
+| Authentication/RBAC | No auth dependency or user/RBAC models existed | **In progress:** JWT, admin/actuary roles, and permission enforcement implemented; expanded role matrix pending |
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
 | Error contract | Default FastAPI `detail` responses were used | **Complete:** standardized error envelope added |
-| Projects | POST and GET only | **Complete:** PATCH and DELETE added |
+| Projects | POST and GET only | **In progress:** PATCH added; destructive DELETE withheld pending an archive and retention contract |
 | Run APIs | `runs.py`, `results.py`, and `trace.py` are empty | Open |
 | Large outputs | `run_outputs` and `trace_logs` use PostgreSQL | Open; replace before production run APIs |
 | Run manifests | Runs do not snapshot inputs/configuration | Open |
@@ -30,7 +30,7 @@ it is considered complete.
     validation, authentication/authorization, API behavior, engine behavior,
     and golden policies.
   - Current evidence: API contract and authentication suites;
-    `docker compose exec -T api pytest -q` returned `7 passed`.
+    `docker compose exec -T api pytest -q` returned `12 passed`.
 - **[IMPROVE] Database Seeding Scripts — OPEN**
   - Add an idempotent `seed.py` using synthetic users, roles, permissions,
     projects, products, and representative actuarial metadata.
@@ -40,17 +40,20 @@ it is considered complete.
 
 ## 2. API Contract and Security
 
-- **[BUILD] Global Authentication and Authorization (JWT) — COMPLETE**
+- **[BUILD] Global Authentication and Authorization (JWT) — IN PROGRESS**
   - Build users/RBAC persistence, token issuance, `/v1/auth/me`, and `/v1/users`.
-  - Require authenticated users on public application routers and restrict
-    uploads/run execution to actuary/admin roles.
+  - Project endpoints enforce stored `projects:read` and `projects:write`
+    permissions; uploads and registries remain restricted to admin/actuary roles.
+  - Define the permission matrix for model developer, reviewer, and read-only
+    roles before considering the authorization model complete.
 - **[IMPROVE] API Versioning and Error Handling — COMPLETE**
   - Public application routers are mounted below `/v1`.
   - Errors use `{"error": {"code": "...", "message": "..."}}`, with optional
     structured details.
-- **[IMPROVE] Project Mutation Endpoints — COMPLETE**
-  - Added `PATCH /v1/projects/{project_id}` and
-    `DELETE /v1/projects/{project_id}`.
+- **[IMPROVE] Project Mutation Endpoints — IN PROGRESS**
+  - Added permission-protected `PATCH /v1/projects/{project_id}`.
+  - Permanent project deletion is not exposed. Define an audited archive or
+    soft-delete lifecycle and retention policy before adding removal behavior.
 - **[BUILD] File Record Viewers — OPEN**
   - Add paginated, filterable record endpoints suitable for spreadsheet-style
     viewers. Define safe filter operators and maximum page sizes.
@@ -112,9 +115,10 @@ it is considered complete.
 ## Implementation Order
 
 1. API foundation: versioning, error contract, project mutations, and initial
-   endpoint tests. **Complete.**
+   endpoint tests. **In progress:** project archival remains open.
 2. Users/RBAC schema, authentication endpoints, JWT configuration, and router
-   authorization tests. **Complete.**
+   authorization tests. **In progress:** the initial admin/actuary permission
+   model is enforced; the expanded role matrix remains open.
 3. Audit logs and actor fields.
 4. Local/S3 Parquet storage interface and immutable run manifests.
 5. Run, status, result, trace, and reconciliation services.
@@ -136,7 +140,7 @@ Before an item moves to complete, record:
 
 - Versioned routes: `backend/app/main.py`
 - Standard error handlers: `backend/app/api/errors.py`
-- Project PATCH/DELETE: `backend/app/api/projects.py`
+- Permission-protected project PATCH: `backend/app/api/projects.py`
 - Contract tests: `backend/tests/integration/test_api_contract.py`
 - Auth/RBAC migration: `backend/app/db/migrations/versions/2f6d51e920a4_add_users_and_rbac.py`
 - Authentication tests: `backend/tests/integration/test_auth_api.py`
