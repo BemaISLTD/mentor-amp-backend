@@ -36,14 +36,23 @@ def client(db_session):
 
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
-        id="test-user", roles=[SimpleNamespace(name="admin")]
+        id="test-user",
+        roles=[
+            SimpleNamespace(
+                name="admin",
+                permissions=[
+                    SimpleNamespace(name="projects:read"),
+                    SimpleNamespace(name="projects:write"),
+                ],
+            )
+        ],
     )
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
 
 
-def test_projects_crud_uses_v1_prefix(client):
+def test_project_create_update_and_read_use_v1_prefix(client):
     created = client.post(
         "/v1/projects/",
         json={"name": "Valuation", "description": "Initial"},
@@ -59,18 +68,17 @@ def test_projects_crud_uses_v1_prefix(client):
     assert updated.json()["name"] == "Valuation"
     assert updated.json()["description"] == "Updated"
 
-    deleted = client.delete(f"/v1/projects/{project_id}")
-    assert deleted.status_code == 204
-    assert deleted.content == b""
+    fetched = client.get(f"/v1/projects/{project_id}")
+    assert fetched.status_code == 200
+    assert fetched.json()["description"] == "Updated"
 
-    missing = client.get(f"/v1/projects/{project_id}")
-    assert missing.status_code == 404
-    assert missing.json() == {
-        "error": {
-            "code": "NOT_FOUND",
-            "message": f"Project with id '{project_id}' not found.",
-        }
-    }
+
+def test_project_delete_is_not_exposed(client):
+    created = client.post("/v1/projects/", json={"name": "Protected"})
+
+    response = client.delete(f"/v1/projects/{created.json()['id']}")
+
+    assert response.status_code == 405
 
 
 def test_validation_errors_use_standard_envelope(client):

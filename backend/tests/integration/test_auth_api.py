@@ -7,6 +7,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db.database import get_db
+from app.db.models.project import Project
 from app.db.models.user import Permission, Role, User, role_permissions, user_roles
 from app.main import app
 
@@ -22,6 +23,7 @@ def auth_client():
         table.create(engine)
     user_roles.create(engine)
     role_permissions.create(engine)
+    Project.__table__.create(engine)
     session = sessionmaker(bind=engine)()
 
     def override_get_db():
@@ -140,3 +142,99 @@ def test_actuary_cannot_access_admin_user_list(auth_client):
 
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "FORBIDDEN"
+
+
+def test_actuary_can_read_projects_but_cannot_mutate_them(auth_client):
+    admin_token = _bootstrap_and_login(auth_client)
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    created = auth_client.post(
+        "/v1/projects/",
+        headers=admin_headers,
+        json={"name": "Governed Portfolio"},
+    )
+    assert created.status_code == 201
+    project_id = created.json()["id"]
+
+    user = auth_client.post(
+        "/v1/users/",
+        headers=admin_headers,
+        json={
+            "email": "actuary@example.com",
+            "full_name": "Test Actuary",
+            "password": "actuary-secure-password",
+            "roles": ["actuary"],
+        },
+    )
+    assert user.status_code == 201
+    token = auth_client.post(
+        "/v1/auth/token",
+        data={
+            "username": "actuary@example.com",
+            "password": "actuary-secure-password",
+        },
+    ).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    assert auth_client.get("/v1/projects/", headers=headers).status_code == 200
+    assert auth_client.get(
+        f"/v1/projects/{project_id}", headers=headers
+    ).status_code == 200
+    assert auth_client.post(
+        "/v1/projects/", headers=headers, json={"name": "Disallowed"}
+    ).status_code == 403
+    assert auth_client.patch(
+        f"/v1/projects/{project_id}",
+        headers=headers,
+        json={"description": "Disallowed"},
+    ).status_code == 403
+    assert auth_client.delete(
+        f"/v1/projects/{project_id}", headers=headers
+    ).status_code == 405
+
+
+def test_invalid_bootstrap_email_returns_validation_envelope(auth_client):
+    response = auth_client.post(
+        "/v1/auth/bootstrap",
+        json={
+            "email": "not-an-email",
+            "full_name": "Initial Admin",
+            "password": "correct-horse-battery-staple",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_invalid_user_email_returns_validation_envelope(auth_client):
+    token = _bootstrap_and_login(auth_client)
+    response = auth_client.post(
+        "/v1/users/",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "email": "not-an-email",
+            "full_name": "Invalid User",
+            "password": "correct-horse-battery-staple",
+            "roles": ["actuary"],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_empty_roles_returns_validation_envelope(auth_client):
+    token = _bootstrap_and_login(auth_client)
+    response = auth_client.post(
+        "/v1/users/",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "email": "user@example.com",
+            "full_name": "Invalid User",
+            "password": "correct-horse-battery-staple",
+            "roles": [],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
