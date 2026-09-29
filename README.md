@@ -137,6 +137,14 @@ Authenticated `admin` and `actuary` users can manage:
 Product codes are unique within a project. Deletes are soft deletes and product
 deletion also retires its active mappings and asset positions.
 
+### Dashboard Statistics
+
+Authenticated `admin` and `actuary` users can request project-level statistics
+from `GET /v1/dashboard/stats?project_id={project_id}`. The response summarizes
+products, the latest asset-position snapshot, projection runs, and in-force
+file volumes. Pass `as_of_date=YYYY-MM-DD` to select a historical asset
+snapshot instead.
+
 ## Running Tests
 To run unit and integration tests inside the Docker container:
 ```bash
