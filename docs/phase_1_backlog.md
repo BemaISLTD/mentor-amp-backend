@@ -12,7 +12,7 @@ it is considered complete.
 
 | Area | Verified state | Status |
 | --- | --- | --- |
-| Tests | Original `test_*.py` modules are empty placeholders | Test suite remains open; first API tests added |
+| Tests | Original `test_*.py` modules were empty placeholders | Test suite remains open; 24 automated tests now cover implemented domains |
 | Seed data | No seed script exists | Open |
 | Authentication/RBAC | No auth dependency or user/RBAC models existed | **Complete:** JWT and role enforcement implemented |
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
@@ -54,9 +54,9 @@ it is considered complete.
 - **[BUILD] File Record Viewers — OPEN**
   - Add paginated, filterable record endpoints suitable for spreadsheet-style
     viewers. Define safe filter operators and maximum page sizes.
-- **[BUILD] Dashboard Contract — OPEN**
-  - Build `GET /v1/dashboard/stats` or explicitly defer it in the Launch 1.0
-    frontend contract.
+- **[BUILD] Dashboard Contract — COMPLETE**
+  - `GET /v1/dashboard/stats` returns project-scoped product, latest or
+    requested asset snapshot, run, and in-force file statistics.
 - **[CONDITIONAL] `/imports` to `/files` Adapter — DEFERRED**
   - Implement only after the frontend architecture is finalized.
 - **[CONDITIONAL] `/formulas` to `/tables` Adapter — DEFERRED**
@@ -124,7 +124,7 @@ it is considered complete.
    local Parquet and manifests are complete; S3 and legacy table removal remain.
 5. Run, status, result, and trace APIs. **Complete for local execution.**
    Durable workers remain open; reconciliation is complete.
-6. Product and asset domains. **Complete.** Workflow, reporting, dashboard,
+6. Product, asset, and dashboard domains. **Complete.** Workflow, reporting,
    and record-viewer domains remain open.
 7. Conditional `/files` and `/tables` adapters after frontend confirmation.
 
@@ -153,4 +153,6 @@ Before an item moves to complete, record:
 - Parquet storage tests: `backend/tests/unit/test_artifact_storage.py`
 - Products/assets migration: `backend/app/db/migrations/versions/c48a2d7159be_add_products_and_assets.py`
 - Products/assets tests: `backend/tests/integration/test_products_api.py`
+- Dashboard API: `backend/app/api/dashboard.py`
+- Dashboard tests: `backend/tests/integration/test_dashboard_api.py`
 - Verification command: `docker compose exec -T api pytest -q`
