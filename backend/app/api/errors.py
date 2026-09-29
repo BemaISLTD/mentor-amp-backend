@@ -4,6 +4,7 @@ from http import HTTPStatus
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
@@ -55,7 +56,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             content=_payload(
                 "VALIDATION_ERROR",
                 "Request validation failed.",
-                exc.errors(),
+                jsonable_encoder(exc.errors()),
             ),
         )
 

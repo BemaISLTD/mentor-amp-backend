@@ -3,11 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.auth import router as auth_router
 from app.api.audit_logs import router as audit_logs_router
+from app.api.assets import router as assets_router
 from app.api.dependencies import get_current_user, require_roles
 from app.api.errors import register_exception_handlers
 from app.api.formulas import router as formulas_router
 from app.api.imports import router as imports_router
 from app.api.projects import router as projects_router
+from app.api.products import router as products_router
 from app.api.reconciliation import router as reconciliation_router
 from app.api.results import router as results_router
 from app.api.runs import router as runs_router
@@ -54,6 +56,8 @@ app.include_router(
     prefix=API_PREFIX,
     dependencies=actuarial_access,
 )
+app.include_router(products_router, prefix=API_PREFIX, dependencies=actuarial_access)
+app.include_router(assets_router, prefix=API_PREFIX, dependencies=actuarial_access)
 
 
 @app.get("/health", tags=["health"])
