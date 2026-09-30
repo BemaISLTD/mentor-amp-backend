@@ -20,8 +20,51 @@ BUILTIN_PERMISSIONS = {
     "projects:write": "Create and modify projects.",
     "registries:read": "View actuarial registries.",
     "registries:write": "Modify actuarial registries.",
+    "imports:read": "View imported actuarial data.",
     "imports:write": "Upload actuarial data files.",
+    "runs:read": "View projection runs and results.",
     "runs:execute": "Start projection runs.",
+}
+
+BUILTIN_ROLES = {
+    "admin": {
+        "description": "Full platform access.",
+        "permissions": set(BUILTIN_PERMISSIONS),
+    },
+    "actuary": {
+        "description": "Actuarial data, model, and execution access.",
+        "permissions": set(BUILTIN_PERMISSIONS) - {"projects:write"},
+    },
+    "model_developer": {
+        "description": "Model configuration, data import, and test execution access.",
+        "permissions": {
+            "projects:read",
+            "registries:read",
+            "registries:write",
+            "imports:read",
+            "imports:write",
+            "runs:read",
+            "runs:execute",
+        },
+    },
+    "reviewer": {
+        "description": "Read-only review access to models, data, runs, and results.",
+        "permissions": {
+            "projects:read",
+            "registries:read",
+            "imports:read",
+            "runs:read",
+        },
+    },
+    "read_only": {
+        "description": "Read-only access to projects and published actuarial information.",
+        "permissions": {
+            "projects:read",
+            "registries:read",
+            "imports:read",
+            "runs:read",
+        },
+    },
 }
 
 
@@ -45,22 +88,17 @@ def initialize_builtin_roles(db: Session) -> dict[str, Role]:
             permissions[name] = permission
 
     roles = {role.name: role for role in db.query(Role).all()}
-    if "admin" not in roles:
-        roles["admin"] = Role(name="admin", description="Full platform access.")
-        db.add(roles["admin"])
-    if "actuary" not in roles:
-        roles["actuary"] = Role(
-            name="actuary", description="Actuarial data and execution access."
-        )
-        db.add(roles["actuary"])
+    for name, definition in BUILTIN_ROLES.items():
+        if name not in roles:
+            roles[name] = Role(name=name, description=definition["description"])
+            db.add(roles[name])
 
     db.flush()
-    roles["admin"].permissions = list(permissions.values())
-    roles["actuary"].permissions = [
-        permission
-        for name, permission in permissions.items()
-        if name != "projects:write"
-    ]
+    for role_name, definition in BUILTIN_ROLES.items():
+        roles[role_name].description = definition["description"]
+        roles[role_name].permissions = [
+            permissions[name] for name in sorted(definition["permissions"])
+        ]
     return roles
 
 

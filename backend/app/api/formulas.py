@@ -3,6 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.api.dependencies import require_permissions
 from app.core.formula_engine.registry import (
     delete, get_by_id, get_by_output, list_all, register, update,
 )
@@ -22,7 +23,12 @@ def list_formulas(
     return list_all(db, category=category, product=product)
 
 
-@router.post("/", response_model=FormulaDefinition, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    response_model=FormulaDefinition,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permissions("registries:write"))],
+)
 def create_formula(formula: FormulaDefinition, db: Session = Depends(get_db)):
     existing = get_by_output(db, formula.output_variable)
     if existing:
@@ -49,7 +55,11 @@ def get_dependency_graph(formula_id: str, db: Session = Depends(get_db)):
     return to_graph_view([f])
 
 
-@router.put("/{formula_id}", response_model=FormulaDefinition)
+@router.put(
+    "/{formula_id}",
+    response_model=FormulaDefinition,
+    dependencies=[Depends(require_permissions("registries:write"))],
+)
 def update_formula(formula_id: str, updates: dict, db: Session = Depends(get_db)):
     f = update(db, formula_id, updates)
     if f is None:
@@ -57,7 +67,11 @@ def update_formula(formula_id: str, updates: dict, db: Session = Depends(get_db)
     return f
 
 
-@router.delete("/{formula_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{formula_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permissions("registries:write"))],
+)
 def delete_formula(formula_id: str, db: Session = Depends(get_db)):
     success = delete(db, formula_id)
     if not success:

@@ -97,7 +97,13 @@ def dashboard_client():
 
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
-        id="actuary-1", roles=[SimpleNamespace(name="actuary")]
+        id="actuary-1",
+        roles=[
+            SimpleNamespace(
+                name="actuary",
+                permissions=[SimpleNamespace(name="projects:read")],
+            )
+        ],
     )
     try:
         with TestClient(app) as client:

@@ -34,6 +34,7 @@ def auth_client():
     app.dependency_overrides[get_db] = override_get_db
     try:
         with TestClient(app) as client:
+            client.test_session = session
             yield client
     finally:
         app.dependency_overrides.clear()
@@ -125,6 +126,58 @@ def test_admin_can_create_and_list_actuary(auth_client):
         "bootstrap",
         "admin",
     }
+
+
+def test_bootstrap_creates_the_complete_role_permission_matrix(auth_client):
+    _bootstrap_and_login(auth_client)
+    session = auth_client.test_session
+    roles = {
+        role.name: {permission.name for permission in role.permissions}
+        for role in session.query(Role).all()
+    }
+
+    assert roles == {
+        "admin": {
+            "projects:read", "projects:write", "registries:read", "registries:write",
+            "imports:read", "imports:write", "runs:read", "runs:execute",
+        },
+        "actuary": {
+            "projects:read", "registries:read", "registries:write", "imports:read",
+            "imports:write", "runs:read", "runs:execute",
+        },
+        "model_developer": {
+            "projects:read", "registries:read", "registries:write", "imports:read",
+            "imports:write", "runs:read", "runs:execute",
+        },
+        "reviewer": {"projects:read", "registries:read", "imports:read", "runs:read"},
+        "read_only": {"projects:read", "registries:read", "imports:read", "runs:read"},
+    }
+
+
+@pytest.mark.parametrize("role", ["model_developer", "reviewer", "read_only"])
+def test_non_admin_roles_can_read_but_cannot_manage_projects(auth_client, role):
+    admin_token = _bootstrap_and_login(auth_client)
+    created = auth_client.post(
+        "/v1/users/",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={
+            "email": f"{role}@example.com",
+            "full_name": role.replace("_", " ").title(),
+            "password": "role-specific-password",
+            "roles": [role],
+        },
+    )
+    assert created.status_code == 201
+    token = auth_client.post(
+        "/v1/auth/token",
+        data={"username": f"{role}@example.com", "password": "role-specific-password"},
+    ).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    assert auth_client.get("/v1/projects/", headers=headers).status_code == 200
+    assert auth_client.post(
+        "/v1/projects/", headers=headers, json={"name": "Disallowed"}
+    ).status_code == 403
 
 
 def test_actuary_cannot_access_admin_user_list(auth_client):

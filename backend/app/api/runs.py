@@ -8,6 +8,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, s
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
+from app.api.dependencies import require_permissions
 from app.core.audit import record_audit
 from app.core.projection_engine.runner import run_projection
 from app.core.run_manifest import create_run_manifest
@@ -45,7 +46,12 @@ def execute_queued_run(run_definition: ProjectionRunDefinition) -> None:
         db.close()
 
 
-@router.post("/", response_model=RunResponse, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/",
+    response_model=RunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_permissions("runs:execute"))],
+)
 def queue_run(
     payload: RunCreate,
     background_tasks: BackgroundTasks,

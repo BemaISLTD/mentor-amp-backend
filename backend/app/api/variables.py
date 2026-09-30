@@ -3,6 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.api.dependencies import require_permissions
 from app.core.variable_registry.registry import (
     delete,
     get_by_name,
@@ -26,7 +27,12 @@ def list_variables(
     return list_all(db, product=product, kind=kind)
 
 
-@router.post("/", response_model=VariableDefinition, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    response_model=VariableDefinition,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permissions("registries:write"))],
+)
 def create_variable(variable: VariableDefinition, db: Session = Depends(get_db)):
     """Register a new variable."""
     existing = get_by_name(db, variable.name)
@@ -47,7 +53,11 @@ def get_variable(name: str, db: Session = Depends(get_db)):
     return var
 
 
-@router.put("/{name}", response_model=VariableDefinition)
+@router.put(
+    "/{name}",
+    response_model=VariableDefinition,
+    dependencies=[Depends(require_permissions("registries:write"))],
+)
 def update_variable(name: str, updates: dict, db: Session = Depends(get_db)):
     """Update a variable's fields."""
     var = update(db, name, updates)
@@ -56,7 +66,11 @@ def update_variable(name: str, updates: dict, db: Session = Depends(get_db)):
     return var
 
 
-@router.delete("/{name}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{name}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permissions("registries:write"))],
+)
 def delete_variable(name: str, db: Session = Depends(get_db)):
     """Delete a variable by name."""
     success = delete(db, name)

@@ -47,7 +47,12 @@ def viewer():
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
         id="reviewer",
-        roles=[SimpleNamespace(name="actuary", permissions=[])],
+        roles=[
+            SimpleNamespace(
+                name="actuary",
+                permissions=[SimpleNamespace(name="imports:read")],
+            )
+        ],
     )
     with TestClient(app) as client:
         yield client
