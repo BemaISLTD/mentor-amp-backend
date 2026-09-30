@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 from sqlalchemy import Float, cast
 from sqlalchemy.orm import Session
 
+from app.api.dependencies import require_permissions
 from app.data.importers.base import detect_format, import_file, parse_file, preview_file
 from app.data.validation.inforce_validator import validate_inforce
 from app.data.validation.assumption_validator import validate_assumptions
@@ -62,7 +63,11 @@ def _staged_upload(file: UploadFile) -> Iterator[Path]:
         path.unlink(missing_ok=True)
 
 
-@router.post("/inforce", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/inforce",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permissions("imports:write"))],
+)
 def upload_inforce(
     file: UploadFile = File(...),
     project_id: str = Query(...),
@@ -109,7 +114,11 @@ def upload_inforce(
         raise
 
 
-@router.post("/assumptions", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/assumptions",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permissions("imports:write"))],
+)
 def upload_assumptions(
     file: UploadFile = File(...),
     project_id: str = Query(...),
@@ -133,7 +142,11 @@ def upload_assumptions(
     }
 
 
-@router.post("/factors", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/factors",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permissions("imports:write"))],
+)
 def upload_factors(
     file: UploadFile = File(...),
     project_id: str = Query(...),
@@ -156,7 +169,11 @@ def upload_factors(
     }
 
 
-@router.post("/scenarios", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/scenarios",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permissions("imports:write"))],
+)
 def upload_scenarios(
     file: UploadFile = File(...),
     project_id: str = Query(...),

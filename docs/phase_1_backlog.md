@@ -12,9 +12,9 @@ it is considered complete.
 
 | Area | Verified state | Status |
 | --- | --- | --- |
-| Tests | Original `test_*.py` modules were empty placeholders | Test suite remains open; 39 automated tests now cover implemented domains |
+| Tests | Original `test_*.py` modules were empty placeholders | Test suite remains open; 43 automated tests now cover implemented domains |
 | Seed data | No seed script exists | Open |
-| Authentication/RBAC | No auth dependency or user/RBAC models existed | **In progress:** JWT, admin/actuary roles, and permission enforcement implemented; expanded role matrix pending |
+| Authentication/RBAC | No auth dependency or user/RBAC models existed | **Complete:** JWT and the administrator, actuary, model developer, reviewer, and read-only permission matrix are enforced |
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
 | Error contract | Default FastAPI `detail` responses were used | **Complete:** standardized error envelope added |
 | Projects | POST and GET only | **In progress:** PATCH added; destructive DELETE withheld pending an archive and retention contract |
@@ -29,8 +29,9 @@ it is considered complete.
   - Build coverage for database connectivity, migrations, model constraints,
     validation, authentication/authorization, API behavior, engine behavior,
     and golden policies.
-  - Current evidence: API contract, authentication, upload recovery, and record
-    viewer suites; `docker compose exec -T api pytest -q` returned `39 passed`.
+  - Current evidence: API contract, authentication/RBAC, upload recovery, and
+    record viewer suites; `docker compose exec -T api pytest -q` returned
+    `43 passed`.
 - **[IMPROVE] Database Seeding Scripts — OPEN**
   - Add an idempotent `seed.py` using synthetic users, roles, permissions,
     projects, products, and representative actuarial metadata.
@@ -43,12 +44,13 @@ it is considered complete.
 
 ## 2. API Contract and Security
 
-- **[BUILD] Global Authentication and Authorization (JWT) — IN PROGRESS**
+- **[BUILD] Global Authentication and Authorization (JWT) — COMPLETE**
   - Build users/RBAC persistence, token issuance, `/v1/auth/me`, and `/v1/users`.
   - Project endpoints enforce stored `projects:read` and `projects:write`
     permissions; uploads and registries remain restricted to admin/actuary roles.
-  - Define the permission matrix for model developer, reviewer, and read-only
-    roles before considering the authorization model complete.
+  - Administrator, actuary, model developer, reviewer, and read-only roles use
+    an explicit project, registry, import, and run permission matrix.
+  - Read and mutation routes enforce stored permissions rather than role names.
 - **[IMPROVE] API Versioning and Error Handling — COMPLETE**
   - Public application routers are mounted below `/v1`.
   - Errors use `{"error": {"code": "...", "message": "..."}}`, with optional
@@ -126,8 +128,8 @@ it is considered complete.
 1. API foundation: versioning, error contract, project mutations, and initial
    endpoint tests. **In progress:** project archival remains open.
 2. Users/RBAC schema, authentication endpoints, JWT configuration, and router
-   authorization tests. **In progress:** the initial admin/actuary permission
-   model is enforced; the expanded role matrix remains open.
+   authorization tests. **Complete:** expanded roles and route-level read,
+   write, and execute permissions are enforced.
 3. Audit logs and project actor fields. **Complete.**
 4. Local/S3 Parquet storage interface and immutable run manifests. **In progress:**
    local Parquet and manifests are complete; S3 and legacy table removal remain.
@@ -155,6 +157,7 @@ Before an item moves to complete, record:
 - Permission-protected project PATCH: `backend/app/api/projects.py`
 - Contract tests: `backend/tests/integration/test_api_contract.py`
 - Auth/RBAC migration: `backend/app/db/migrations/versions/2f6d51e920a4_add_users_and_rbac.py`
+- Expanded RBAC migration: `backend/app/db/migrations/versions/d1a4c7e9b205_expand_builtin_rbac_roles.py`
 - Authentication tests: `backend/tests/integration/test_auth_api.py`
 - Upload recovery implementation: `backend/app/api/imports.py`
 - Upload recovery tests: `backend/tests/unit/test_importers.py`

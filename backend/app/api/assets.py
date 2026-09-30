@@ -6,7 +6,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import get_current_user
+from app.api.dependencies import get_current_user, require_permissions
 from app.api.products import _get_product_or_404
 from app.core.audit import record_audit
 from app.db.database import get_db
@@ -45,7 +45,12 @@ def _position_state(position: AssetPosition) -> dict:
     }
 
 
-@router.post("/", response_model=AssetPositionResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    response_model=AssetPositionResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permissions("registries:write"))],
+)
 def create_position(
     payload: AssetPositionCreate,
     current_user: Annotated[User, Depends(get_current_user)],
@@ -109,7 +114,11 @@ def get_position(position_id: str, db: Session = Depends(get_db)):
     return _get_position_or_404(position_id, db)
 
 
-@router.patch("/{position_id}", response_model=AssetPositionResponse)
+@router.patch(
+    "/{position_id}",
+    response_model=AssetPositionResponse,
+    dependencies=[Depends(require_permissions("registries:write"))],
+)
 def update_position(
     position_id: str,
     payload: AssetPositionUpdate,
@@ -140,7 +149,11 @@ def update_position(
     return position
 
 
-@router.delete("/{position_id}", status_code=204)
+@router.delete(
+    "/{position_id}",
+    status_code=204,
+    dependencies=[Depends(require_permissions("registries:write"))],
+)
 def delete_position(
     position_id: str,
     current_user: Annotated[User, Depends(get_current_user)],

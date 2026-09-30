@@ -63,7 +63,16 @@ def run_api_client(tmp_path, monkeypatch):
 
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
-        id="actuary-1", roles=[SimpleNamespace(name="actuary")]
+        id="actuary-1",
+        roles=[
+            SimpleNamespace(
+                name="actuary",
+                permissions=[
+                    SimpleNamespace(name="runs:read"),
+                    SimpleNamespace(name="runs:execute"),
+                ],
+            )
+        ],
     )
     try:
         with TestClient(app) as client:

@@ -6,7 +6,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import get_current_user
+from app.api.dependencies import get_current_user, require_permissions
 from app.core.audit import record_audit
 from app.db.database import get_db
 from app.db.models.product import AssetPosition, Product, ProductMapping
@@ -63,7 +63,12 @@ def _ensure_unique_code(
         )
 
 
-@router.post("/", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    response_model=ProductResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permissions("registries:write"))],
+)
 def create_product(
     payload: ProductCreate,
     current_user: Annotated[User, Depends(get_current_user)],
@@ -120,7 +125,11 @@ def get_product(product_id: str, db: Session = Depends(get_db)):
     return _get_product_or_404(product_id, db)
 
 
-@router.patch("/{product_id}", response_model=ProductResponse)
+@router.patch(
+    "/{product_id}",
+    response_model=ProductResponse,
+    dependencies=[Depends(require_permissions("registries:write"))],
+)
 def update_product(
     product_id: str,
     payload: ProductUpdate,
@@ -150,7 +159,11 @@ def update_product(
     return product
 
 
-@router.delete("/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{product_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permissions("registries:write"))],
+)
 def delete_product(
     product_id: str,
     current_user: Annotated[User, Depends(get_current_user)],
@@ -191,6 +204,7 @@ def delete_product(
     "/{product_id}/mappings",
     response_model=ProductMappingResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permissions("registries:write"))],
 )
 def create_mapping(
     product_id: str,
@@ -243,7 +257,11 @@ def list_mappings(product_id: str, db: Session = Depends(get_db)):
     ).order_by(ProductMapping.effective_from.desc()).all()
 
 
-@router.delete("/{product_id}/mappings/{mapping_id}", status_code=204)
+@router.delete(
+    "/{product_id}/mappings/{mapping_id}",
+    status_code=204,
+    dependencies=[Depends(require_permissions("registries:write"))],
+)
 def delete_mapping(
     product_id: str,
     mapping_id: str,
