@@ -12,7 +12,7 @@ it is considered complete.
 
 | Area | Verified state | Status |
 | --- | --- | --- |
-| Tests | Original `test_*.py` modules were empty placeholders | Test suite remains open; 35 automated tests now cover implemented domains |
+| Tests | Original `test_*.py` modules were empty placeholders | Test suite remains open; 39 automated tests now cover implemented domains |
 | Seed data | No seed script exists | Open |
 | Authentication/RBAC | No auth dependency or user/RBAC models existed | **In progress:** JWT, admin/actuary roles, and permission enforcement implemented; expanded role matrix pending |
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
@@ -29,8 +29,8 @@ it is considered complete.
   - Build coverage for database connectivity, migrations, model constraints,
     validation, authentication/authorization, API behavior, engine behavior,
     and golden policies.
-  - Current evidence: API contract, authentication, and upload recovery suites;
-    `docker compose exec -T api pytest -q` returned `35 passed`.
+  - Current evidence: API contract, authentication, upload recovery, and record
+    viewer suites; `docker compose exec -T api pytest -q` returned `39 passed`.
 - **[IMPROVE] Database Seeding Scripts — OPEN**
   - Add an idempotent `seed.py` using synthetic users, roles, permissions,
     projects, products, and representative actuarial metadata.
@@ -57,9 +57,11 @@ it is considered complete.
   - Added permission-protected `PATCH /v1/projects/{project_id}`.
   - Permanent project deletion is not exposed. Define an audited archive or
     soft-delete lifecycle and retention policy before adding removal behavior.
-- **[BUILD] File Record Viewers — OPEN**
-  - Add paginated, filterable record endpoints suitable for spreadsheet-style
-    viewers. Define safe filter operators and maximum page sizes.
+- **[BUILD] File Record Viewers — COMPLETE FOR IN-FORCE FILES**
+  - `GET /v1/imports/inforce/{file_id}/records` returns stable, paginated rows
+    with file metadata and a maximum page size of 200.
+  - Filtering is restricted to `policy_id` and columns declared by the file,
+    using allowlisted text and numeric operators.
 - **[BUILD] Dashboard Contract — COMPLETE**
   - `GET /v1/dashboard/stats` returns project-scoped product, latest or
     requested asset snapshot, run, and in-force file statistics.
@@ -156,6 +158,7 @@ Before an item moves to complete, record:
 - Authentication tests: `backend/tests/integration/test_auth_api.py`
 - Upload recovery implementation: `backend/app/api/imports.py`
 - Upload recovery tests: `backend/tests/unit/test_importers.py`
+- In-force record viewer tests: `backend/tests/integration/test_inforce_record_viewer.py`
 - Audit migration: `backend/app/db/migrations/versions/7c3f19ad0e82_add_audit_logging.py`
 - Audit API: `backend/app/api/audit_logs.py`
 - Artifact metadata migration: `backend/app/db/migrations/versions/91b4e26d7fa0_add_run_manifests_and_artifacts.py`
