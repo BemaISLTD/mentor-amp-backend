@@ -1,9 +1,9 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import get_current_user
+from app.api.dependencies import get_current_user, require_permissions
 from app.core.audit import record_audit
 from app.db.database import get_db
 from app.db.models.project import Project
@@ -37,7 +37,12 @@ def _get_project_or_404(project_id: str, db: Session) -> Project:
     return project
 
 
-@router.post("/", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    response_model=ProjectResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permissions("projects:write"))],
+)
 def create_project(
     payload: ProjectCreate,
     current_user: Annotated[User, Depends(get_current_user)],
@@ -65,7 +70,11 @@ def create_project(
     return project
 
 
-@router.get("/", response_model=ProjectListResponse)
+@router.get(
+    "/",
+    response_model=ProjectListResponse,
+    dependencies=[Depends(require_permissions("projects:read"))],
+)
 def list_projects(db: Session = Depends(get_db)):
     """List all projects."""
     projects = db.query(Project).order_by(Project.created_at.desc()).all()
@@ -75,13 +84,21 @@ def list_projects(db: Session = Depends(get_db)):
     )
 
 
-@router.get("/{project_id}", response_model=ProjectResponse)
+@router.get(
+    "/{project_id}",
+    response_model=ProjectResponse,
+    dependencies=[Depends(require_permissions("projects:read"))],
+)
 def get_project(project_id: str, db: Session = Depends(get_db)):
     """Get a single project by ID."""
     return _get_project_or_404(project_id, db)
 
 
-@router.patch("/{project_id}", response_model=ProjectResponse)
+@router.patch(
+    "/{project_id}",
+    response_model=ProjectResponse,
+    dependencies=[Depends(require_permissions("projects:write"))],
+)
 def update_project(
     project_id: str,
     payload: ProjectUpdate,
@@ -107,24 +124,3 @@ def update_project(
     db.commit()
     db.refresh(project)
     return project
-
-
-@router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_project(
-    project_id: str,
-    current_user: Annotated[User, Depends(get_current_user)],
-    db: Session = Depends(get_db),
-) -> Response:
-    """Delete a project and its database-cascaded child records."""
-    project = _get_project_or_404(project_id, db)
-    record_audit(
-        db,
-        actor_user_id=current_user.id,
-        action="project.deleted",
-        entity_type="project",
-        entity_id=project.id,
-        before_state=_project_state(project),
-    )
-    db.delete(project)
-    db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
