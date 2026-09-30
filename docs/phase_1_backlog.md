@@ -12,7 +12,7 @@ it is considered complete.
 
 | Area | Verified state | Status |
 | --- | --- | --- |
-| Tests | Original `test_*.py` modules were empty placeholders | Test suite remains open; 29 automated tests now cover implemented domains |
+| Tests | Original `test_*.py` modules were empty placeholders | Test suite remains open; 35 automated tests now cover implemented domains |
 | Seed data | No seed script exists | Open |
 | Authentication/RBAC | No auth dependency or user/RBAC models existed | **In progress:** JWT, admin/actuary roles, and permission enforcement implemented; expanded role matrix pending |
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
@@ -29,14 +29,17 @@ it is considered complete.
   - Build coverage for database connectivity, migrations, model constraints,
     validation, authentication/authorization, API behavior, engine behavior,
     and golden policies.
-  - Current evidence: API contract and authentication suites;
-    `docker compose exec -T api pytest -q` returned `29 passed`.
+  - Current evidence: API contract, authentication, and upload recovery suites;
+    `docker compose exec -T api pytest -q` returned `35 passed`.
 - **[IMPROVE] Database Seeding Scripts — OPEN**
   - Add an idempotent `seed.py` using synthetic users, roles, permissions,
     projects, products, and representative actuarial metadata.
-- **[IMPROVE] Upload Recovery — OPEN**
-  - Define transaction boundaries and cleanup behavior for partially failed
-    uploads, including orphaned local/object-storage files.
+- **[IMPROVE] Upload Recovery — COMPLETE FOR LOCAL UPLOADS**
+  - Uploads use atomic staging, sanitize client filenames, and remove staged or
+    partially copied files on success and failure.
+  - In-force database writes commit only after staging cleanup and roll back on
+    parsing, validation, storage, cleanup, or commit failures.
+  - Reapply the same lifecycle when an object-storage-backed import path is added.
 
 ## 2. API Contract and Security
 
@@ -151,6 +154,8 @@ Before an item moves to complete, record:
 - Contract tests: `backend/tests/integration/test_api_contract.py`
 - Auth/RBAC migration: `backend/app/db/migrations/versions/2f6d51e920a4_add_users_and_rbac.py`
 - Authentication tests: `backend/tests/integration/test_auth_api.py`
+- Upload recovery implementation: `backend/app/api/imports.py`
+- Upload recovery tests: `backend/tests/unit/test_importers.py`
 - Audit migration: `backend/app/db/migrations/versions/7c3f19ad0e82_add_audit_logging.py`
 - Audit API: `backend/app/api/audit_logs.py`
 - Artifact metadata migration: `backend/app/db/migrations/versions/91b4e26d7fa0_add_run_manifests_and_artifacts.py`
