@@ -4,10 +4,12 @@ import os
 import shutil
 import uuid
 from contextlib import contextmanager
+from math import ceil
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from sqlalchemy import Float, cast
 from sqlalchemy.orm import Session
 
 from app.data.importers.base import detect_format, import_file, parse_file, preview_file
@@ -17,11 +19,14 @@ from app.data.validation.factor_validator import validate_factors
 from app.data.validation.scenario_validator import validate_scenarios
 from app.db.database import get_db
 from app.db.models import InforceFile, InforceRecord
-from app.models.schemas import ImportPreviewResponse
+from app.models.schemas import ImportPreviewResponse, InforceRecordListResponse
 
 router = APIRouter(prefix="/imports", tags=["imports"])
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
+FilterOperator = Literal["eq", "ne", "contains", "starts_with", "gt", "gte", "lt", "lte"]
+SortColumn = Literal["policy_id", "created_at"]
+SortOrder = Literal["asc", "desc"]
 
 
 def _safe_filename(filename: str | None) -> str:
@@ -172,6 +177,96 @@ def upload_scenarios(
         "errors": errors,
         "preview": rows[:20],
     }
+
+
+def _file_columns(infile: InforceFile) -> list[str]:
+    columns = infile.columns_detected or []
+    if isinstance(columns, dict):
+        return list(columns)
+    return list(columns)
+
+
+def _filter_records(query, infile: InforceFile, column: str, operator: FilterOperator, value: str):
+    allowed_columns = set(_file_columns(infile)) | {"policy_id"}
+    if column not in allowed_columns:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported filter column '{column}'.",
+        )
+
+    field = InforceRecord.policy_id if column == "policy_id" else InforceRecord.data[column].as_string()
+    if operator == "eq":
+        return query.filter(field == value)
+    if operator == "ne":
+        return query.filter(field != value)
+    if operator == "contains":
+        return query.filter(field.contains(value, autoescape=True))
+    if operator == "starts_with":
+        return query.filter(field.startswith(value, autoescape=True))
+
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Filter operator '{operator}' requires a numeric value.",
+        ) from exc
+
+    numeric_field = cast(field, Float)
+    comparisons = {
+        "gt": numeric_field > number,
+        "gte": numeric_field >= number,
+        "lt": numeric_field < number,
+        "lte": numeric_field <= number,
+    }
+    return query.filter(comparisons[operator])
+
+
+@router.get("/inforce/{file_id}/records", response_model=InforceRecordListResponse)
+def list_inforce_records(
+    file_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    filter_column: str | None = Query(None, min_length=1, max_length=255),
+    filter_operator: FilterOperator = Query("eq"),
+    filter_value: str | None = Query(None, max_length=500),
+    sort_by: SortColumn = Query("policy_id"),
+    sort_order: SortOrder = Query("asc"),
+    db: Session = Depends(get_db),
+):
+    """Return a bounded, filterable page of records for one in-force file."""
+    infile = db.get(InforceFile, file_id)
+    if infile is None:
+        raise HTTPException(status_code=404, detail="In-force file not found.")
+    if (filter_column is None) != (filter_value is None):
+        raise HTTPException(
+            status_code=400,
+            detail="filter_column and filter_value must be provided together.",
+        )
+
+    query = db.query(InforceRecord).filter(InforceRecord.file_id == file_id)
+    if filter_column is not None and filter_value is not None:
+        query = _filter_records(query, infile, filter_column, filter_operator, filter_value)
+
+    total = query.order_by(None).count()
+    sort_field = getattr(InforceRecord, sort_by)
+    order = sort_field.desc() if sort_order == "desc" else sort_field.asc()
+    records = (
+        query.order_by(order, InforceRecord.id.asc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return InforceRecordListResponse(
+        file_id=infile.id,
+        filename=infile.filename,
+        columns=_file_columns(infile),
+        records=records,
+        page=page,
+        page_size=page_size,
+        total=total,
+        total_pages=ceil(total / page_size),
+    )
 
 
 @router.get("/preview", response_model=ImportPreviewResponse)

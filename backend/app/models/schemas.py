@@ -272,6 +272,25 @@ class ImportPreviewResponse(BaseModel):
     sample_rows: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class InforceRecordResponse(BaseModel):
+    id: int
+    policy_id: str
+    data: dict[str, Any]
+    created_at: datetime
+    model_config = {"from_attributes": True}
+
+
+class InforceRecordListResponse(BaseModel):
+    file_id: str
+    filename: str
+    columns: list[str] = Field(default_factory=list)
+    records: list[InforceRecordResponse] = Field(default_factory=list)
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+
+
 class RunStatusResponse(BaseModel):
     run_id: str
     status: Literal["pending", "running", "success", "partial_success", "failed"]
