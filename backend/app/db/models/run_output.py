@@ -6,6 +6,7 @@ from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Integer, JSON, S
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.database import Base
+from app.db.types import BigIntegerPK
 
 
 class RunOutput(Base):
@@ -13,7 +14,7 @@ class RunOutput(Base):
 
     __tablename__ = "run_outputs"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BigIntegerPK, primary_key=True, autoincrement=True)
     run_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True
     )

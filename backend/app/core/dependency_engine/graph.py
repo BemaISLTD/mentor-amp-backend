@@ -34,7 +34,8 @@ def topological_sort(formulas: list[FormulaDefinition]) -> list[str]:
             cycle = path[cycle_start:] + [node]
             raise ValueError(f"Circular dependency: {' → '.join(cycle)}")
         in_progress.add(node)
-        for dep in graph.get(node, set()):
+        # Sorted so the order is identical in every process (set order varies with hashing).
+        for dep in sorted(graph.get(node, set())):
             visit(dep, path + [node])
         in_progress.discard(node)
         visited.add(node)
@@ -45,7 +46,7 @@ def topological_sort(formulas: list[FormulaDefinition]) -> list[str]:
         visit(formula.output_variable, [])
 
     # Add any variables that are dependencies but not formula outputs
-    for var in all_vars:
+    for var in sorted(all_vars):
         if var not in visited:
             visited.add(var)
             order.append(var)

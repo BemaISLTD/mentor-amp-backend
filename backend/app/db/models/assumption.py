@@ -45,3 +45,9 @@ class AssumptionTable(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+    # --- M1: lifecycle, provenance and the explicit value column ---
+    status: Mapped[str] = mapped_column(String(30), default="validated", nullable=False)
+    version_label: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    value_column: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
