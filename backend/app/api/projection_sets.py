@@ -7,14 +7,22 @@ from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import require_permissions
+from app.api.dependencies import authorize_path
 from app.db.database import get_db
 from app.db.models.user import User
 from app.services import projection_set_service
 
 router = APIRouter(tags=["projection-sets"])
-Reader = Annotated[User, Depends(require_permissions("projects:read"))]
-Writer = Annotated[User, Depends(require_permissions("registries:write"))]
+ProjectReader = Annotated[User, Depends(authorize_path("project", "project_id", "projects:read"))]
+ProjectWriter = Annotated[
+    User, Depends(authorize_path("project", "project_id", "registries:write", write=True))
+]
+SetReader = Annotated[
+    User, Depends(authorize_path("projection_set", "projection_set_id", "projects:read"))
+]
+SetWriter = Annotated[
+    User, Depends(authorize_path("projection_set", "projection_set_id", "registries:write", write=True))
+]
 
 
 class TraceScope(BaseModel):
@@ -29,6 +37,7 @@ class ProjectionSetCreate(BaseModel):
     model_version_id: str
     inforce_file_ids: list[str] = Field(default_factory=list)
     assumption_table_ids: list[str] = Field(default_factory=list)
+    factor_table_ids: list[str] = Field(default_factory=list)
     scenario_ids: list[str] = Field(default_factory=list)
     valuation_date: date
     horizon_months: int = Field(ge=1, le=1200)
@@ -44,6 +53,7 @@ class ProjectionSetUpdate(BaseModel):
     model_version_id: str | None = None
     inforce_file_ids: list[str] | None = None
     assumption_table_ids: list[str] | None = None
+    factor_table_ids: list[str] | None = None
     scenario_ids: list[str] | None = None
     valuation_date: date | None = None
     horizon_months: int | None = Field(None, ge=1, le=1200)
@@ -64,7 +74,7 @@ class AttachScenario(BaseModel):
 @router.get("/projects/{project_id}/projection-sets")
 def list_projection_sets(
     project_id: str,
-    user: Reader,
+    user: ProjectReader,
     search: str | None = Query(None),
     status_filter: str | None = Query(None, alias="status"),
     db: Session = Depends(get_db),
@@ -75,27 +85,27 @@ def list_projection_sets(
 
 @router.post("/projects/{project_id}/projection-sets", status_code=status.HTTP_201_CREATED)
 def create_projection_set(
-    project_id: str, payload: ProjectionSetCreate, user: Writer, db: Session = Depends(get_db)
+    project_id: str, payload: ProjectionSetCreate, user: ProjectWriter, db: Session = Depends(get_db)
 ):
     return projection_set_service.create(db, project_id, payload.model_dump(), user)
 
 
 @router.get("/projection-sets/{projection_set_id}")
-def get_projection_set(projection_set_id: str, user: Reader, db: Session = Depends(get_db)):
+def get_projection_set(projection_set_id: str, user: SetReader, db: Session = Depends(get_db)):
     del user
-    return projection_set_service.serialize(db, projection_set_service._get(db, projection_set_id))  # noqa: SLF001
+    return projection_set_service.serialize(db, projection_set_service.get(db, projection_set_id))
 
 
 @router.patch("/projection-sets/{projection_set_id}")
 def update_projection_set(
-    projection_set_id: str, payload: ProjectionSetUpdate, user: Writer, db: Session = Depends(get_db)
+    projection_set_id: str, payload: ProjectionSetUpdate, user: SetWriter, db: Session = Depends(get_db)
 ):
     del user
     return projection_set_service.update(db, projection_set_id, payload.model_dump(exclude_unset=True))
 
 
 @router.post("/projection-sets/{projection_set_id}/validate")
-def validate_projection_set(projection_set_id: str, user: Writer, db: Session = Depends(get_db)):
+def validate_projection_set(projection_set_id: str, user: SetWriter, db: Session = Depends(get_db)):
     del user
     return projection_set_service.validate(db, projection_set_id)
 
@@ -103,7 +113,7 @@ def validate_projection_set(projection_set_id: str, user: Writer, db: Session = 
 @router.post("/projection-sets/{projection_set_id}/duplicate", status_code=status.HTTP_201_CREATED)
 def duplicate_projection_set(
     projection_set_id: str,
-    user: Writer,
+    user: SetWriter,
     payload: DuplicateRequest | None = None,
     db: Session = Depends(get_db),
 ):
@@ -114,7 +124,7 @@ def duplicate_projection_set(
 
 @router.post("/projection-sets/{projection_set_id}/scenarios")
 def attach_scenario(
-    projection_set_id: str, payload: AttachScenario, user: Writer, db: Session = Depends(get_db)
+    projection_set_id: str, payload: AttachScenario, user: SetWriter, db: Session = Depends(get_db)
 ):
     del user
     return projection_set_service.attach_scenario(db, projection_set_id, payload.scenario_id)

@@ -1,7 +1,8 @@
 """M1 boss demo: run the SPIA illustrative Projection Set end to end through the real API.
 
 Steps: system status → project → model → Projection Set → submit Run Set (Base + Low Interest
-Rate) → watch progress → reserves by year → comparison → trace of one value → manifest.
+Rate; each run is frozen into an immutable run package) → watch progress → reserves by year →
+comparison → trace of one value → run package and final manifest fingerprints.
 
 Usage (from the repository root):
   # against a running server (uvicorn app.main:app --port 8000, from backend/):
@@ -140,6 +141,10 @@ def main() -> None:
         headline = summary["headline"] or {}
         say(f"\n== {name} ==  status {summary['status']} · {summary['policy_count']} policies · "
               f"{summary['output_row_count']} output rows · warnings {summary['warning_count']}")
+        say(f"   run package {run.get('run_package_fingerprint')}")
+        if summary["status"] != "success":
+            say("   No results: only runs that finished with status 'success' have results.")
+            continue
         say(f"   {headline.get('label')}: {money(headline.get('value'))}")
         aggregates = call("GET", f"/runs/{run['id']}/aggregates",
                           params={"variables": "reserve,expected_payment"})
@@ -150,7 +155,8 @@ def main() -> None:
                   f"{money(row['values']['expected_payment']):>22}"
                   f"{('' if change is None else f'{change:+.2f}%'):>16}")
 
-    if "Base" in runs and "Low Interest Rate" in runs:
+    finished = {name: run for name, run in runs.items() if run["status"] == "success"}
+    if "Base" in finished and "Low Interest Rate" in finished:
         comparison = call("GET", "/comparisons", params={
             "baseline_run_id": runs["Base"]["id"], "current_run_id": runs["Low Interest Rate"]["id"],
         })
@@ -164,7 +170,9 @@ def main() -> None:
         for driver in comparison["attribution"]["drivers"]:
             say(f"   driver: {driver['label']} explains {money(driver['amount'])}")
 
-    base = runs.get("Base") or next(iter(runs.values()))
+    base = finished.get("Base") or next(iter(finished.values()), None)
+    if base is None:
+        raise SystemExit("No run finished successfully; see the run events for the reason.")
     trace = call("GET", f"/runs/{base['id']}/trace", params={
         "policy_id": "SPIA-0001", "month": 12, "variable": "pv_expected_payment", "depth": 5,
     })
@@ -172,7 +180,8 @@ def main() -> None:
     print_tree(trace["root"], "   ")
 
     manifest = call("GET", f"/runs/{base['id']}/manifest")
-    say(f"\nManifest fingerprint: {manifest['fingerprint']}")
+    say(f"\nRun package fingerprint (frozen inputs):       {manifest['run_package']['fingerprint']}")
+    say(f"Final manifest fingerprint (inputs + outcome): {manifest['final_manifest']['fingerprint']}")
     say("All values above are ILLUSTRATIVE — not actuarially approved.")
 
 

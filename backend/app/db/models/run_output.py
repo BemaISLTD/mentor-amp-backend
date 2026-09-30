@@ -21,6 +21,8 @@ class RunOutput(Base):
     policy_id: Mapped[str] = mapped_column(String(100), nullable=False)
     scenario_id: Mapped[str] = mapped_column(String(100), nullable=False)
     projection_month: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The run attempt that wrote this row; only runs.accepted_attempt_number is canonical.
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     variable_name: Mapped[str] = mapped_column(String(255), nullable=False)
     value: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     product: Mapped[str | None] = mapped_column(String(100), nullable=True)

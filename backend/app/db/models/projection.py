@@ -50,6 +50,8 @@ class ProjectionSet(Base):
     )
     inforce_file_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     assumption_table_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    # Pinned factor tables (by ID); a run never selects a factor table by name alone.
+    factor_table_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     scenario_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     valuation_date: Mapped[date] = mapped_column(Date, nullable=False)
     horizon_months: Mapped[int] = mapped_column(Integer, nullable=False)

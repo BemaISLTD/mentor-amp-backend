@@ -19,7 +19,7 @@ import app.db.models  # noqa: F401 - register every table
 from app.config import settings
 from app.db.database import Base, get_db
 from app.main import app
-from app.services import run_service
+from app.services import run_execution_service
 
 BACKEND = Path(__file__).resolve().parents[2]
 HORIZON = 600
@@ -48,7 +48,7 @@ def env():
             db.close()
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(run_service, "SessionLocal", TestSession)
+    monkeypatch.setattr(run_execution_service, "SessionLocal", TestSession)
     seed = _load_seed_module()
     monkeypatch.setattr(seed, "SessionLocal", TestSession)
     app.dependency_overrides[get_db] = override_get_db
@@ -293,10 +293,13 @@ def test_manifest_events_dashboard_and_run_lists(env, ids):
     client = env["client"]
     base_manifest = get(client, f"/runs/{ids['base']}/manifest")
     low_manifest = get(client, f"/runs/{ids['low']}/manifest")
-    assert base_manifest["manifest"]["outcome"]["status"] == "success"
-    assert base_manifest["fingerprint"] != low_manifest["fingerprint"]  # scenario differs
-    assert base_manifest["manifest"]["illustrative"] is True
-    assert {d["name"] for d in base_manifest["manifest"]["datasets"]} == {"synthetic_spia_inforce.csv"}
+    final = base_manifest["final_manifest"]["manifest"]
+    assert final["runtime"]["status"] == "success"
+    # The package fingerprint is the configuration identity: the scenario differs, so it differs.
+    assert base_manifest["run_package"]["fingerprint"] != low_manifest["run_package"]["fingerprint"]
+    assert base_manifest["final_manifest"]["fingerprint"] != base_manifest["run_package"]["fingerprint"]
+    assert final["configuration"]["illustrative"] is True
+    assert {d["name"] for d in final["configuration"]["datasets"]["inforce"]} == {"synthetic_spia_inforce.csv"}
 
     events = get(client, f"/runs/{ids['base']}/events")["events"]
     assert events[0]["step"] == "queued" and events[-1]["step"] == "complete"

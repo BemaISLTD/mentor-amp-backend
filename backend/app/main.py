@@ -19,13 +19,14 @@ from app.api.variables import router as variables_router
 from app.config import settings
 from app.products.registry import register_all_products
 from app.services.common import register_service_error_handler
+from app.version import APP_VERSION
 
 # Formula functions are code: register them once at startup (contract §F.4).
 register_all_products()
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.1.0",
+    version=APP_VERSION,
     docs_url="/docs" if settings.debug else None,
     redoc_url="/redoc" if settings.debug else None,
 )
@@ -53,7 +54,7 @@ app.include_router(
 actuarial_access = [Depends(require_roles("admin", "actuary"))]
 app.include_router(imports_router, prefix=API_PREFIX, dependencies=actuarial_access)
 app.include_router(variables_router, prefix=API_PREFIX, dependencies=actuarial_access)
-# Milestone 1 routers (permission checks are declared on each endpoint).
+# Milestone 1 routers: permission and project-access checks are declared on each endpoint.
 app.include_router(modeling_router, prefix=API_PREFIX)
 app.include_router(formulas_router, prefix=API_PREFIX, dependencies=actuarial_access)
 app.include_router(system_router, prefix=API_PREFIX)

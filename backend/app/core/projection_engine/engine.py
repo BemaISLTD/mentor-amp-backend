@@ -29,6 +29,10 @@ from app.core.projection_engine.run_data import (
 )
 from app.core.valuation import illustrative_reserve
 
+# Identifies the calculation semantics of this engine. Change it whenever a change to the engine
+# could alter results: a run package frozen under one engine version is refused by another.
+ENGINE_VERSION = "m1-cpu-1"
+
 CONTEXT_FIELDS = (
     "projection_month",
     "policy_month",

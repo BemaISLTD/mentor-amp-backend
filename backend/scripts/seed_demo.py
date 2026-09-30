@@ -1,8 +1,13 @@
 """Seed the Milestone 1 demo into the configured database (idempotent).
 
-Creates (or updates) the demo user, project, SPIA illustrative model, variables, formulas,
-published outputs, synthetic mortality table, synthetic inforce, scenarios and a validated
-Projection Set. Running it twice creates nothing new. Contract: §G.
+Creates (or updates) the demo user, project (with the demo user as owner), SPIA illustrative
+model, variables, formulas, published outputs, synthetic mortality table, synthetic inforce,
+scenarios and a Projection Set. Running it twice creates nothing new. Contract: §G.
+
+Nothing is marked "validated" by assumption: every status comes from a validator that ran here
+(model checks, the inforce validator, the lookup-table validator, scenario override checks,
+Projection Set validation). This script is also the explicit setup step that provisions the demo
+user — request authentication never creates users.
 
 Usage (from the repository root):
   backend/.venv/Scripts/python backend/scripts/seed_demo.py
@@ -16,8 +21,15 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
-from app.api.dependencies import get_demo_user  # noqa: E402
-from app.core.formula_engine.formulas import FORMULA_METADATA  # noqa: E402
+from app.core import lifecycle  # noqa: E402
+from app.core.execution.fingerprints import (  # noqa: E402
+    inforce_fingerprint,
+    scenario_fingerprint,
+    table_fingerprint,
+)
+from app.core.formula_engine.formulas import FORMULA_FUNCTIONS, FORMULA_METADATA  # noqa: E402
+from app.data.validation.inforce_validator import validate_inforce  # noqa: E402
+from app.data.validation.table_validator import validate_lookup_table  # noqa: E402
 from app.db.database import SessionLocal  # noqa: E402
 from app.db.models.assumption import AssumptionSet, AssumptionTable  # noqa: E402
 from app.db.models.formula import FormulaRegistry  # noqa: E402
@@ -30,8 +42,10 @@ from app.db.models.scenario import ScenarioSet, ScenarioTable  # noqa: E402
 from app.db.models.variable import VariableRegistry  # noqa: E402
 from app.products.registry import register_all_products  # noqa: E402
 from app.products.spia_lite import config as spia  # noqa: E402
-from app.services import projection_set_service  # noqa: E402
-from app.services.common import fingerprint  # noqa: E402
+from app.services import catalog_service, projection_set_service  # noqa: E402
+from app.services.bootstrap import ensure_demo_user, ensure_member  # noqa: E402
+from app.services.model_definition import to_variable_spec  # noqa: E402
+from app.services.run_package_service import override_problems  # noqa: E402
 
 SAMPLES = BACKEND.parent / "samples" / "spia"
 PROJECT_NAME = "MentorAmp Demo — SPIA (Illustrative)"
@@ -47,15 +61,16 @@ def read_csv(path: Path) -> list[dict]:
         return list(csv.DictReader(handle))
 
 
-def upsert_project(db, user) -> Project:
-    project = db.query(Project).filter(Project.name == PROJECT_NAME).first()
+def upsert_project(db, user, name: str = PROJECT_NAME) -> Project:
+    project = db.query(Project).filter(Project.name == name).first()
     if project is None:
         project = Project(
-            name=PROJECT_NAME,
+            name=name,
             description="Synthetic data and illustrative formulas for the first end-to-end run (M1).",
         )
         db.add(project)
         db.flush()
+    ensure_member(db, project.id, user.id)
     return project
 
 
@@ -63,12 +78,11 @@ def upsert_model(db, project, user) -> tuple[Model, ModelVersion, FormulaGroup]:
     definition = spia.MODEL
     model = db.query(Model).filter(Model.project_id == project.id, Model.name == definition["name"]).first()
     if model is None:
-        model = Model(project_id=project.id, name=definition["name"])
+        model = Model(project_id=project.id, name=definition["name"], status=lifecycle.DRAFT)
         db.add(model)
     model.product_code = definition["product_code"]
     model.description = definition["description"]
     model.owner_user_id = user.id
-    model.status = "validated"
     db.flush()
 
     version_def = definition["version"]
@@ -78,11 +92,10 @@ def upsert_model(db, project, user) -> tuple[Model, ModelVersion, FormulaGroup]:
         .first()
     )
     if version is None:
-        version = ModelVersion(model_id=model.id, version_label=version_def["version_label"])
+        version = ModelVersion(model_id=model.id, version_label=version_def["version_label"], status=lifecycle.DRAFT)
         db.add(version)
     for field in ("block_name", "profile_name", "basis", "methodology", "notes"):
         setattr(version, field, version_def[field])
-    version.status = "validated"
     version.is_current = True
     version.illustrative = True
     db.flush()
@@ -144,7 +157,8 @@ def upsert_formulas(db, version, group) -> None:
         row.product_applicability = [spia.PRODUCT_CODE]
         row.basis_applicability = [version.basis]
         row.version = "v1"
-        row.status = "validated"
+        # Validated only if its implementation is registered (checked, not assumed).
+        row.status = lifecycle.VALIDATED if row.function_ref in FORMULA_FUNCTIONS else lifecycle.DRAFT
         row.group_id = group.id
         row.expression_text = meta.expression_text
         row.explanation = meta.explanation
@@ -178,6 +192,17 @@ def upsert_published_outputs(db, version) -> None:
     db.flush()
 
 
+def validate_model(db, model, version) -> dict:
+    formulas = db.query(FormulaRegistry).filter(FormulaRegistry.model_version_id == version.id).all()
+    published = db.query(ModelPublishedOutput).filter(ModelPublishedOutput.model_version_id == version.id).all()
+    checks = catalog_service.model_version_checks(db, formulas, published)
+    status = lifecycle.VALIDATED if checks["status"] == "validated" else lifecycle.DRAFT
+    version.status = status
+    model.status = status
+    db.flush()
+    return checks
+
+
 def upsert_mortality(db, project) -> AssumptionTable:
     assumption_set = (
         db.query(AssumptionSet)
@@ -208,8 +233,9 @@ def upsert_mortality(db, project) -> AssumptionTable:
     table.value_column = "qx"
     table.data = rows
     table.version_label = "v1"
-    table.status = "validated"
-    table.fingerprint = fingerprint(rows)
+    errors = validate_lookup_table(rows, table.lookup_keys, table.value_column, (0.0, 1.0))
+    table.status = lifecycle.NEEDS_REVIEW if errors else lifecycle.VALIDATED
+    table.fingerprint = table_fingerprint(rows)
     table.description = (
         "Synthetic Gompertz mortality by age and gender (SYNTHETIC — not a published table). "
         "Terminal age 120."
@@ -232,9 +258,11 @@ def upsert_inforce(db, project) -> InforceFile:
         db.add_all(InforceRecord(file_id=file.id, policy_id=row["policy_id"], data=row) for row in rows)
     file.row_count = len(rows)
     file.columns_detected = list(rows[0].keys())
-    file.status = "validated"
+    errors = validate_inforce(rows)
+    file.status = lifecycle.NEEDS_REVIEW if errors else lifecycle.VALIDATED
     file.version_label = "v2026.12"
-    file.fingerprint = fingerprint(sorted(rows, key=lambda row: row["policy_id"]))
+    # Same order the run loader uses: policy_id, then load order.
+    file.fingerprint = inforce_fingerprint(sorted(rows, key=lambda row: row["policy_id"]))
     file.description = "25 synthetic SPIA policies (SYNTHETIC — not real policyholders)"
     db.flush()
     return file
@@ -253,6 +281,7 @@ def upsert_scenarios(db, project) -> list[ScenarioTable]:
         )
         db.add(scenario_set)
         db.flush()
+    variables = {row.name: to_variable_spec(row) for row in db.query(VariableRegistry).all()}
     definitions = [
         ("Base", "Discount rate 4.5% (the variable default).", []),
         ("Low Interest Rate", "Discount rate set to 3.0%.",
@@ -271,12 +300,13 @@ def upsert_scenarios(db, project) -> list[ScenarioTable]:
             db.add(scenario)
         scenario.description = description
         scenario.overrides = overrides
-        scenario.status = "validated"
+        problems = override_problems(f"Scenario '{name}'", overrides, variables)
+        scenario.status = lifecycle.NEEDS_REVIEW if problems else lifecycle.VALIDATED
         scenario.version_label = "v1"
         scenario.scenario_type = "deterministic"
         scenario.as_of_date = VALUATION_DATE
         scenario.path_count = 1
-        scenario.fingerprint = fingerprint(overrides)
+        scenario.fingerprint = scenario_fingerprint(overrides)
         db.flush()
         scenarios.append(scenario)
     return scenarios
@@ -292,13 +322,14 @@ def upsert_projection_set(db, project, version, inforce, table, scenarios, user)
     if projection_set is None:
         projection_set = ProjectionSet(
             project_id=project.id, name=PROJECTION_SET_NAME, version_label="v1", created_by=user.id,
-            valuation_date=VALUATION_DATE, horizon_months=600,
+            valuation_date=VALUATION_DATE, horizon_months=600, status=lifecycle.DRAFT,
         )
         db.add(projection_set)
     projection_set.description = "Illustrative SPIA valuation for the M1 demo."
     projection_set.model_version_id = version.id
     projection_set.inforce_file_ids = [inforce.id]
     projection_set.assumption_table_ids = [table.id]
+    projection_set.factor_table_ids = []
     projection_set.scenario_ids = [scenario.id for scenario in scenarios]
     projection_set.valuation_date = VALUATION_DATE
     projection_set.horizon_months = 600
@@ -312,30 +343,44 @@ def upsert_projection_set(db, project, version, inforce, table, scenarios, user)
     return projection_set
 
 
-def main() -> None:
+def seed(db, project_name: str = PROJECT_NAME) -> dict:
+    """Seed one demo project into ``db``; return the objects created (used by tests too)."""
     register_all_products()
+    user = ensure_demo_user(db)
+    project = upsert_project(db, user, project_name)
+    model, version, group = upsert_model(db, project, user)
+    upsert_variables(db)
+    upsert_formulas(db, version, group)
+    upsert_published_outputs(db, version)
+    model_checks = validate_model(db, model, version)
+    table = upsert_mortality(db, project)
+    inforce = upsert_inforce(db, project)
+    scenarios = upsert_scenarios(db, project)
+    projection_set = upsert_projection_set(db, project, version, inforce, table, scenarios, user)
+    db.commit()
+    validated = projection_set_service.validate(db, projection_set.id)
+    return {
+        "user": user, "project": project, "model": model, "version": version,
+        "model_checks": model_checks, "table": table, "inforce": inforce, "scenarios": scenarios,
+        "projection_set": projection_set, "validation": validated,
+    }
+
+
+def main() -> None:
     db = SessionLocal()
     try:
-        user = get_demo_user(db)
-        project = upsert_project(db, user)
-        model, version, group = upsert_model(db, project, user)
-        upsert_variables(db)
-        upsert_formulas(db, version, group)
-        upsert_published_outputs(db, version)
-        table = upsert_mortality(db, project)
-        inforce = upsert_inforce(db, project)
-        scenarios = upsert_scenarios(db, project)
-        projection_set = upsert_projection_set(db, project, version, inforce, table, scenarios, user)
-        db.commit()
-        validated = projection_set_service.validate(db, projection_set.id)
+        seeded = seed(db)
         print("Seed complete.")
-        print(f"  project        {project.id}  {project.name}")
-        print(f"  model version  {version.id}  {model.name} {version.version_label}")
-        print(f"  inforce file   {inforce.id}  {inforce.row_count} policies")
-        print(f"  mortality      {table.id}  {len(table.data)} rows")
-        for scenario in scenarios:
-            print(f"  scenario       {scenario.id}  {scenario.scenario_name}")
-        print(f"  projection set {projection_set.id}  status={validated['status']}")
+        print(f"  project        {seeded['project'].id}  {seeded['project'].name}")
+        print(f"  model version  {seeded['version'].id}  {seeded['model'].name} "
+              f"{seeded['version'].version_label} ({seeded['version'].status})")
+        print(f"  inforce file   {seeded['inforce'].id}  {seeded['inforce'].row_count} policies "
+              f"({seeded['inforce'].status})")
+        print(f"  mortality      {seeded['table'].id}  {len(seeded['table'].data)} rows ({seeded['table'].status})")
+        for scenario in seeded["scenarios"]:
+            print(f"  scenario       {scenario.id}  {scenario.scenario_name} ({scenario.status})")
+        validated = seeded["validation"]
+        print(f"  projection set {seeded['projection_set'].id}  status={validated['status']}")
         for check in validated["validation"]["checks"]:
             print(f"    [{check['status']:7}] {check['label']}: {check['message']}")
     finally:

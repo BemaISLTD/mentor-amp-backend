@@ -6,6 +6,7 @@ from datetime import date, datetime, timezone
 from sqlalchemy import Date, DateTime, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core import lifecycle
 from app.db.database import Base
 
 
@@ -46,7 +47,8 @@ class ScenarioTable(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
     # --- M1: lifecycle, provenance and scenario description ---
-    status: Mapped[str] = mapped_column(String(30), default="validated", nullable=False)
+    # app.core.lifecycle: "validated" only after a validation actually ran and passed.
+    status: Mapped[str] = mapped_column(String(30), default=lifecycle.DRAFT, nullable=False)
     version_label: Mapped[str | None] = mapped_column(String(30), nullable=True)
     fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     scenario_type: Mapped[str] = mapped_column(String(30), default="deterministic", nullable=False)

@@ -111,6 +111,8 @@ class RunData:
     horizon_months: int
     output_variables: list[str]
     traced_policy_ids: frozenset[str] = frozenset()
+    # Projection Set parameters, frozen in the run package (no M1 formula reads them yet).
+    parameters: dict[str, Any] = field(default_factory=dict)
 
     def valuation_variables(self) -> list[VariableSpec]:
         return [spec for spec in self.variables.values() if spec.source_type == "valuation"]

@@ -8,9 +8,11 @@ from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
 from app.config import settings
+from app.core.projection_engine.engine import ENGINE_VERSION
 from app.db.database import get_db
 from app.products.registry import REGISTERED_PRODUCTS, registered_function_count
 from app.services.common import iso, now_utc
+from app.version import APP_VERSION
 
 router = APIRouter(prefix="/system", tags=["system"])
 SLOW_DATABASE_MS = 2000
@@ -34,7 +36,8 @@ def system_status(db: Session = Depends(get_db)):
     return {
         "status": "degraded" if degraded else "ok",
         "app": settings.app_name,
-        "version": "0.1.0",
+        "version": APP_VERSION,
+        "app_env": settings.app_env,
         "code_version": settings.code_version,
         "auth_mode": settings.auth_mode,
         "database": database,
@@ -42,6 +45,7 @@ def system_status(db: Session = Depends(get_db)):
             "registered_functions": functions,
             "products": list(REGISTERED_PRODUCTS),
             "execution_backend": "cpu",
+            "engine_version": ENGINE_VERSION,
         },
         "time": iso(now_utc()),
     }

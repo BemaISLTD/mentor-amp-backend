@@ -21,9 +21,11 @@ class TraceLog(Base):
     policy_id: Mapped[str] = mapped_column(String(100), nullable=False)
     scenario_id: Mapped[str] = mapped_column(String(100), nullable=False)
     projection_month: Mapped[int] = mapped_column(Integer, nullable=False)
-    formula_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("formula_registry.id", ondelete="SET NULL"), nullable=True
-    )
+    # The run attempt that wrote this row; only runs.accepted_attempt_number is canonical.
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The run package's formula ID, kept as plain data (no foreign key): trace rows are
+    # historical evidence and must not change when a formula is later edited or deleted.
+    formula_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     variable_name: Mapped[str] = mapped_column(String(255), nullable=False)
     input_values: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     output_value: Mapped[dict | None] = mapped_column(JSON, nullable=True)

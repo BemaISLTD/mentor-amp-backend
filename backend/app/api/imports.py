@@ -1,14 +1,16 @@
 """API endpoints for file import and preview."""
 
-import os
 import shutil
 import uuid
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
-from app.config import settings
+from app.api.dependencies import get_current_user
+from app.core import lifecycle
+from app.core.execution.fingerprints import inforce_fingerprint
 from app.data.importers.base import detect_format, import_file, preview_file
 from app.data.validation.inforce_validator import validate_inforce
 from app.data.validation.assumption_validator import validate_assumptions
@@ -16,11 +18,14 @@ from app.data.validation.factor_validator import validate_factors
 from app.data.validation.scenario_validator import validate_scenarios
 from app.db.database import get_db
 from app.db.models import InforceFile, InforceRecord
+from app.db.models.user import User
 from app.models.schemas import ImportPreviewResponse
+from app.services import access
 
 router = APIRouter(prefix="/imports", tags=["imports"])
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
+CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
 def _save_upload(file: UploadFile) -> str:
@@ -35,11 +40,13 @@ def _save_upload(file: UploadFile) -> str:
 
 @router.post("/inforce", status_code=status.HTTP_201_CREATED)
 def upload_inforce(
+    user: CurrentUser,
     file: UploadFile = File(...),
     project_id: str = Query(...),
     db: Session = Depends(get_db),
 ):
     """Upload an inforce file, validate, and store."""
+    access.require_project_access(db, user, project_id, write=True)
     try:
         fmt = detect_format(file.filename or "unknown.tsv")
     except ValueError:
@@ -47,13 +54,24 @@ def upload_inforce(
 
     file_path = _save_upload(file)
 
+    validation_errors: list[dict] = []
+
+    def validate(rows: list[dict]) -> list[dict]:
+        validation_errors.extend(validate_inforce(rows))
+        return validation_errors
+
     def store_inforce(session: Session, rows: list[dict]) -> int:
+        # Stored only when validation found no blocking error (import_file); warnings leave the
+        # file in needs_review. The fingerprint uses the same order the run loader reads.
+        ordered = sorted(enumerate(rows), key=lambda item: (str(item[1].get("policy_id", f"row_{item[0]}")), item[0]))
         infile = InforceFile(
             project_id=project_id,
             filename=file.filename or "unknown",
             file_type=fmt,
             row_count=len(rows),
             columns_detected=list(rows[0].keys()) if rows else [],
+            status=lifecycle.NEEDS_REVIEW if validation_errors else lifecycle.VALIDATED,
+            fingerprint=inforce_fingerprint(row for _index, row in ordered),
         )
         session.add(infile)
         session.flush()
@@ -70,17 +88,19 @@ def upload_inforce(
         session.commit()
         return len(records)
 
-    result = import_file(file_path, db, validate_inforce, store_inforce)
+    result = import_file(file_path, db, validate, store_inforce)
     return result
 
 
 @router.post("/assumptions", status_code=status.HTTP_201_CREATED)
 def upload_assumptions(
+    user: CurrentUser,
     file: UploadFile = File(...),
     project_id: str = Query(...),
     db: Session = Depends(get_db),
 ):
     """Upload an assumption file, validate, and store."""
+    access.require_project_access(db, user, project_id, write=True)
     try:
         detect_format(file.filename or "unknown.tsv")
     except ValueError:
@@ -101,11 +121,13 @@ def upload_assumptions(
 
 @router.post("/factors", status_code=status.HTTP_201_CREATED)
 def upload_factors(
+    user: CurrentUser,
     file: UploadFile = File(...),
     project_id: str = Query(...),
     db: Session = Depends(get_db),
 ):
     """Upload a factor file, validate, and store."""
+    access.require_project_access(db, user, project_id, write=True)
     try:
         detect_format(file.filename or "unknown.tsv")
     except ValueError:
@@ -127,11 +149,13 @@ def upload_factors(
 
 @router.post("/scenarios", status_code=status.HTTP_201_CREATED)
 def upload_scenarios(
+    user: CurrentUser,
     file: UploadFile = File(...),
     project_id: str = Query(...),
     db: Session = Depends(get_db),
 ):
     """Upload a scenario file, validate, and store."""
+    access.require_project_access(db, user, project_id, write=True)
     try:
         detect_format(file.filename or "unknown.tsv")
     except ValueError:
@@ -153,11 +177,15 @@ def upload_scenarios(
 
 @router.get("/preview", response_model=ImportPreviewResponse)
 def preview_upload(file_path: str = Query(...)):
-    """Preview an uploaded file (first 20 rows) without storing."""
-    if not os.path.exists(file_path):
+    """Preview an uploaded file (first 20 rows) without storing anything.
+
+    Only files inside the upload directory can be previewed (no arbitrary server paths).
+    """
+    candidate = Path(file_path).resolve()
+    if not candidate.is_relative_to(UPLOAD_DIR.resolve()) or not candidate.is_file():
         raise HTTPException(status_code=404, detail="File not found.")
 
-    data = preview_file(file_path, max_rows=20)
+    data = preview_file(str(candidate), max_rows=20)
     return ImportPreviewResponse(
         columns=data["columns"],
         row_count=data["row_count"],

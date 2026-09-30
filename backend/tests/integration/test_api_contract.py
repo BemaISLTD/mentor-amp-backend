@@ -9,6 +9,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db.database import get_db
 from app.db.models.project import Project
+from app.db.models.project_member import ProjectMember
 from app.api.dependencies import get_current_user
 from app.main import app
 
@@ -21,6 +22,8 @@ def db_session():
         poolclass=StaticPool,
     )
     Project.__table__.create(engine)
+    # Creating a project records its creator as owner (project-scoped authorization).
+    ProjectMember.__table__.create(engine)
     session = sessionmaker(bind=engine)()
     try:
         yield session

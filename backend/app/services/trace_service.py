@@ -1,7 +1,10 @@
 """Trace: explain one calculated value from rows captured during the run (contract §E.10, §F.6).
 
 Nothing is recalculated here. The tree is assembled from ``trace_logs`` rows written by the
-engine while it calculated, so children are exactly the inputs the formula actually used.
+engine while it calculated, so children are exactly the inputs the formula actually used. Only
+rows of the run's accepted attempt are read, under the same access rules as other results, and
+formula text/version, variable names and units come from the run's frozen package, not from
+today's (editable) registry.
 """
 
 from typing import Any
@@ -10,23 +13,35 @@ from sqlalchemy.orm import Session
 
 from app.core.projection_engine.engine import month_end_after
 from app.core.valuation import illustrative_reserve
-from app.db.models.formula import FormulaRegistry
-from app.db.models.scenario import ScenarioTable
+from app.db.models.run import Run
 from app.db.models.trace_log import TraceLog
-from app.db.models.variable import VariableRegistry
 from app.services.common import ServiceError, iso, not_found, unwrap_value
-from app.services.run_service import get_run
+from app.services.results_service import is_complete, result_run
+from app.services.run_query_service import run_configuration
 
 MAX_DEPTH = 10
 
 
-def traced_policies(db: Session, run_id: str) -> dict[str, Any]:
-    run = get_run(db, run_id)
-    policy_ids = sorted(
-        row[0] for row in db.query(TraceLog.policy_id).filter(TraceLog.run_id == run.id).distinct().all()
+def _accepted(db: Session, run: Run):
+    return db.query(TraceLog).filter(
+        TraceLog.run_id == run.id, TraceLog.attempt_number == run.accepted_attempt_number,
     )
-    mode = ((run.manifest or {}).get("trace_scope") or {}).get("mode", "none")
-    return {"run_id": run.id, "mode": mode, "policy_ids": policy_ids, "months": run.horizon_months}
+
+
+def _traced_policy_ids(db: Session, run: Run) -> list[str]:
+    return sorted(
+        row[0] for row in db.query(TraceLog.policy_id)
+        .filter(TraceLog.run_id == run.id, TraceLog.attempt_number == run.accepted_attempt_number)
+        .distinct().all()
+    )
+
+
+def traced_policies(db: Session, run_id: str, include_partial: bool = False) -> dict[str, Any]:
+    run = result_run(db, run_id, include_partial)
+    config = run_configuration(db, run)
+    mode = ((config.get("outputs") or {}).get("trace_scope") or {}).get("mode", "none")
+    return {"run_id": run.id, "mode": mode, "policy_ids": _traced_policy_ids(db, run),
+            "months": run.horizon_months, "complete": is_complete(run)}
 
 
 class _TraceIndex:
@@ -45,28 +60,22 @@ class _TraceIndex:
 
 
 class _TreeBuilder:
-    def __init__(self, db: Session, run, rows: list[TraceLog]):
-        self.db = db
+    def __init__(self, run, config: dict[str, Any], rows: list[TraceLog]):
         self.run = run
         self.index = _TraceIndex(rows)
-        self.variables = {row.name: row for row in db.query(VariableRegistry).all()}
-        self._formulas: dict[str, FormulaRegistry | None] = {}
-
-    def _formula(self, formula_id: str) -> FormulaRegistry | None:
-        if formula_id not in self._formulas:
-            self._formulas[formula_id] = self.db.get(FormulaRegistry, formula_id)
-        return self._formulas[formula_id]
+        self.variables = {entry["name"]: entry for entry in config.get("variables") or []}
+        self.formulas = {entry["id"]: entry for entry in config.get("formulas") or [] if entry.get("id")}
 
     def _base(self, variable: str, month: int, kind: str, value: Any) -> dict[str, Any]:
-        registry = self.variables.get(variable)
+        registry = self.variables.get(variable) or {}
         return {
             "variable": variable,
-            "display_name": (registry.display_name if registry and registry.display_name else variable),
+            "display_name": registry.get("display_name") or variable,
             "kind": kind,
             "month": month,
             "period_end_date": iso(month_end_after(self.run.valuation_date, month)) if self.run.valuation_date else None,
             "value": value,
-            "unit": registry.unit if registry else None,
+            "unit": registry.get("unit"),
             "formula": None,
             "source": None,
             "scenario_override": None,
@@ -79,15 +88,16 @@ class _TreeBuilder:
         key = (variable, month)
         if key in self.index.formula:
             row = self.index.formula[key]
-            formula = self._formula(row.formula_id)
+            formula = self.formulas.get(row.formula_id) or {}
             node = self._base(variable, month, "formula", unwrap_value(row.output_value))
             node["formula"] = {
                 "id": row.formula_id,
-                "name": formula.name if formula else None,
-                "function_ref": formula.function_ref if formula else None,
-                "expression_text": formula.expression_text if formula else None,
-                "version": formula.version if formula else None,
-                "illustrative": bool(formula.illustrative) if formula else False,
+                "name": formula.get("name"),
+                "function_ref": formula.get("function_ref"),
+                "expression_text": formula.get("expression_text"),
+                "version": formula.get("version"),
+                "content_fingerprint": formula.get("content_fingerprint"),
+                "illustrative": bool(formula.get("illustrative")),
             }
             inputs = list((row.input_values or {}).keys())
             if depth <= 0:
@@ -169,21 +179,21 @@ class _TreeBuilder:
 
 
 def trace_tree(
-    db: Session, run_id: str, policy_id: str, month: int, variable: str, depth: int = 4
+    db: Session, run_id: str, policy_id: str, month: int, variable: str, depth: int = 4,
+    include_partial: bool = False,
 ) -> dict[str, Any]:
-    run = get_run(db, run_id)
+    run = result_run(db, run_id, include_partial)
     depth = max(0, min(depth, MAX_DEPTH))
     rows = (
-        db.query(TraceLog)
+        _accepted(db, run)
         .filter(
-            TraceLog.run_id == run.id,
             TraceLog.policy_id == policy_id,
             TraceLog.projection_month.in_([month, month + 1, max(month, 1)]),
         )
         .all()
     )
     if not rows:
-        traced = traced_policies(db, run.id)["policy_ids"]
+        traced = _traced_policy_ids(db, run)
         if policy_id not in traced:
             raise ServiceError(
                 404, "NOT_FOUND",
@@ -191,13 +201,17 @@ def trace_tree(
                 {"reason": "TRACE_NOT_CAPTURED", "traced_policy_ids": traced},
             )
         raise not_found(f"No trace for month {month}.")
-    builder = _TreeBuilder(db, run, rows)
+    config = run_configuration(db, run)
+    builder = _TreeBuilder(run, config, rows)
     root = builder.node(variable, month, depth)
-    scenario = db.get(ScenarioTable, run.scenario_id) if run.scenario_id else None
+    scenario = config.get("scenario") or {}
     return {
         "run_id": run.id,
+        "attempt_number": run.accepted_attempt_number,
+        "complete": is_complete(run),
+        "run_package_fingerprint": run.run_package_fingerprint,
         "policy_id": policy_id,
-        "scenario": {"id": scenario.id, "name": scenario.scenario_name} if scenario else None,
+        "scenario": {"id": scenario.get("id"), "name": scenario.get("name")} if scenario.get("id") else None,
         "month": month,
         "period_end_date": iso(month_end_after(run.valuation_date, month)) if run.valuation_date else None,
         "illustrative": bool(run.illustrative),
@@ -205,12 +219,13 @@ def trace_tree(
     }
 
 
-def dependents(db: Session, run_id: str, policy_id: str, month: int, variable: str) -> dict[str, Any]:
-    run = get_run(db, run_id)
+def dependents(
+    db: Session, run_id: str, policy_id: str, month: int, variable: str, include_partial: bool = False,
+) -> dict[str, Any]:
+    run = result_run(db, run_id, include_partial)
     rows = (
-        db.query(TraceLog)
+        _accepted(db, run)
         .filter(
-            TraceLog.run_id == run.id,
             TraceLog.policy_id == policy_id,
             TraceLog.projection_month.in_([month - 1, month, month + 1]),
         )
@@ -220,7 +235,7 @@ def dependents(db: Session, run_id: str, policy_id: str, month: int, variable: s
         raise ServiceError(
             404, "NOT_FOUND",
             f"Trace was not captured for policy '{policy_id}' in this run.",
-            {"reason": "TRACE_NOT_CAPTURED", "traced_policy_ids": traced_policies(db, run.id)["policy_ids"]},
+            {"reason": "TRACE_NOT_CAPTURED", "traced_policy_ids": _traced_policy_ids(db, run)},
         )
     found: list[dict[str, Any]] = []
     for row in rows:

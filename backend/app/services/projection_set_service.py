@@ -1,4 +1,10 @@
-"""Projection Sets: create, edit, validate, duplicate, attach scenarios (contract §E.6)."""
+"""Projection Sets: create, edit, validate, duplicate, attach scenarios (contract §E.6).
+
+Every object a Projection Set references (model version, inforce files, assumption and factor
+tables, scenarios) must belong to the Projection Set's project; this is enforced when the set is
+created or edited, again by validation, and once more when a run is submitted (the run package
+freeze). Validation uses the same checks as the freeze (``run_package_service``).
+"""
 
 import re
 from typing import Any
@@ -7,45 +13,48 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.core.formula_engine.formulas import FORMULA_FUNCTIONS
+from app.core import lifecycle
 from app.db.models.assumption import AssumptionTable
+from app.db.models.factor import FactorTable
 from app.db.models.formula import FormulaRegistry
 from app.db.models.inforce import InforceFile, InforceRecord
-from app.db.models.modeling import Model, ModelPublishedOutput, ModelVersion
+from app.db.models.modeling import Model, ModelVersion
 from app.db.models.projection import ProjectionSet
 from app.db.models.scenario import ScenarioTable
-from app.db.models.variable import VariableRegistry
-from app.products.registry import register_all_products
-from app.services import catalog_service
-from app.services.common import conflict, iso, not_found, now_utc, user_ref
-from app.services.run_loader import load_variable_closure, to_variable_spec
+from app.services import access, catalog_service
+from app.services import run_package_service as checks
+from app.services.common import ServiceError, conflict, iso, not_found, now_utc, user_ref
 
-RUNNABLE_STATUSES = {"validated", "needs_review"}
 EDITABLE_FIELDS = (
     "name", "description", "model_version_id", "inforce_file_ids", "assumption_table_ids",
-    "scenario_ids", "valuation_date", "horizon_months", "time_step", "output_variables",
-    "trace_scope", "parameters",
+    "factor_table_ids", "scenario_ids", "valuation_date", "horizon_months", "time_step",
+    "output_variables", "trace_scope", "parameters",
+)
+REFERENCE_FIELDS = (
+    ("inforce_file_ids", "inforce_file"),
+    ("assumption_table_ids", "assumption_table"),
+    ("factor_table_ids", "factor_table"),
+    ("scenario_ids", "scenario"),
 )
 
 
-def _get(db: Session, projection_set_id: str) -> ProjectionSet:
+def get(db: Session, projection_set_id: str) -> ProjectionSet:
     projection_set = db.get(ProjectionSet, projection_set_id)
     if projection_set is None:
         raise not_found(f"Projection Set '{projection_set_id}' not found.")
     return projection_set
 
 
+def _tables(db: Session, model: type, ids: list[str]) -> list[Any]:
+    return db.query(model).filter(model.id.in_(ids)).all() if ids else []
+
+
 def serialize(db: Session, projection_set: ProjectionSet) -> dict[str, Any]:
     version = db.get(ModelVersion, projection_set.model_version_id) if projection_set.model_version_id else None
     model = db.get(Model, version.model_id) if version else None
-    files = (
-        db.query(InforceFile).filter(InforceFile.id.in_(projection_set.inforce_file_ids)).all()
-        if projection_set.inforce_file_ids else []
-    )
-    tables = (
-        db.query(AssumptionTable).filter(AssumptionTable.id.in_(projection_set.assumption_table_ids)).all()
-        if projection_set.assumption_table_ids else []
-    )
+    files = _tables(db, InforceFile, list(projection_set.inforce_file_ids or []))
+    assumption_tables = _tables(db, AssumptionTable, list(projection_set.assumption_table_ids or []))
+    factor_tables = _tables(db, FactorTable, list(projection_set.factor_table_ids or []))
     scenarios = []
     for scenario_id in projection_set.scenario_ids or []:
         scenario = db.get(ScenarioTable, scenario_id)
@@ -76,10 +85,20 @@ def serialize(db: Session, projection_set: ProjectionSet) -> dict[str, Any]:
         ),
         "inputs": {
             "inforce_files": [
-                {"id": file.id, "name": file.filename, "record_count": file.row_count or 0}
+                {"id": file.id, "name": file.filename, "record_count": file.row_count or 0,
+                 "status": file.status, "fingerprint": file.fingerprint}
                 for file in files
             ],
-            "assumption_tables": [{"id": table.id, "name": table.table_name} for table in tables],
+            "assumption_tables": [
+                {"id": table.id, "name": table.table_name, "status": table.status,
+                 "version_label": table.version_label, "fingerprint": table.fingerprint}
+                for table in assumption_tables
+            ],
+            "factor_tables": [
+                {"id": table.id, "name": table.table_name, "status": table.status,
+                 "version_label": table.version_label, "fingerprint": table.fingerprint}
+                for table in factor_tables
+            ],
         },
         "scenarios": scenarios,
         "valuation_date": iso(projection_set.valuation_date),
@@ -89,7 +108,7 @@ def serialize(db: Session, projection_set: ProjectionSet) -> dict[str, Any]:
         "trace_scope": dict(projection_set.trace_scope or {"mode": "none", "policy_ids": []}),
         "parameters": dict(projection_set.parameters or {}),
         "counts": {
-            "input_count": len(files) + len(tables),
+            "input_count": len(files) + len(assumption_tables) + len(factor_tables),
             "formula_count": formula_count,
             "scenario_count": len(scenarios),
             "policy_count": sum(file.row_count or 0 for file in files),
@@ -115,28 +134,44 @@ def list_projection_sets(
     return {"projection_sets": [serialize(db, row) for row in rows], "total": len(rows)}
 
 
-def _normalise_trace_scope(scope: dict | None) -> dict[str, Any]:
-    scope = dict(scope or {})
-    return {"mode": scope.get("mode", "none"), "policy_ids": list(scope.get("policy_ids") or [])}
+def _check_references(db: Session, project_id: str, values: dict[str, Any]) -> None:
+    """Refuse any referenced object that is missing or belongs to another project (422)."""
+    foreign: list[dict[str, Any]] = []
+    model_version_id = values.get("model_version_id")
+    if model_version_id and access.project_id_of(db, "model_version", model_version_id) != project_id:
+        foreign.append({"field": "model_version_id", "id": model_version_id})
+    for field, kind in REFERENCE_FIELDS:
+        for object_id in values.get(field) or []:
+            if access.project_id_of(db, kind, object_id) != project_id:
+                foreign.append({"field": field, "id": object_id})
+    if foreign:
+        raise ServiceError(
+            422, "CROSS_PROJECT_REFERENCE",
+            "Referenced objects were not found in this project: "
+            + ", ".join(f"{item['field']} {item['id']}" for item in foreign),
+            {"references": foreign},
+        )
 
 
 def create(db: Session, project_id: str, payload: dict[str, Any], user: Any) -> dict[str, Any]:
     catalog_service.get_project(db, project_id)
+    _check_references(db, project_id, payload)
     projection_set = ProjectionSet(
         project_id=project_id,
         name=payload["name"],
         description=payload.get("description"),
         version_label=payload.get("version_label") or "v1",
-        status="draft",
+        status=lifecycle.DRAFT,
         model_version_id=payload.get("model_version_id"),
         inforce_file_ids=list(payload.get("inforce_file_ids") or []),
         assumption_table_ids=list(payload.get("assumption_table_ids") or []),
+        factor_table_ids=list(payload.get("factor_table_ids") or []),
         scenario_ids=list(payload.get("scenario_ids") or []),
         valuation_date=payload["valuation_date"],
         horizon_months=payload["horizon_months"],
         time_step=payload.get("time_step") or "monthly",
         output_variables=list(payload.get("output_variables") or []),
-        trace_scope=_normalise_trace_scope(payload.get("trace_scope")),
+        trace_scope=checks.normalise_trace_scope(payload.get("trace_scope")),
         parameters=dict(payload.get("parameters") or {}),
         created_by=user.id,
     )
@@ -158,26 +193,29 @@ def _commit_unique(db: Session, projection_set: ProjectionSet) -> None:
 
 
 def update(db: Session, projection_set_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    projection_set = _get(db, projection_set_id)
+    projection_set = get(db, projection_set_id)
+    _check_references(db, projection_set.project_id, payload)
     changed = False
     for field in EDITABLE_FIELDS:
         if field not in payload or payload[field] is None:
             continue
         value = payload[field]
         if field == "trace_scope":
-            value = _normalise_trace_scope(value)
+            value = checks.normalise_trace_scope(value)
         if getattr(projection_set, field) != value:
             setattr(projection_set, field, value)
             changed = True
     if changed:
-        projection_set.status = "draft"
+        # Any edit invalidates the previous validation; submitted runs are unaffected because
+        # each one executes its own frozen run package.
+        projection_set.status = lifecycle.DRAFT
         projection_set.validation = None
     _commit_unique(db, projection_set)
     return serialize(db, projection_set)
 
 
 def duplicate(db: Session, projection_set_id: str, version_label: str | None, user: Any) -> dict[str, Any]:
-    source = _get(db, projection_set_id)
+    source = get(db, projection_set_id)
     if not version_label:
         labels = [
             row[0] for row in db.query(ProjectionSet.version_label)
@@ -191,10 +229,11 @@ def duplicate(db: Session, projection_set_id: str, version_label: str | None, us
         name=source.name,
         description=source.description,
         version_label=version_label,
-        status="draft",
+        status=lifecycle.DRAFT,
         model_version_id=source.model_version_id,
         inforce_file_ids=list(source.inforce_file_ids or []),
         assumption_table_ids=list(source.assumption_table_ids or []),
+        factor_table_ids=list(source.factor_table_ids or []),
         scenario_ids=list(source.scenario_ids or []),
         valuation_date=source.valuation_date,
         horizon_months=source.horizon_months,
@@ -210,12 +249,11 @@ def duplicate(db: Session, projection_set_id: str, version_label: str | None, us
 
 
 def attach_scenario(db: Session, projection_set_id: str, scenario_id: str) -> dict[str, Any]:
-    projection_set = _get(db, projection_set_id)
-    if db.get(ScenarioTable, scenario_id) is None:
-        raise not_found(f"Scenario '{scenario_id}' not found.")
+    projection_set = get(db, projection_set_id)
+    _check_references(db, projection_set.project_id, {"scenario_ids": [scenario_id]})
     if scenario_id not in (projection_set.scenario_ids or []):
         projection_set.scenario_ids = list(projection_set.scenario_ids or []) + [scenario_id]
-        projection_set.status = "draft"
+        projection_set.status = lifecycle.DRAFT
         projection_set.validation = None
         db.commit()
         db.refresh(projection_set)
@@ -226,136 +264,106 @@ def attach_scenario(db: Session, projection_set_id: str, scenario_id: str) -> di
 # Validation (contract §E.6.2)
 # =============================================================================
 
+MODEL_CODES = {
+    "MODEL_VERSION_NOT_SELECTED", "MODEL_VERSION_NOT_FOUND", "MODEL_VERSION_NOT_RUNNABLE",
+    "NO_FORMULAS", "FORMULA_NOT_RUNNABLE", "VARIABLE_NOT_REGISTERED",
+}
+ENGINE_CODES = {"FUNCTION_NOT_REGISTERED", "FORMULA_GRAPH_INVALID"}
+
+
 def _check(code: str, label: str, status: str, message: str) -> dict[str, str]:
     return {"code": code, "label": label, "status": status, "message": message}
 
 
+def _messages(problems: list) -> str:
+    return "; ".join(problem.message for problem in problems[:4])
+
+
 def validate(db: Session, projection_set_id: str) -> dict[str, Any]:
-    register_all_products()
-    projection_set = _get(db, projection_set_id)
-    checks: list[dict[str, str]] = []
+    projection_set = get(db, projection_set_id)
+    project_id = projection_set.project_id
+    result: list[dict[str, str]] = []
 
-    version = db.get(ModelVersion, projection_set.model_version_id) if projection_set.model_version_id else None
-    model = db.get(Model, version.model_id) if version else None
-    formulas = (
-        db.query(FormulaRegistry).filter(FormulaRegistry.model_version_id == version.id).all()
-        if version else []
-    )
-    published = (
-        {row.variable_name for row in db.query(ModelPublishedOutput)
-         .filter(ModelPublishedOutput.model_version_id == version.id).all()}
-        if version else set()
-    )
-    if version is None:
-        checks.append(_check("model_version_selected", "Model version selected and validated", "fail",
-                             "No model version selected"))
-    else:
-        model_checks = catalog_service.model_version_checks(
-            db, formulas,
-            db.query(ModelPublishedOutput).filter(ModelPublishedOutput.model_version_id == version.id).all(),
-        )
-        checks.append(_check(
-            "model_version_selected", "Model version selected and validated",
-            "pass" if model_checks["status"] == "validated" else "fail",
-            f"{model.name if model else '?'} {version.version_label}",
-        ))
-
-    variables = load_variable_closure(db, formulas, list(projection_set.output_variables or []))
-
-    # inputs mapped
-    files = (
-        db.query(InforceFile).filter(InforceFile.id.in_(projection_set.inforce_file_ids)).all()
-        if projection_set.inforce_file_ids else []
-    )
-    if not files:
-        checks.append(_check("inputs_mapped", "All required inputs mapped", "fail", "No inforce file selected"))
-    else:
-        mappings = [
-            item
-            for file in files
-            for item in catalog_service.input_mappings(db, projection_set.project_id, file.id)["mappings"]
-        ]
-        present = [item for item in mappings if item["status"] == "validated"]
-        checks.append(_check(
-            "inputs_mapped", "All required inputs mapped",
-            "pass" if len(present) == len(mappings) else "fail",
-            f"{len(present)} of {len(mappings)} inforce columns present",
-        ))
-
-    # assumption tables pinned
-    needed = sorted({
-        spec.source.get("table") for spec in variables.values()
-        if spec.source_type == "assumption" and spec.source.get("table")
-    })
-    pinned_tables = (
-        db.query(AssumptionTable).filter(AssumptionTable.id.in_(projection_set.assumption_table_ids)).all()
-        if projection_set.assumption_table_ids else []
-    )
-    pinned_names = {table.table_name for table in pinned_tables}
-    missing_tables = [name for name in needed if name not in pinned_names]
-    checks.append(_check(
-        "assumption_tables_pinned", "Assumption tables pinned",
-        "fail" if missing_tables else "pass",
-        f"Missing: {', '.join(missing_tables)}" if missing_tables else (", ".join(needed) or "None needed"),
+    model = checks.check_model(db, project_id, projection_set)
+    model_problems = [p for p in model.problems if p.code in MODEL_CODES]
+    label = f"{model.model.name} {model.version.version_label}" if model.version and model.model else "—"
+    result.append(_check(
+        "model_version_selected", "Model version selected and validated",
+        "fail" if model_problems else "pass", _messages(model_problems) or label,
     ))
 
-    # scenarios compatible
-    all_variables = {row.name: to_variable_spec(row) for row in db.query(VariableRegistry).all()}
-    scenario_problems: list[str] = []
-    scenario_rows = []
+    files, inforce_problems = checks.check_inforce(db, project_id, list(projection_set.inforce_file_ids or []))
+    mappings = [
+        item
+        for file in files
+        for item in catalog_service.input_mappings(db, project_id, file.id)["mappings"]
+    ]
+    present = [item for item in mappings if item["status"] == "validated"]
+    if len(present) != len(mappings):
+        inforce_problems = inforce_problems + [checks.Problem(
+            "INPUT_COLUMNS_MISSING", f"{len(mappings) - len(present)} mapped inforce column(s) missing",
+        )]
+    result.append(_check(
+        "inputs_mapped", "All required inputs mapped, validated and fingerprinted",
+        "fail" if inforce_problems else "pass",
+        _messages(inforce_problems) or f"{len(present)} of {len(mappings)} inforce columns present",
+    ))
+
+    pinned: dict[str, list] = {}
+    table_problems: list = []
+    for kind, ids in (("assumption", projection_set.assumption_table_ids),
+                      ("factor", projection_set.factor_table_ids)):
+        pinned[kind], found = checks.check_tables(db, project_id, kind, list(ids or []))
+        table_problems += found
+    bindings, _columns, binding_problems = checks.bind_tables(model.variables, pinned)
+    table_problems += binding_problems
+    result.append(_check(
+        "assumption_tables_pinned", "Assumption and factor tables pinned by ID",
+        "fail" if table_problems else "pass",
+        _messages(table_problems) or (", ".join(sorted(bindings)) or "None needed"),
+    ))
+
+    scenario_problems: list = []
     for scenario_id in projection_set.scenario_ids or []:
-        scenario = db.get(ScenarioTable, scenario_id)
-        if scenario is None:
-            scenario_problems.append(f"scenario {scenario_id} not found")
-            continue
-        scenario_rows.append(scenario)
-        for override in scenario.overrides or []:
-            target = override.get("target_variable")
-            spec = all_variables.get(target)
-            if spec is None:
-                scenario_problems.append(f"{scenario.scenario_name}: '{target}' is not a variable")
-            elif spec.source_type in ("formula", "valuation"):
-                scenario_problems.append(f"{scenario.scenario_name}: '{target}' is a calculated output")
+        _scenario, _set, found = checks.check_scenario(db, project_id, scenario_id, model.variables)
+        scenario_problems += found
     if not projection_set.scenario_ids:
-        checks.append(_check("scenarios_compatible", "Scenario subset compatible", "fail", "No scenario selected"))
+        result.append(_check("scenarios_compatible", "Scenario subset compatible", "fail", "No scenario selected"))
     else:
-        checks.append(_check(
+        result.append(_check(
             "scenarios_compatible", "Scenario subset compatible",
             "fail" if scenario_problems else "pass",
-            "; ".join(scenario_problems) if scenario_problems
-            else f"{len(scenario_rows)} scenario(s); overridden variables exist",
+            _messages(scenario_problems)
+            or f"{len(projection_set.scenario_ids)} scenario(s); validated, unchanged, valid overrides",
         ))
 
-    # horizon
     horizon_ok = 1 <= (projection_set.horizon_months or 0) <= 1200 and projection_set.time_step == "monthly"
-    checks.append(_check(
+    result.append(_check(
         "horizon_valid", "Projection characteristics valid",
         "pass" if horizon_ok else "fail",
         f"{projection_set.horizon_months} {projection_set.time_step} steps from {iso(projection_set.valuation_date)}",
     ))
 
-    # outputs
     outputs = list(projection_set.output_variables or [])
-    unknown_outputs = [name for name in outputs if name not in published]
-    checks.append(_check(
+    unknown_outputs = [name for name in outputs if name not in model.published]
+    result.append(_check(
         "outputs_configured", "Output capture configured",
         "fail" if not outputs or unknown_outputs else "pass",
         f"Not published: {', '.join(unknown_outputs)}" if unknown_outputs
         else (f"{len(outputs)} published outputs" if outputs else "No outputs selected"),
     ))
 
-    # trace scope
-    scope = _normalise_trace_scope(projection_set.trace_scope)
+    scope = checks.normalise_trace_scope(projection_set.trace_scope)
     policy_ids = {
         row[0] for row in db.query(InforceRecord.policy_id)
-        .filter(InforceRecord.file_id.in_(projection_set.inforce_file_ids or [])).all()
-    } if projection_set.inforce_file_ids else set()
+        .filter(InforceRecord.file_id.in_([file.id for file in files])).all()
+    } if files else set()
     if scope["mode"] == "none":
-        checks.append(_check("trace_scope_selected", "Trace capture scope selected", "warning",
+        result.append(_check("trace_scope_selected", "Trace capture scope selected", "warning",
                              "Trace capture scope is not explicitly selected; values cannot be traced."))
     elif scope["mode"] == "all":
         too_many = len(policy_ids) > settings.max_traced_policies
-        checks.append(_check(
+        result.append(_check(
             "trace_scope_selected", "Trace capture scope selected",
             "fail" if too_many else "pass",
             f"'all' is limited to {settings.max_traced_policies} policies; this set has {len(policy_ids)}."
@@ -366,28 +374,28 @@ def validate(db: Session, projection_set_id: str) -> dict[str, Any]:
         status = "warning" if unknown or not scope["policy_ids"] else "pass"
         if len(scope["policy_ids"]) > settings.max_traced_policies:
             status = "fail"
-        checks.append(_check(
+        result.append(_check(
             "trace_scope_selected", "Trace capture scope selected", status,
             f"Unknown policies: {', '.join(unknown)}" if unknown
             else f"{len(scope['policy_ids'])} policies",
         ))
 
-    # engine ready
-    unregistered = [row.function_ref for row in formulas if row.function_ref not in FORMULA_FUNCTIONS]
-    checks.append(_check(
+    engine_problems = [p for p in model.problems if p.code in ENGINE_CODES]
+    if not model.formulas and model.version is not None:
+        engine_problems.append(checks.Problem("NO_FORMULAS", "The model version has no formulas."))
+    result.append(_check(
         "engine_ready", "Formulas registered and graph valid",
-        "fail" if unregistered or not formulas else "pass",
-        f"Unregistered: {', '.join(unregistered)}" if unregistered
-        else f"{len(formulas)} formulas, no cycles",
+        "fail" if engine_problems else "pass",
+        _messages(engine_problems) or f"{len(model.formulas)} formulas, no cycles",
     ))
 
-    if any(check["status"] == "fail" for check in checks):
-        overall, status = "invalid", "draft"
-    elif any(check["status"] == "warning" for check in checks):
-        overall, status = "needs_review", "needs_review"
+    if any(check["status"] == "fail" for check in result):
+        overall, status = "invalid", lifecycle.DRAFT
+    elif any(check["status"] == "warning" for check in result):
+        overall, status = lifecycle.NEEDS_REVIEW, lifecycle.NEEDS_REVIEW
     else:
-        overall, status = "validated", "validated"
-    projection_set.validation = {"status": overall, "validated_at": iso(now_utc()), "checks": checks}
+        overall, status = lifecycle.VALIDATED, lifecycle.VALIDATED
+    projection_set.validation = {"status": overall, "validated_at": iso(now_utc()), "checks": result}
     projection_set.status = status
     db.commit()
     db.refresh(projection_set)

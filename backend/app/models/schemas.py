@@ -88,7 +88,8 @@ class FormulaDefinition(BaseModel):
     product_applicability: list[str] = Field(default_factory=list)
     basis_applicability: list[str] = Field(default_factory=list)
     version: str = "v1"
-    status: Literal["draft", "active", "deprecated"] = "draft"
+    # Legacy statuses plus the lifecycle statuses M1 formulas use (app.core.lifecycle).
+    status: Literal["draft", "active", "deprecated", "needs_review", "validated", "approved"] = "draft"
     test_case_ids: list[str] = Field(default_factory=list)
 
 

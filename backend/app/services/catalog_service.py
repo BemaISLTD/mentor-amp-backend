@@ -19,7 +19,7 @@ from app.db.models.run import Run
 from app.db.models.scenario import ScenarioSet, ScenarioTable
 from app.db.models.variable import VariableRegistry
 from app.services.common import iso, not_found, product_name, user_ref
-from app.services.run_loader import load_variable_closure, to_formula_spec, to_variable_spec
+from app.services.model_definition import load_variable_closure, to_formula_spec, to_variable_spec
 
 CATEGORY_LABELS = {
     "liability_inforce": "Liability Inforce",
@@ -592,7 +592,7 @@ def _table_item(table: Any, category: str, scope: str) -> dict[str, Any]:
         "scope": scope,
         "record_count": len(table.data or []),
         "record_unit": "rows",
-        "status": getattr(table, "status", "validated"),
+        "status": table.status,
         "fingerprint": getattr(table, "fingerprint", None),
         "updated_at": iso(table.created_at),
     }
@@ -795,7 +795,7 @@ def table_detail(db: Session, table_id: str, kind: str, limit: int, offset: int)
         "value_column": getattr(table, "value_column", None),
         "columns": columns,
         "version_label": getattr(table, "version_label", None),
-        "status": getattr(table, "status", "validated"),
+        "status": table.status,
         "fingerprint": getattr(table, "fingerprint", None),
         "rows": rows[offset: offset + limit],
         "total": len(rows),
