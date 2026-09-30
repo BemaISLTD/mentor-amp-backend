@@ -53,3 +53,24 @@ def require_roles(*allowed_roles: str) -> Callable[..., User]:
         return current_user
 
     return dependency
+
+
+def require_permissions(*required_permissions: str) -> Callable[..., User]:
+    required = set(required_permissions)
+
+    def dependency(
+        current_user: Annotated[User, Depends(get_current_user)],
+    ) -> User:
+        assigned = {
+            permission.name
+            for role in current_user.roles
+            for permission in role.permissions
+        }
+        if not required.issubset(assigned):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to perform this action.",
+            )
+        return current_user
+
+    return dependency
