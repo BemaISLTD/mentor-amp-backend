@@ -1,6 +1,7 @@
 """Integration tests for run management and analytical read APIs."""
 
 import hashlib
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -174,6 +175,27 @@ def test_queue_rejects_unknown_project(run_api_client):
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_queue_rejects_archived_project(run_api_client):
+    client, session, _ = run_api_client
+    project = session.get(Project, "project-1")
+    project.archived_at = datetime.now(timezone.utc)
+    session.commit()
+
+    response = client.post(
+        "/v1/runs/",
+        json={
+            "name": "Archived",
+            "project_id": "project-1",
+            "formula_database_id": "formula-db-1",
+            "scenario_ids": ["base"],
+            "projection_length_months": 12,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "CONFLICT"
 
 
 def test_reconciliation_compares_completed_runs(run_api_client):

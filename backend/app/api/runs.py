@@ -10,10 +10,10 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import get_current_user
 from app.api.dependencies import require_permissions
 from app.core.audit import record_audit
+from app.core.project_lifecycle import require_active_project
 from app.core.projection_engine.runner import run_projection
 from app.core.run_manifest import create_run_manifest
 from app.db.database import SessionLocal, get_db
-from app.db.models.project import Project
 from app.db.models.run import Run
 from app.db.models.run_artifact import RunManifest
 from app.db.models.user import User
@@ -58,8 +58,7 @@ def queue_run(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Session = Depends(get_db),
 ):
-    if db.query(Project).filter(Project.id == payload.project_id).first() is None:
-        raise HTTPException(status_code=404, detail=f"Project '{payload.project_id}' not found.")
+    require_active_project(db, payload.project_id)
 
     run_id = str(uuid.uuid4())
     run_definition = ProjectionRunDefinition(

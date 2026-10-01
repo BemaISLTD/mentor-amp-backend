@@ -85,6 +85,7 @@ def test_inforce_upload_commits_after_staging_cleanup(tmp_path, monkeypatch):
 
     monkeypatch.setattr(imports, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(imports, "import_file", successful_import)
+    monkeypatch.setattr(imports, "require_active_project", lambda db, project_id: None)
 
     result = imports.upload_inforce(upload(), project_id="project-1", db=session)
 
@@ -104,6 +105,7 @@ def test_inforce_upload_rolls_back_and_removes_file_on_failure(tmp_path, monkeyp
 
     monkeypatch.setattr(imports, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(imports, "import_file", failed_import)
+    monkeypatch.setattr(imports, "require_active_project", lambda db, project_id: None)
 
     with pytest.raises(RuntimeError, match="database write failed"):
         imports.upload_inforce(upload(), project_id="project-1", db=session)
