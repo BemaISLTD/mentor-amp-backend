@@ -4,12 +4,12 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.core.variable_registry.registry import get_by_name
 from app.core.artifacts import RunArtifactBuffer
+from app.core.output.storage import get_output
+from app.core.variable_registry.registry import get_by_name
 from app.db.models.assumption import AssumptionTable
 from app.db.models.factor import FactorTable
 from app.db.models.inforce import InforceRecord
-from app.db.models.run_output import RunOutput
 from app.db.models.scenario import ScenarioTable
 from app.models.schemas import ProjectionContext, VariableResolutionResult
 
@@ -115,16 +115,14 @@ def _prior_period_lookup(
             prev_month,
             variable_name,
         )
-    output = db.query(RunOutput).filter(
-        RunOutput.run_id == context.run_id,
-        RunOutput.policy_id == context.policy_id,
-        RunOutput.scenario_id == context.scenario_id,
-        RunOutput.projection_month == prev_month,
-        RunOutput.variable_name == variable_name,
-    ).first()
-    if output is None or output.value is None:
-        return None
-    return output.value.get("value") if isinstance(output.value, dict) else output.value
+    return get_output(
+        db,
+        context.run_id,
+        context.policy_id,
+        context.scenario_id,
+        prev_month,
+        variable_name,
+    )
 
 
 def resolve(

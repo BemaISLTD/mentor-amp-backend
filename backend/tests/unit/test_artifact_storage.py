@@ -9,10 +9,12 @@ from app.core import artifacts
 from app.core.artifacts import LocalParquetArtifactStore, RunArtifactBuffer
 from app.core.output import storage as output_storage
 from app.core.projection_engine import runner
+from app.core.variable_registry.resolver import _prior_period_lookup
+from app.db.database import Base
 from app.core.formula_engine.formulas import FORMULA_FUNCTIONS
 from app.db.models.run import Run
 from app.db.models.run_artifact import RunArtifact
-from app.models.schemas import FormulaDefinition, ProjectionRunDefinition
+from app.models.schemas import FormulaDefinition, ProjectionContext, ProjectionRunDefinition
 
 
 def test_output_buffer_writes_parquet_and_reads_results(tmp_path, monkeypatch):
@@ -68,6 +70,39 @@ def test_local_store_rejects_path_traversal(tmp_path):
         assert "escapes" in str(exc)
     else:
         raise AssertionError("Path traversal should be rejected.")
+
+
+def test_prior_period_fallback_reads_parquet_artifact(tmp_path, monkeypatch):
+    engine = create_engine("sqlite://")
+    RunArtifact.__table__.create(engine)
+    db = sessionmaker(bind=engine)()
+    store = LocalParquetArtifactStore(tmp_path)
+    monkeypatch.setattr(artifacts, "get_artifact_store", lambda: store)
+
+    buffer = RunArtifactBuffer("run-prior", store=store)
+    buffer.add_output("P001", "base", 1, "reserve", 125.5)
+    buffer.flush_policy(db, "P001")
+    db.commit()
+
+    value = _prior_period_lookup(
+        db,
+        "reserve",
+        ProjectionContext(
+            run_id="run-prior",
+            policy_id="P001",
+            scenario_id="base",
+            projection_month=2,
+        ),
+    )
+
+    assert value == 125.5
+    db.close()
+    engine.dispose()
+
+
+def test_legacy_run_tables_are_absent_from_model_metadata():
+    assert "run_outputs" not in Base.metadata.tables
+    assert "trace_logs" not in Base.metadata.tables
 
 
 def test_projection_runner_writes_outputs_without_run_output_rows(
