@@ -4,14 +4,14 @@ from collections import defaultdict
 from datetime import date
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
+from app.core.project_lifecycle import get_project_or_404
 from app.db.models.inforce import InforceFile
 from app.db.models.product import AssetPosition, Product
-from app.db.models.project import Project
 from app.db.models.run import Run
 from app.models.dashboard import (
     DashboardStatsResponse,
@@ -30,8 +30,7 @@ def get_dashboard_stats(
     as_of_date: date | None = Query(None),
     db: Session = Depends(get_db),
 ):
-    if db.query(Project).filter(Project.id == project_id).first() is None:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found.")
+    get_project_or_404(db, project_id)
 
     products = db.query(Product).filter(
         Product.project_id == project_id,

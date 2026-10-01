@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import get_current_user, require_permissions
 from app.api.products import _get_product_or_404
 from app.core.audit import record_audit
+from app.core.project_lifecycle import require_active_project
 from app.db.database import get_db
 from app.db.models.product import AssetPosition
 from app.db.models.user import User
@@ -57,6 +58,7 @@ def create_position(
     db: Session = Depends(get_db),
 ):
     product = _get_product_or_404(payload.product_id, db)
+    require_active_project(db, product.project_id)
     position = AssetPosition(
         project_id=product.project_id,
         **payload.model_dump(),
@@ -126,10 +128,12 @@ def update_position(
     db: Session = Depends(get_db),
 ):
     position = _get_position_or_404(position_id, db)
+    require_active_project(db, position.project_id)
     before_state = _position_state(position)
     updates = payload.model_dump(exclude_unset=True)
     if updates.get("product_id") is not None:
         product = _get_product_or_404(updates["product_id"], db)
+        require_active_project(db, product.project_id)
         position.project_id = product.project_id
     for field, value in updates.items():
         setattr(position, field, value)
@@ -160,6 +164,7 @@ def delete_position(
     db: Session = Depends(get_db),
 ) -> Response:
     position = _get_position_or_404(position_id, db)
+    require_active_project(db, position.project_id)
     before_state = _position_state(position)
     position.deleted_at = datetime.now(timezone.utc)
     position.updated_by = current_user.id

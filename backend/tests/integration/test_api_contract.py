@@ -99,6 +99,45 @@ def test_project_delete_is_not_exposed(client, db_session):
     assert [entry.action for entry in entries] == ["project.created"]
 
 
+def test_project_archive_is_audited_hidden_and_read_only(client, db_session):
+    archived = client.post("/v1/projects/", json={"name": "Completed Valuation"})
+    active = client.post("/v1/projects/", json={"name": "Current Valuation"})
+    project_id = archived.json()["id"]
+
+    response = client.post(
+        f"/v1/projects/{project_id}/archive",
+        json={"reason": "Retention period started after sign-off."},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["archived_by"] == "test-user"
+    assert response.json()["archived_at"] is not None
+    assert response.json()["archive_reason"] == "Retention period started after sign-off."
+
+    visible = client.get("/v1/projects/").json()
+    assert [project["id"] for project in visible["projects"]] == [active.json()["id"]]
+    retained = client.get("/v1/projects/", params={"include_archived": True}).json()
+    assert {project["id"] for project in retained["projects"]} == {
+        project_id,
+        active.json()["id"],
+    }
+    assert client.get(f"/v1/projects/{project_id}").status_code == 404
+    assert client.get(
+        f"/v1/projects/{project_id}", params={"include_archived": True}
+    ).status_code == 200
+    assert client.patch(
+        f"/v1/projects/{project_id}", json={"description": "Disallowed"}
+    ).status_code == 409
+    assert client.post(
+        f"/v1/projects/{project_id}/archive", json={"reason": "Again"}
+    ).status_code == 409
+    assert db_session.query(Project).filter(Project.id == project_id).count() == 1
+
+    audit = db_session.query(AuditLog).filter(AuditLog.entity_id == project_id).all()
+    assert [entry.action for entry in audit] == ["project.created", "project.archived"]
+    assert audit[-1].after_state["archive_reason"] == "Retention period started after sign-off."
+
+
 def test_validation_errors_use_standard_envelope(client):
     response = client.post("/v1/projects/", json={"name": ""})
 

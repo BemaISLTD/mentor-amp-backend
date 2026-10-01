@@ -1,5 +1,6 @@
 """Integration tests for products, mappings, and asset positions."""
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -188,3 +189,41 @@ def test_mapping_validates_effective_date_range(product_client):
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_archived_project_rejects_catalog_mutations(product_client):
+    client, session = product_client
+    product_id = _create_product(client)
+    mapping = client.post(
+        f"/v1/products/{product_id}/mappings",
+        json={
+            "source_system": "legacy",
+            "source_product_code": "CLOSED",
+            "effective_from": "2026-01-01",
+        },
+    )
+    assert mapping.status_code == 201
+
+    project = session.get(Project, "project-1")
+    project.archived_at = datetime.now(timezone.utc)
+    session.commit()
+
+    response = client.post(
+        "/v1/products/",
+        json={
+            "project_id": "project-1",
+            "code": "CLOSED",
+            "name": "Archived Product",
+            "product_type": "FIA",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "CONFLICT"
+    assert client.patch(
+        f"/v1/products/{product_id}", json={"name": "Disallowed"}
+    ).status_code == 409
+    assert client.delete(
+        f"/v1/products/{product_id}/mappings/{mapping.json()['id']}"
+    ).status_code == 409
+    assert client.get(f"/v1/products/{product_id}/mappings").status_code == 200

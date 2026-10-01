@@ -251,6 +251,9 @@ class ProjectResponse(BaseModel):
     description: Optional[str] = None
     created_by: Optional[str] = None
     updated_by: Optional[str] = None
+    archived_by: Optional[str] = None
+    archive_reason: Optional[str] = None
+    archived_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
     model_config = {"from_attributes": True}
@@ -259,6 +262,10 @@ class ProjectResponse(BaseModel):
 class ProjectUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     description: Optional[str] = None
+
+
+class ProjectArchive(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=1000)
 
 
 class ProjectListResponse(BaseModel):

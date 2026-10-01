@@ -13,6 +13,7 @@ from sqlalchemy import Float, cast
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import require_permissions
+from app.core.project_lifecycle import require_active_project
 from app.data.importers.base import detect_format, import_file, parse_file, preview_file
 from app.data.validation.inforce_validator import validate_inforce
 from app.data.validation.assumption_validator import validate_assumptions
@@ -74,6 +75,7 @@ def upload_inforce(
     db: Session = Depends(get_db),
 ):
     """Upload an inforce file, validate, and store."""
+    require_active_project(db, project_id)
     try:
         fmt = detect_format(file.filename or "unknown.tsv")
     except ValueError:
@@ -125,6 +127,7 @@ def upload_assumptions(
     db: Session = Depends(get_db),
 ):
     """Upload an assumption file, validate, and store."""
+    require_active_project(db, project_id)
     try:
         detect_format(file.filename or "unknown.tsv")
     except ValueError:
@@ -153,6 +156,7 @@ def upload_factors(
     db: Session = Depends(get_db),
 ):
     """Upload a factor file, validate, and store."""
+    require_active_project(db, project_id)
     try:
         detect_format(file.filename or "unknown.tsv")
     except ValueError:
@@ -180,6 +184,7 @@ def upload_scenarios(
     db: Session = Depends(get_db),
 ):
     """Upload a scenario file, validate, and store."""
+    require_active_project(db, project_id)
     try:
         detect_format(file.filename or "unknown.tsv")
     except ValueError:

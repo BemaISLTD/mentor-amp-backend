@@ -12,12 +12,12 @@ it is considered complete.
 
 | Area | Verified state | Status |
 | --- | --- | --- |
-| Tests | Original `test_*.py` modules were empty placeholders | Test suite remains open; 43 automated tests now cover implemented domains |
+| Tests | Original `test_*.py` modules were empty placeholders | Test suite remains open; 46 automated tests now cover implemented domains |
 | Seed data | No seed script exists | Open |
 | Authentication/RBAC | No auth dependency or user/RBAC models existed | **Complete:** JWT and the administrator, actuary, model developer, reviewer, and read-only permission matrix are enforced |
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
 | Error contract | Default FastAPI `detail` responses were used | **Complete:** standardized error envelope added |
-| Projects | POST and GET only | **In progress:** PATCH added; destructive DELETE withheld pending an archive and retention contract |
+| Projects | POST and GET only | **Complete:** permission-protected PATCH and audited archival added; hard deletion is not exposed |
 | Run APIs | `runs.py`, `results.py`, and `trace.py` were empty | **Complete for local execution:** queue, status, manifest, result, summary, and trace APIs added |
 | Large outputs | Runner previously wrote outputs and traces to PostgreSQL | **In progress:** runner now writes Parquet; legacy tables remain |
 | Run manifests | Runs did not snapshot inputs/configuration | **Complete:** immutable version snapshot added |
@@ -31,7 +31,7 @@ it is considered complete.
     and golden policies.
   - Current evidence: API contract, authentication/RBAC, upload recovery, and
     record viewer suites; `docker compose exec -T api pytest -q` returned
-    `43 passed`.
+    `46 passed`.
 - **[IMPROVE] Database Seeding Scripts — OPEN**
   - Add an idempotent `seed.py` using synthetic users, roles, permissions,
     projects, products, and representative actuarial metadata.
@@ -55,10 +55,15 @@ it is considered complete.
   - Public application routers are mounted below `/v1`.
   - Errors use `{"error": {"code": "...", "message": "..."}}`, with optional
     structured details.
-- **[IMPROVE] Project Mutation Endpoints — IN PROGRESS**
-  - Added permission-protected `PATCH /v1/projects/{project_id}`.
-  - Permanent project deletion is not exposed. Define an audited archive or
-    soft-delete lifecycle and retention policy before adding removal behavior.
+- **[IMPROVE] Project Mutation Endpoints — COMPLETE**
+  - Added permission-protected `PATCH /v1/projects/{project_id}` and
+    `POST /v1/projects/{project_id}/archive`.
+  - Archival records the actor, timestamp, reason, and before/after audit state.
+    Archived projects and their child records are retained indefinitely as
+    read-only governed records unless a separate authorized purge policy is
+    designed. Permanent project deletion is not exposed.
+  - Normal project reads and dashboards hide archived projects; authorized
+    project reads can opt in with `include_archived=true`.
 - **[BUILD] File Record Viewers — COMPLETE FOR IN-FORCE FILES**
   - `GET /v1/imports/inforce/{file_id}/records` returns stable, paginated rows
     with file metadata and a maximum page size of 200.
@@ -85,8 +90,11 @@ it is considered complete.
     to the remaining auditable actuarial metadata as their mutation APIs are
     implemented.
 - **[IMPROVE] Soft Deletes — IN PROGRESS**
-  - Define retention rules and add `deleted_at` to auditable actuarial metadata;
-    avoid accidental hard deletion of governed records.
+  - Project archival and its retention contract are complete. Archived projects
+    reject project, import, catalog, asset, mapping, and run mutations while
+    retaining historical data.
+  - Extend soft deletion to remaining auditable actuarial metadata and avoid
+    accidental hard deletion of governed records.
 - **[BUILD] Products and Assets — COMPLETE**
   - Build `products`, `asset_positions`, and `product_mappings`.
 - **[BUILD] Actuarial Workflows — OPEN**
@@ -126,7 +134,8 @@ it is considered complete.
 ## Implementation Order
 
 1. API foundation: versioning, error contract, project mutations, and initial
-   endpoint tests. **In progress:** project archival remains open.
+   endpoint tests. **Complete:** audited project archival enforces read-only
+   retention without exposing hard deletion.
 2. Users/RBAC schema, authentication endpoints, JWT configuration, and router
    authorization tests. **Complete:** expanded roles and route-level read,
    write, and execute permissions are enforced.
@@ -154,7 +163,9 @@ Before an item moves to complete, record:
 
 - Versioned routes: `backend/app/main.py`
 - Standard error handlers: `backend/app/api/errors.py`
-- Permission-protected project PATCH: `backend/app/api/projects.py`
+- Permission-protected project PATCH and archival: `backend/app/api/projects.py`
+- Project lifecycle enforcement: `backend/app/core/project_lifecycle.py`
+- Project archival migration: `backend/app/db/migrations/versions/e2b5d8f0c316_add_project_archival.py`
 - Contract tests: `backend/tests/integration/test_api_contract.py`
 - Auth/RBAC migration: `backend/app/db/migrations/versions/2f6d51e920a4_add_users_and_rbac.py`
 - Expanded RBAC migration: `backend/app/db/migrations/versions/d1a4c7e9b205_expand_builtin_rbac_roles.py`

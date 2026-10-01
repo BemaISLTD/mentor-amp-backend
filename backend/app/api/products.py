@@ -8,9 +8,9 @@ from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user, require_permissions
 from app.core.audit import record_audit
+from app.core.project_lifecycle import require_active_project
 from app.db.database import get_db
 from app.db.models.product import AssetPosition, Product, ProductMapping
-from app.db.models.project import Project
 from app.db.models.user import User
 from app.models.products import (
     ProductCreate,
@@ -74,8 +74,7 @@ def create_product(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Session = Depends(get_db),
 ):
-    if db.query(Project).filter(Project.id == payload.project_id).first() is None:
-        raise HTTPException(status_code=404, detail=f"Project '{payload.project_id}' not found.")
+    require_active_project(db, payload.project_id)
     _ensure_unique_code(db, payload.project_id, payload.code)
     product = Product(
         **payload.model_dump(),
@@ -137,6 +136,7 @@ def update_product(
     db: Session = Depends(get_db),
 ):
     product = _get_product_or_404(product_id, db)
+    require_active_project(db, product.project_id)
     updates = payload.model_dump(exclude_unset=True)
     if "code" in updates:
         _ensure_unique_code(db, product.project_id, updates["code"], exclude_id=product.id)
@@ -170,6 +170,7 @@ def delete_product(
     db: Session = Depends(get_db),
 ) -> Response:
     product = _get_product_or_404(product_id, db)
+    require_active_project(db, product.project_id)
     deleted_at = datetime.now(timezone.utc)
     before_state = _product_state(product)
     product.deleted_at = deleted_at
@@ -212,7 +213,8 @@ def create_mapping(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Session = Depends(get_db),
 ):
-    _get_product_or_404(product_id, db)
+    product = _get_product_or_404(product_id, db)
+    require_active_project(db, product.project_id)
     duplicate = db.query(ProductMapping).filter(
         ProductMapping.product_id == product_id,
         ProductMapping.source_system == payload.source_system,
@@ -268,7 +270,8 @@ def delete_mapping(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Session = Depends(get_db),
 ) -> Response:
-    _get_product_or_404(product_id, db)
+    product = _get_product_or_404(product_id, db)
+    require_active_project(db, product.project_id)
     mapping = db.query(ProductMapping).filter(
         ProductMapping.id == mapping_id,
         ProductMapping.product_id == product_id,
