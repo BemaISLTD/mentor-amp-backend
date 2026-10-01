@@ -1,5 +1,10 @@
 # MentorAmp — Phase 0 & 1: Foundation & Database Schema
 
+> [!IMPORTANT]
+> This document records the original staged implementation. References to
+> PostgreSQL `run_outputs` and `trace_logs` are historical: those tables were
+> replaced by Parquet artifacts and removed by migration `a7f4c2d9e180`.
+
 **Status:** Complete  
 **Backend stack:** Python 3.11 · FastAPI · SQLAlchemy (sync) · Alembic · PostgreSQL (Neon)
 

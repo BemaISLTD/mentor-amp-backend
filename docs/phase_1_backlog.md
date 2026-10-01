@@ -12,14 +12,14 @@ it is considered complete.
 
 | Area | Verified state | Status |
 | --- | --- | --- |
-| Tests | Original `test_*.py` modules were empty placeholders | Test suite remains open; 46 automated tests now cover implemented domains |
+| Tests | Original `test_*.py` modules were empty placeholders | Test suite remains open; 48 automated tests now cover implemented domains |
 | Seed data | No seed script exists | Open |
 | Authentication/RBAC | No auth dependency or user/RBAC models existed | **Complete:** JWT and the administrator, actuary, model developer, reviewer, and read-only permission matrix are enforced |
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
 | Error contract | Default FastAPI `detail` responses were used | **Complete:** standardized error envelope added |
 | Projects | POST and GET only | **Complete:** permission-protected PATCH and audited archival added; hard deletion is not exposed |
 | Run APIs | `runs.py`, `results.py`, and `trace.py` were empty | **Complete for local execution:** queue, status, manifest, result, summary, and trace APIs added |
-| Large outputs | Runner previously wrote outputs and traces to PostgreSQL | **In progress:** runner now writes Parquet; legacy tables remain |
+| Large outputs | Runner previously wrote outputs and traces to PostgreSQL | **Complete for local execution:** Parquet artifacts replace the removed legacy tables; production object storage remains open |
 | Run manifests | Runs did not snapshot inputs/configuration | **Complete:** immutable version snapshot added |
 | Reconciliation | No comparison service or API existed | **Complete:** deterministic on-demand comparison over immutable artifacts |
 
@@ -31,7 +31,7 @@ it is considered complete.
     and golden policies.
   - Current evidence: API contract, authentication/RBAC, upload recovery, and
     record viewer suites; `docker compose exec -T api pytest -q` returned
-    `46 passed`.
+    `48 passed`.
 - **[IMPROVE] Database Seeding Scripts — OPEN**
   - Add an idempotent `seed.py` using synthetic users, roles, permissions,
     projects, products, and representative actuarial metadata.
@@ -113,12 +113,14 @@ it is considered complete.
 > This is the primary architectural risk. The analytical storage boundary must
 > be completed before production run/result/trace APIs are built.
 
-- **[REPLACE] PostgreSQL `run_outputs` and `trace_logs` — IN PROGRESS**
-  - Write compressed, partitioned Parquet to a local data lake or S3-compatible
-    object storage. Keep only metadata, locations, fingerprints, and summaries
-    in PostgreSQL.
-  - Define an interface supporting local development and production object
-    storage without changing engine code.
+- **[REPLACE] PostgreSQL `run_outputs` and `trace_logs` — COMPLETE FOR LOCAL EXECUTION**
+  - Compressed, partitioned Parquet stores outputs and traces locally; PostgreSQL
+    retains artifact metadata, locations, fingerprints, and summaries only.
+  - The legacy high-volume tables and ORM models are removed. The removal
+    migration refuses to discard non-empty legacy tables, requiring an explicit
+    export before deployment when old data exists.
+  - Add an S3-compatible implementation of the artifact-store interface before
+    production deployment; engine code must remain storage-backend independent.
 - **[BUILD] Immutable Run Manifests — COMPLETE**
   - Snapshot data-file, assumption, factor, scenario, formula/model, code, and
     storage versions when a run is queued.
@@ -141,7 +143,7 @@ it is considered complete.
    write, and execute permissions are enforced.
 3. Audit logs and project actor fields. **Complete.**
 4. Local/S3 Parquet storage interface and immutable run manifests. **In progress:**
-   local Parquet and manifests are complete; S3 and legacy table removal remain.
+   local Parquet, manifests, and legacy table removal are complete; S3 remains.
 5. Run, status, result, and trace APIs. **Complete for local execution.**
    Durable workers remain open; reconciliation is complete.
 6. Product, asset, and dashboard domains. **Complete.** Workflow, reporting,
@@ -176,6 +178,7 @@ Before an item moves to complete, record:
 - Audit migration: `backend/app/db/migrations/versions/7c3f19ad0e82_add_audit_logging.py`
 - Audit API: `backend/app/api/audit_logs.py`
 - Artifact metadata migration: `backend/app/db/migrations/versions/91b4e26d7fa0_add_run_manifests_and_artifacts.py`
+- Legacy run-storage removal: `backend/app/db/migrations/versions/a7f4c2d9e180_remove_legacy_run_storage.py`
 - Parquet storage tests: `backend/tests/unit/test_artifact_storage.py`
 - Products/assets migration: `backend/app/db/migrations/versions/c48a2d7159be_add_products_and_assets.py`
 - Products/assets tests: `backend/tests/integration/test_products_api.py`
