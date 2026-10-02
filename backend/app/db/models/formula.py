@@ -31,6 +31,9 @@ class FormulaRegistry(Base):
     version: Mapped[str] = mapped_column(String(20), default="v1")
     status: Mapped[str] = mapped_column(String(20), default="draft")
     created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    updated_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

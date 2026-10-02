@@ -53,14 +53,14 @@ def list_formulas(
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permissions("registries:write"))],
 )
-def create_formula(formula: FormulaDefinition, db: Session = Depends(get_db)):
+def create_formula(formula: FormulaDefinition, user: CurrentUser, db: Session = Depends(get_db)):
     existing = get_by_output(db, formula.output_variable)
     if existing:
         raise HTTPException(
             status_code=409,
             detail=f"Formula for output '{formula.output_variable}' already exists.",
         )
-    return register(db, formula)
+    return register(db, formula, user.id)
 
 
 @router.get("/{formula_id}", response_model=FormulaDefinition)
@@ -82,7 +82,7 @@ def get_dependency_graph(formula_id: str, user: CurrentUser, db: Session = Depen
 )
 def update_formula(formula_id: str, updates: dict, user: CurrentUser, db: Session = Depends(get_db)):
     _authorize(db, user, formula_id, write=True)
-    f = update(db, formula_id, updates)
+    f = update(db, formula_id, updates, user.id)
     if f is None:
         raise HTTPException(status_code=404, detail="Formula not found.")
     return f
@@ -95,6 +95,6 @@ def update_formula(formula_id: str, updates: dict, user: CurrentUser, db: Sessio
 )
 def delete_formula(formula_id: str, user: CurrentUser, db: Session = Depends(get_db)):
     _authorize(db, user, formula_id, write=True)
-    success = delete(db, formula_id)
+    success = delete(db, formula_id, user.id)
     if not success:
         raise HTTPException(status_code=404, detail="Formula not found.")

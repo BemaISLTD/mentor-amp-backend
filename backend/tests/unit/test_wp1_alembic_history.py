@@ -10,7 +10,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 
 BACKEND = Path(__file__).resolve().parents[2]
-HEAD = "f9d3e5a7b012"
+HEAD = "c6e1a4b9d203"
 MERGE = "a3c5e7f9b1d2"
 
 
@@ -31,7 +31,8 @@ def test_the_merge_joins_the_m1_and_dev_histories():
     assert set(script().get_revision("f8c2d4e6a901").down_revision) == {
         "a7f4c2d9e180", "b7e4d2a9c613",
     }
-    assert script().get_revision(HEAD).down_revision == "f8c2d4e6a901"
+    assert script().get_revision("f9d3e5a7b012").down_revision == "f8c2d4e6a901"
+    assert script().get_revision(HEAD).down_revision == "f9d3e5a7b012"
 
 
 def test_both_branch_heads_and_their_ancestors_are_upgraded_by_head():
@@ -40,6 +41,6 @@ def test_both_branch_heads_and_their_ancestors_are_upgraded_by_head():
         "e0c51a917e8e", "bfc45372c779", "fbe10ad9a08b", "2f6d51e920a4",  # shared base
         "4d8e2f6a1c90",                                                  # main (M1)
         "7c3f19ad0e82", "91b4e26d7fa0", "c48a2d7159be",                  # dev (Noah)
-        MERGE, "b7e4d2a9c613", "a7f4c2d9e180", "f8c2d4e6a901", HEAD,
+        MERGE, "b7e4d2a9c613", "a7f4c2d9e180", "f8c2d4e6a901", "f9d3e5a7b012", HEAD,
     } <= ancestors
     assert len(script().get_bases()) == 1

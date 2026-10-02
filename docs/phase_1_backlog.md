@@ -12,7 +12,7 @@ it is considered complete.
 
 | Area | Verified state | Status |
 | --- | --- | --- |
-| Tests | Original `test_*.py` modules were empty placeholders | 155 tests pass in the clean Docker image; 5 opt-in PostgreSQL tests pass separately |
+| Tests | Original `test_*.py` modules were empty placeholders | 156 tests pass in the clean Docker image; 5 opt-in PostgreSQL tests pass separately |
 | Seed data | No seed script existed | Complete for illustrative SPIA demo; broader product and workflow seed remains open |
 | Authentication/RBAC | No auth dependency or user/RBAC models existed | **Complete:** JWT and the administrator, actuary, model developer, reviewer, and read-only permission matrix are enforced |
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
@@ -29,7 +29,7 @@ it is considered complete.
   - Build coverage for database connectivity, migrations, model constraints,
     validation, authentication/authorization, API behavior, engine behavior,
     and golden policies.
-  - Current evidence: clean-image `pytest -q` returned `155 passed, 5 skipped`;
+  - Current evidence: clean-image `pytest -q` returned `156 passed, 5 skipped`;
     the five opt-in PostgreSQL migration/concurrency tests passed separately.
 - **[IMPROVE] Database Seeding Scripts — IN PROGRESS**
   - `scripts/seed_demo.py` idempotently creates synthetic SPIA users, project,
@@ -87,9 +87,12 @@ it is considered complete.
   - Track actor, action, entity, before/after values, and timestamp for metadata
     mutations.
 - **[IMPROVE] Actor Audit Fields — IN PROGRESS**
-  - Projects, products, and asset positions now record actors. Extend the same contract
-    to the remaining auditable actuarial metadata as their mutation APIs are
-    implemented.
+  - Projects, products, asset positions, variables, and formulas now record mutation
+    actors. Variable and formula create/update/delete operations write before/after
+    audit records in the same database transaction as the mutation.
+  - Extend this contract to other actuarial metadata as their mutation APIs are
+    implemented. Formula `created_by` predates the actor migration; existing rows
+    remain nullable/unchanged.
 - **[IMPROVE] Soft Deletes — IN PROGRESS**
   - Project archival and its retention contract are complete. Archived projects
     reject project, import, catalog, asset, mapping, and run mutations while
@@ -118,8 +121,9 @@ it is considered complete.
   - Compressed, partitioned Parquet stores outputs and traces locally; PostgreSQL
     retains artifact metadata, locations, fingerprints, and summaries only.
   - The legacy high-volume tables and ORM models are removed. The removal
-    migration refuses to discard non-empty legacy tables, requiring an explicit
-    export before deployment when old data exists.
+    migration refuses to discard non-empty legacy tables. A disposable development
+    database can be reset; export is necessary only when its old results must be
+    preserved. No exporter is in the current development scope.
   - M1 execution writes attempt-scoped Parquet artifacts; analytical reads expose
     only an accepted attempt. Failed-attempt artifacts remain noncanonical
     evidence and are not exposed through result APIs.
@@ -186,6 +190,7 @@ Before an item moves to complete, record:
 - Parquet storage tests: `backend/tests/unit/test_artifact_storage.py`
 - M1 execution integration: `backend/app/services/run_execution_service.py`
 - Attempt-scoped artifact migration: `backend/app/db/migrations/versions/f9d3e5a7b012_attempt_scoped_artifacts.py`
+- Registry actor migration: `backend/app/db/migrations/versions/c6e1a4b9d203_registry_actor_fields.py`
 - M1 end-to-end tests: `backend/tests/integration/test_m1_end_to_end.py`
 - PostgreSQL migration/concurrency tests: `backend/tests/postgres/test_wp1_migrations_postgres.py`
 - Products/assets migration: `backend/app/db/migrations/versions/c48a2d7159be_add_products_and_assets.py`

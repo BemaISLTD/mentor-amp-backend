@@ -31,7 +31,7 @@ RAW_URL = os.environ.get("MENTORAMP_TEST_POSTGRES_URL")
 pytestmark = pytest.mark.skipif(
     not RAW_URL, reason="set MENTORAMP_TEST_POSTGRES_URL to a disposable PostgreSQL database"
 )
-HEAD, M1_HEAD, DEV_HEAD = "f9d3e5a7b012", "4d8e2f6a1c90", "c48a2d7159be"
+HEAD, M1_HEAD, DEV_HEAD = "c6e1a4b9d203", "4d8e2f6a1c90", "c48a2d7159be"
 BACKEND = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -85,6 +85,9 @@ def test_empty_database_upgrades_downgrades_and_upgrades_again(pg):
     assert {"run_packages", "run_attempts", "project_members", "run_manifests", "run_artifacts",
             "audit_logs", "products", "models", "projection_sets"} <= tables
     assert "run_outputs" not in tables and "trace_logs" not in tables
+    columns = inspect(engine).get_columns("variable_registry")
+    assert {"created_by", "updated_by"} <= {column["name"] for column in columns}
+    assert "updated_by" in {column["name"] for column in inspect(engine).get_columns("formula_registry")}
     command.downgrade(config, "f8c2d4e6a901")
     assert current(engine) == ["f8c2d4e6a901"]
     command.upgrade(config, "head")
