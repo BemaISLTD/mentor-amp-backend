@@ -86,8 +86,9 @@ def test_inforce_upload_commits_after_staging_cleanup(tmp_path, monkeypatch):
     monkeypatch.setattr(imports, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(imports, "import_file", successful_import)
     monkeypatch.setattr(imports, "require_active_project", lambda db, project_id: None)
+    monkeypatch.setattr(imports.access, "require_project_access", lambda db, user, project_id, write: None)
 
-    result = imports.upload_inforce(upload(), project_id="project-1", db=session)
+    result = imports.upload_inforce(user=object(), file=upload(), project_id="project-1", db=session)
 
     assert result["stored_count"] == 1
     assert observed_path is not None and not imports.Path(observed_path).exists()
@@ -106,9 +107,10 @@ def test_inforce_upload_rolls_back_and_removes_file_on_failure(tmp_path, monkeyp
     monkeypatch.setattr(imports, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(imports, "import_file", failed_import)
     monkeypatch.setattr(imports, "require_active_project", lambda db, project_id: None)
+    monkeypatch.setattr(imports.access, "require_project_access", lambda db, user, project_id, write: None)
 
     with pytest.raises(RuntimeError, match="database write failed"):
-        imports.upload_inforce(upload(), project_id="project-1", db=session)
+        imports.upload_inforce(user=object(), file=upload(), project_id="project-1", db=session)
 
     assert list(tmp_path.iterdir()) == []
     assert session.commits == 0

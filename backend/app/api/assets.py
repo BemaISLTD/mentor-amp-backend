@@ -19,6 +19,7 @@ from app.models.products import (
     AssetPositionResponse,
     AssetPositionUpdate,
 )
+from app.services import access
 
 router = APIRouter(prefix="/asset-positions", tags=["assets"])
 
@@ -58,6 +59,7 @@ def create_position(
     db: Session = Depends(get_db),
 ):
     product = _get_product_or_404(payload.product_id, db)
+    access.require_project_access(db, current_user, product.project_id, write=True)
     require_active_project(db, product.project_id)
     position = AssetPosition(
         project_id=product.project_id,
@@ -82,6 +84,7 @@ def create_position(
 
 @router.get("/", response_model=AssetPositionListResponse)
 def list_positions(
+    user: Annotated[User, Depends(get_current_user)],
     project_id: str | None = Query(None),
     product_id: str | None = Query(None),
     as_of_date: date | None = Query(None),
@@ -92,8 +95,14 @@ def list_positions(
 ):
     query = db.query(AssetPosition).filter(AssetPosition.deleted_at.is_(None))
     if project_id is not None:
+        access.require_project_access(db, user, project_id)
         query = query.filter(AssetPosition.project_id == project_id)
+    else:
+        allowed = access.accessible_project_ids(db, user)
+        if allowed is not None:
+            query = query.filter(AssetPosition.project_id.in_(allowed or [""]))
     if product_id is not None:
+        access.require_object_access(db, user, "product", product_id)
         query = query.filter(AssetPosition.product_id == product_id)
     if as_of_date is not None:
         query = query.filter(AssetPosition.as_of_date == as_of_date)
@@ -112,7 +121,12 @@ def list_positions(
 
 
 @router.get("/{position_id}", response_model=AssetPositionResponse)
-def get_position(position_id: str, db: Session = Depends(get_db)):
+def get_position(
+    position_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    access.require_object_access(db, user, "asset_position", position_id)
     return _get_position_or_404(position_id, db)
 
 
@@ -128,11 +142,13 @@ def update_position(
     db: Session = Depends(get_db),
 ):
     position = _get_position_or_404(position_id, db)
+    access.require_project_access(db, current_user, position.project_id, write=True)
     require_active_project(db, position.project_id)
     before_state = _position_state(position)
     updates = payload.model_dump(exclude_unset=True)
     if updates.get("product_id") is not None:
         product = _get_product_or_404(updates["product_id"], db)
+        access.require_project_access(db, current_user, product.project_id, write=True)
         require_active_project(db, product.project_id)
         position.project_id = product.project_id
     for field, value in updates.items():
@@ -164,6 +180,7 @@ def delete_position(
     db: Session = Depends(get_db),
 ) -> Response:
     position = _get_position_or_404(position_id, db)
+    access.require_project_access(db, current_user, position.project_id, write=True)
     require_active_project(db, position.project_id)
     before_state = _position_state(position)
     position.deleted_at = datetime.now(timezone.utc)

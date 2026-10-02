@@ -44,7 +44,7 @@ def product_client():
         id="actuary-1",
         roles=[
             SimpleNamespace(
-                name="actuary",
+                name="admin",
                 permissions=[
                     SimpleNamespace(name="registries:read"),
                     SimpleNamespace(name="registries:write"),

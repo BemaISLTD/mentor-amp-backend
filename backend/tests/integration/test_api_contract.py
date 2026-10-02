@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 from app.db.database import get_db
 from app.db.models.audit_log import AuditLog
 from app.db.models.project import Project
+from app.db.models.project_member import ProjectMember
 from app.api.dependencies import get_current_user
 from app.main import app
 
@@ -23,6 +24,8 @@ def db_session():
     )
     Project.__table__.create(engine)
     AuditLog.__table__.create(engine)
+    # Creating a project records its creator as owner (project-scoped authorization).
+    ProjectMember.__table__.create(engine)
     session = sessionmaker(bind=engine)()
     try:
         yield session
@@ -130,6 +133,10 @@ def test_project_archive_is_audited_hidden_and_read_only(client, db_session):
     ).status_code == 409
     assert client.post(
         f"/v1/projects/{project_id}/archive", json={"reason": "Again"}
+    ).status_code == 409
+    assert client.post(
+        f"/v1/projects/{project_id}/members",
+        json={"user_id": "test-user", "role": "viewer"},
     ).status_code == 409
     assert db_session.query(Project).filter(Project.id == project_id).count() == 1
 

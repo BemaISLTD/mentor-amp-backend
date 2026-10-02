@@ -9,7 +9,7 @@ from app.core.reconciliation import reconcile_results
 from app.db.database import get_db
 from app.models.reconciliation import ReconciliationResponse
 
-router = APIRouter(prefix="/runs", tags=["reconciliation"])
+router = APIRouter(prefix="/legacy-runs", tags=["legacy-reconciliation"], deprecated=True)
 TERMINAL_STATUSES = {"success", "partial_success", "failed"}
 
 

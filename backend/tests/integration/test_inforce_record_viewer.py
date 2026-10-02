@@ -9,6 +9,7 @@ from sqlalchemy.pool import StaticPool
 from app.api.dependencies import get_current_user
 from app.db.database import get_db
 from app.db.models.inforce import InforceFile, InforceRecord
+from app.db.models.project import Project
 from app.main import app
 
 
@@ -19,10 +20,12 @@ def viewer():
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+    Project.__table__.create(engine)
     InforceFile.__table__.create(engine)
     InforceRecord.__table__.create(engine)
     Session = sessionmaker(bind=engine)
     session = Session()
+    session.add(Project(id="project-1", name="Viewer project"))
     infile = InforceFile(
         id="file-1",
         project_id="project-1",
@@ -49,7 +52,7 @@ def viewer():
         id="reviewer",
         roles=[
             SimpleNamespace(
-                name="actuary",
+                name="admin",
                 permissions=[SimpleNamespace(name="imports:read")],
             )
         ],

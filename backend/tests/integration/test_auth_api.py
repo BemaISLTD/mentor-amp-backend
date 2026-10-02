@@ -9,6 +9,7 @@ from sqlalchemy.pool import StaticPool
 from app.db.database import get_db
 from app.db.models.audit_log import AuditLog
 from app.db.models.project import Project
+from app.db.models.project_member import ProjectMember
 from app.db.models.user import Permission, Role, User, role_permissions, user_roles
 from app.main import app
 
@@ -26,6 +27,7 @@ def auth_client():
     role_permissions.create(engine)
     AuditLog.__table__.create(engine)
     Project.__table__.create(engine)
+    ProjectMember.__table__.create(engine)
     session = sessionmaker(bind=engine)()
 
     def override_get_db():
@@ -214,7 +216,12 @@ def test_actuary_cannot_access_admin_user_list(auth_client):
     assert audit_response.status_code == 403
 
 
-def test_actuary_can_read_projects_but_cannot_mutate_them(auth_client):
+def test_actuary_reads_only_member_projects_and_cannot_mutate_them(auth_client):
+    """Work Package 1: a generic projects:read permission no longer exposes every project.
+
+    Before WP1 any actuary could read any project by ID (an IDOR). Now access requires project
+    membership; without it the project is reported as not found.
+    """
     admin_token = _bootstrap_and_login(auth_client)
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
     created = auth_client.post(
@@ -245,7 +252,21 @@ def test_actuary_can_read_projects_but_cannot_mutate_them(auth_client):
     ).json()["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
 
-    assert auth_client.get("/v1/projects/", headers=headers).status_code == 200
+    # Not a member yet: the project is invisible.
+    listed = auth_client.get("/v1/projects/", headers=headers)
+    assert listed.status_code == 200 and listed.json()["total"] == 0
+    assert auth_client.get(
+        f"/v1/projects/{project_id}", headers=headers
+    ).status_code == 404
+
+    granted = auth_client.post(
+        f"/v1/projects/{project_id}/members",
+        headers=admin_headers,
+        json={"user_id": user.json()["id"], "role": "viewer"},
+    )
+    assert granted.status_code == 201 and granted.json()["role"] == "viewer"
+
+    assert auth_client.get("/v1/projects/", headers=headers).json()["total"] == 1
     assert auth_client.get(
         f"/v1/projects/{project_id}", headers=headers
     ).status_code == 200
@@ -260,6 +281,61 @@ def test_actuary_can_read_projects_but_cannot_mutate_them(auth_client):
     assert auth_client.delete(
         f"/v1/projects/{project_id}", headers=headers
     ).status_code == 405
+
+
+def test_project_owner_without_write_permission_cannot_add_members(auth_client):
+    admin_token = _bootstrap_and_login(auth_client)
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    project = auth_client.post(
+        "/v1/projects/", headers=admin_headers, json={"name": "Membership Control"}
+    )
+    assert project.status_code == 201
+    project_id = project.json()["id"]
+
+    owner = auth_client.post(
+        "/v1/users/",
+        headers=admin_headers,
+        json={
+            "email": "owner@example.com",
+            "full_name": "Read-only Owner",
+            "password": "owner-secure-password",
+            "roles": ["actuary"],
+        },
+    )
+    target = auth_client.post(
+        "/v1/users/",
+        headers=admin_headers,
+        json={
+            "email": "target@example.com",
+            "full_name": "Target User",
+            "password": "target-secure-password",
+            "roles": ["actuary"],
+        },
+    )
+    assert owner.status_code == target.status_code == 201
+    grant = auth_client.post(
+        f"/v1/projects/{project_id}/members",
+        headers=admin_headers,
+        json={"user_id": owner.json()["id"], "role": "owner"},
+    )
+    assert grant.status_code == 201
+
+    token = auth_client.post(
+        "/v1/auth/token",
+        data={"username": "owner@example.com", "password": "owner-secure-password"},
+    ).json()["access_token"]
+    owner_headers = {"Authorization": f"Bearer {token}"}
+    assert auth_client.get(
+        f"/v1/projects/{project_id}/members", headers=owner_headers
+    ).status_code == 200
+
+    denied = auth_client.post(
+        f"/v1/projects/{project_id}/members",
+        headers=owner_headers,
+        json={"user_id": target.json()["id"], "role": "owner"},
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "FORBIDDEN"
 
 
 def test_invalid_bootstrap_email_returns_validation_envelope(auth_client):

@@ -20,7 +20,7 @@ from app.db.models.user import User
 from app.models.runs import RunCreate, RunListResponse, RunManifestResponse, RunResponse
 from app.models.schemas import ProjectionRunDefinition
 
-router = APIRouter(prefix="/runs", tags=["runs"])
+router = APIRouter(prefix="/legacy-runs", tags=["legacy-runs"], deprecated=True)
 
 
 def _get_run_or_404(run_id: str, db: Session) -> Run:

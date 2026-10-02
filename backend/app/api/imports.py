@@ -1,27 +1,30 @@
 """API endpoints for file import and preview."""
 
-import os
 import shutil
 import uuid
 from contextlib import contextmanager
 from math import ceil
 from pathlib import Path
-from typing import Iterator, Literal
+from typing import Annotated, Iterator, Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy import Float, cast
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import require_permissions
+from app.api.dependencies import get_current_user, require_permissions
 from app.core.project_lifecycle import require_active_project
 from app.data.importers.base import detect_format, import_file, parse_file, preview_file
+from app.core import lifecycle
+from app.core.execution.fingerprints import inforce_fingerprint
 from app.data.validation.inforce_validator import validate_inforce
 from app.data.validation.assumption_validator import validate_assumptions
 from app.data.validation.factor_validator import validate_factors
 from app.data.validation.scenario_validator import validate_scenarios
 from app.db.database import get_db
 from app.db.models import InforceFile, InforceRecord
+from app.db.models.user import User
 from app.models.schemas import ImportPreviewResponse, InforceRecordListResponse
+from app.services import access
 
 router = APIRouter(prefix="/imports", tags=["imports"])
 
@@ -29,6 +32,7 @@ UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
 FilterOperator = Literal["eq", "ne", "contains", "starts_with", "gt", "gte", "lt", "lte"]
 SortColumn = Literal["policy_id", "created_at"]
 SortOrder = Literal["asc", "desc"]
+CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
 def _safe_filename(filename: str | None) -> str:
@@ -70,24 +74,36 @@ def _staged_upload(file: UploadFile) -> Iterator[Path]:
     dependencies=[Depends(require_permissions("imports:write"))],
 )
 def upload_inforce(
+    user: CurrentUser,
     file: UploadFile = File(...),
     project_id: str = Query(...),
     db: Session = Depends(get_db),
 ):
     """Upload an inforce file, validate, and store."""
+    access.require_project_access(db, user, project_id, write=True)
     require_active_project(db, project_id)
     try:
         fmt = detect_format(file.filename or "unknown.tsv")
     except ValueError:
         raise HTTPException(status_code=400, detail="Unsupported file format. Use .tsv, .csv, or .xlsx.")
 
+    validation_errors: list[dict] = []
+
+    def validate(rows: list[dict]) -> list[dict]:
+        validation_errors.extend(validate_inforce(rows))
+        return validation_errors
     def store_inforce(session: Session, rows: list[dict]) -> int:
+        # Stored only when validation found no blocking error (import_file); warnings leave the
+        # file in needs_review. The fingerprint uses the same order the run loader reads.
+        ordered = sorted(enumerate(rows), key=lambda item: (str(item[1].get("policy_id", f"row_{item[0]}")), item[0]))
         infile = InforceFile(
             project_id=project_id,
             filename=file.filename or "unknown",
             file_type=fmt,
             row_count=len(rows),
             columns_detected=list(rows[0].keys()) if rows else [],
+            status=lifecycle.NEEDS_REVIEW if validation_errors else lifecycle.VALIDATED,
+            fingerprint=inforce_fingerprint(row for _index, row in ordered),
         )
         session.add(infile)
         session.flush()
@@ -108,7 +124,7 @@ def upload_inforce(
         # Remove the staging file before commit. If cleanup fails, the database
         # work is rolled back instead of returning a misleading success.
         with _staged_upload(file) as file_path:
-            result = import_file(str(file_path), db, validate_inforce, store_inforce)
+            result = import_file(str(file_path), db, validate, store_inforce)
         db.commit()
         return result
     except Exception:
@@ -122,11 +138,13 @@ def upload_inforce(
     dependencies=[Depends(require_permissions("imports:write"))],
 )
 def upload_assumptions(
+    user: CurrentUser,
     file: UploadFile = File(...),
     project_id: str = Query(...),
     db: Session = Depends(get_db),
 ):
     """Upload an assumption file, validate, and store."""
+    access.require_project_access(db, user, project_id, write=True)
     require_active_project(db, project_id)
     try:
         detect_format(file.filename or "unknown.tsv")
@@ -151,11 +169,13 @@ def upload_assumptions(
     dependencies=[Depends(require_permissions("imports:write"))],
 )
 def upload_factors(
+    user: CurrentUser,
     file: UploadFile = File(...),
     project_id: str = Query(...),
     db: Session = Depends(get_db),
 ):
     """Upload a factor file, validate, and store."""
+    access.require_project_access(db, user, project_id, write=True)
     require_active_project(db, project_id)
     try:
         detect_format(file.filename or "unknown.tsv")
@@ -179,11 +199,13 @@ def upload_factors(
     dependencies=[Depends(require_permissions("imports:write"))],
 )
 def upload_scenarios(
+    user: CurrentUser,
     file: UploadFile = File(...),
     project_id: str = Query(...),
     db: Session = Depends(get_db),
 ):
     """Upload a scenario file, validate, and store."""
+    access.require_project_access(db, user, project_id, write=True)
     require_active_project(db, project_id)
     try:
         detect_format(file.filename or "unknown.tsv")
@@ -247,6 +269,7 @@ def _filter_records(query, infile: InforceFile, column: str, operator: FilterOpe
 @router.get("/inforce/{file_id}/records", response_model=InforceRecordListResponse)
 def list_inforce_records(
     file_id: str,
+    user: CurrentUser,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     filter_column: str | None = Query(None, min_length=1, max_length=255),
@@ -257,6 +280,7 @@ def list_inforce_records(
     db: Session = Depends(get_db),
 ):
     """Return a bounded, filterable page of records for one in-force file."""
+    access.require_object_access(db, user, "inforce_file", file_id)
     infile = db.get(InforceFile, file_id)
     if infile is None:
         raise HTTPException(status_code=404, detail="In-force file not found.")
@@ -293,11 +317,15 @@ def list_inforce_records(
 
 @router.get("/preview", response_model=ImportPreviewResponse)
 def preview_upload(file_path: str = Query(...)):
-    """Preview an uploaded file (first 20 rows) without storing."""
-    if not os.path.exists(file_path):
+    """Preview an uploaded file (first 20 rows) without storing anything.
+
+    Only files inside the upload directory can be previewed (no arbitrary server paths).
+    """
+    candidate = Path(file_path).resolve()
+    if not candidate.is_relative_to(UPLOAD_DIR.resolve()) or not candidate.is_file():
         raise HTTPException(status_code=404, detail="File not found.")
 
-    data = preview_file(file_path, max_rows=20)
+    data = preview_file(str(candidate), max_rows=20)
     return ImportPreviewResponse(
         columns=data["columns"],
         row_count=data["row_count"],

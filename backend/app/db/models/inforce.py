@@ -3,10 +3,12 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core import lifecycle
 from app.db.database import Base
+from app.db.types import BigIntegerPK
 
 
 class InforceFile(Base):
@@ -27,6 +29,12 @@ class InforceFile(Base):
     uploaded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+    # --- M1: lifecycle and provenance ---
+    # app.core.lifecycle: "validated" only after a validation actually ran and passed.
+    status: Mapped[str] = mapped_column(String(30), default=lifecycle.UPLOADED, nullable=False)
+    version_label: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class InforceRecord(Base):
@@ -34,7 +42,7 @@ class InforceRecord(Base):
 
     __tablename__ = "inforce_records"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BigIntegerPK, primary_key=True, autoincrement=True)
     file_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("inforce_files.id", ondelete="CASCADE"), nullable=False
     )

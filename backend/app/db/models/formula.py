@@ -3,11 +3,11 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, String, Text
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.database import Base
+from app.db.types import StringArray
 
 
 class FormulaRegistry(Base):
@@ -26,8 +26,8 @@ class FormulaRegistry(Base):
     )
     function_ref: Mapped[str] = mapped_column(String(255), nullable=False)
     category: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    product_applicability: Mapped[list] = mapped_column(ARRAY(String), default=list)
-    basis_applicability: Mapped[list] = mapped_column(ARRAY(String), default=list)
+    product_applicability: Mapped[list] = mapped_column(StringArray, default=list)
+    basis_applicability: Mapped[list] = mapped_column(StringArray, default=list)
     version: Mapped[str] = mapped_column(String(20), default="v1")
     status: Mapped[str] = mapped_column(String(20), default="draft")
     created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -39,6 +39,18 @@ class FormulaRegistry(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
+
+    # --- M1: ownership and display metadata ---
+    model_version_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("model_versions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    group_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("formula_groups.id", ondelete="SET NULL"), nullable=True
+    )
+    expression_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    unit: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    illustrative: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Relationship to dependencies
     dependencies = relationship(

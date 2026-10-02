@@ -1,4 +1,4 @@
-"""Metadata for immutable run manifests and analytical artifacts."""
+"""Metadata for immutable final run manifests and analytical artifacts."""
 
 import uuid
 from datetime import datetime, timezone
@@ -9,6 +9,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.database import Base
+from app.db.immutability import forbid_updates
 
 JSON_VALUE = JSON().with_variant(JSONB(), "postgresql")
 
@@ -19,6 +20,7 @@ class RunManifest(Base):
     run_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True
     )
+    # final_manifest_fingerprint: covers configuration identity AND the execution outcome.
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     manifest: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -26,6 +28,17 @@ class RunManifest(Base):
         default=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
+    # --- Work Package 1 ---
+    schema_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # CASCADE (not SET NULL): a SET NULL would be an UPDATE, which the immutability trigger refuses.
+    run_package_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("run_packages.id", ondelete="CASCADE"), nullable=True
+    )
+    run_package_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    attempt_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+forbid_updates(RunManifest)
 
 
 class RunArtifact(Base):
@@ -41,6 +54,7 @@ class RunArtifact(Base):
     run_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
     )
+    attempt_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     artifact_type: Mapped[str] = mapped_column(String(30), nullable=False)
     storage_uri: Mapped[str] = mapped_column(String(1000), nullable=False)
     storage_backend: Mapped[str] = mapped_column(String(30), nullable=False)

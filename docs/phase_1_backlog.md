@@ -12,13 +12,13 @@ it is considered complete.
 
 | Area | Verified state | Status |
 | --- | --- | --- |
-| Tests | Original `test_*.py` modules were empty placeholders | Test suite remains open; 48 automated tests now cover implemented domains |
-| Seed data | No seed script exists | Open |
+| Tests | Original `test_*.py` modules were empty placeholders | 155 tests pass in the clean Docker image; 5 opt-in PostgreSQL tests pass separately |
+| Seed data | No seed script existed | Complete for illustrative SPIA demo; broader product and workflow seed remains open |
 | Authentication/RBAC | No auth dependency or user/RBAC models existed | **Complete:** JWT and the administrator, actuary, model developer, reviewer, and read-only permission matrix are enforced |
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
 | Error contract | Default FastAPI `detail` responses were used | **Complete:** standardized error envelope added |
 | Projects | POST and GET only | **Complete:** permission-protected PATCH and audited archival added; hard deletion is not exposed |
-| Run APIs | `runs.py`, `results.py`, and `trace.py` were empty | **Complete for local execution:** queue, status, manifest, result, summary, and trace APIs added |
+| Run APIs | `runs.py`, `results.py`, and `trace.py` were empty | **Complete for local execution:** consolidated run-set, result, comparison, and trace APIs are canonical at `/v1`; older backlog run routes are deprecated under `/v1/legacy-runs` and administrator-only |
 | Large outputs | Runner previously wrote outputs and traces to PostgreSQL | **Complete for local execution:** Parquet artifacts replace the removed legacy tables; production object storage remains open |
 | Run manifests | Runs did not snapshot inputs/configuration | **Complete:** immutable version snapshot added |
 | Reconciliation | No comparison service or API existed | **Complete:** deterministic on-demand comparison over immutable artifacts |
@@ -29,12 +29,12 @@ it is considered complete.
   - Build coverage for database connectivity, migrations, model constraints,
     validation, authentication/authorization, API behavior, engine behavior,
     and golden policies.
-  - Current evidence: API contract, authentication/RBAC, upload recovery, and
-    record viewer suites; `docker compose exec -T api pytest -q` returned
-    `48 passed`.
-- **[IMPROVE] Database Seeding Scripts — OPEN**
-  - Add an idempotent `seed.py` using synthetic users, roles, permissions,
-    projects, products, and representative actuarial metadata.
+  - Current evidence: clean-image `pytest -q` returned `155 passed, 5 skipped`;
+    the five opt-in PostgreSQL migration/concurrency tests passed separately.
+- **[IMPROVE] Database Seeding Scripts — IN PROGRESS**
+  - `scripts/seed_demo.py` idempotently creates synthetic SPIA users, project,
+    inputs, scenarios, model, and a validated projection set. Broader product
+    and workflow seed data remains open.
 - **[IMPROVE] Upload Recovery — COMPLETE FOR LOCAL UPLOADS**
   - Uploads use atomic staging, sanitize client filenames, and remove staged or
     partially copied files on success and failure.
@@ -47,7 +47,8 @@ it is considered complete.
 - **[BUILD] Global Authentication and Authorization (JWT) — COMPLETE**
   - Build users/RBAC persistence, token issuance, `/v1/auth/me`, and `/v1/users`.
   - Project endpoints enforce stored `projects:read` and `projects:write`
-    permissions; uploads and registries remain restricted to admin/actuary roles.
+    permissions plus project membership; product, asset, dashboard, and in-force
+    record APIs now enforce the same project boundary.
   - Administrator, actuary, model developer, reviewer, and read-only roles use
     an explicit project, registry, import, and run permission matrix.
   - Read and mutation routes enforce stored permissions rather than role names.
@@ -119,6 +120,9 @@ it is considered complete.
   - The legacy high-volume tables and ORM models are removed. The removal
     migration refuses to discard non-empty legacy tables, requiring an explicit
     export before deployment when old data exists.
+  - M1 execution writes attempt-scoped Parquet artifacts; analytical reads expose
+    only an accepted attempt. Failed-attempt artifacts remain noncanonical
+    evidence and are not exposed through result APIs.
   - Add an S3-compatible implementation of the artifact-store interface before
     production deployment; engine code must remain storage-backend independent.
 - **[BUILD] Immutable Run Manifests — COMPLETE**
@@ -180,6 +184,10 @@ Before an item moves to complete, record:
 - Artifact metadata migration: `backend/app/db/migrations/versions/91b4e26d7fa0_add_run_manifests_and_artifacts.py`
 - Legacy run-storage removal: `backend/app/db/migrations/versions/a7f4c2d9e180_remove_legacy_run_storage.py`
 - Parquet storage tests: `backend/tests/unit/test_artifact_storage.py`
+- M1 execution integration: `backend/app/services/run_execution_service.py`
+- Attempt-scoped artifact migration: `backend/app/db/migrations/versions/f9d3e5a7b012_attempt_scoped_artifacts.py`
+- M1 end-to-end tests: `backend/tests/integration/test_m1_end_to_end.py`
+- PostgreSQL migration/concurrency tests: `backend/tests/postgres/test_wp1_migrations_postgres.py`
 - Products/assets migration: `backend/app/db/migrations/versions/c48a2d7159be_add_products_and_assets.py`
 - Products/assets tests: `backend/tests/integration/test_products_api.py`
 - Dashboard API: `backend/app/api/dashboard.py`

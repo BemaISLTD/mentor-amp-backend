@@ -22,11 +22,21 @@ Spin up the entire stack (PostgreSQL Database + FastAPI Server) using Docker Com
 docker-compose up --build -d
 ```
 
+The Docker image includes the synthetic SPIA samples and embeds the Git commit.
+Each submitted run package also records a digest of the actual backend code,
+including bind-mounted local changes. Build from a Git checkout; run submission
+is refused when neither a commit nor a code digest is available.
+
 This will automatically:
 1. Start the PostgreSQL database on port `5432`.
 2. Run all required Alembic database migrations.
 3. Start the FastAPI application on port `8001`.
 4. Mount the local `/backend` folder so changes to the code will hot-reload automatically.
+
+Before upgrading a database that has M1 run results or trace rows, export those
+rows to artifact storage. The migration deliberately stops if either legacy
+table contains data; it does not silently discard historical outputs. A fresh
+database or a database already using Parquet artifacts upgrades normally.
 
 ### Option B: Without Docker (Local Virtual Environment)
 If you prefer to run the API directly on your machine, you can use a virtual environment. You will still need a PostgreSQL database running locally (or via Docker just for the DB).
@@ -62,6 +72,7 @@ If you prefer to run the API directly on your machine, you can use a virtual env
 ### Accessing the API
 - **Base API URL:** `http://localhost:8001` (Docker) or `http://localhost:8000` (Local)
 - **Versioned API prefix:** `/v1` (for example, `GET /v1/projects/`)
+- **Run API:** `/v1/run-sets` and `/v1/runs` use the consolidated M1 contract. Older backlog run routes are deprecated under `/v1/legacy-runs` and restricted to administrators.
 - **Health check:** `GET /health` (intentionally unversioned for infrastructure probes)
 - **Swagger Documentation:** `http://localhost:8001/docs` (Docker) or `http://localhost:8000/docs` (Local)
 

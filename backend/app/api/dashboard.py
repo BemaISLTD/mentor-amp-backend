@@ -3,16 +3,19 @@
 from collections import defaultdict
 from datetime import date
 from decimal import Decimal
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
+from app.api.dependencies import get_current_user
 from app.core.project_lifecycle import get_project_or_404
 from app.db.models.inforce import InforceFile
 from app.db.models.product import AssetPosition, Product
 from app.db.models.run import Run
+from app.db.models.user import User
 from app.models.dashboard import (
     DashboardStatsResponse,
     NamedCount,
@@ -20,16 +23,19 @@ from app.models.dashboard import (
     ProductValue,
     RecentRun,
 )
+from app.services import access
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
 @router.get("/stats", response_model=DashboardStatsResponse)
 def get_dashboard_stats(
+    user: Annotated[User, Depends(get_current_user)],
     project_id: str = Query(...),
     as_of_date: date | None = Query(None),
     db: Session = Depends(get_db),
 ):
+    access.require_project_access(db, user, project_id)
     get_project_or_404(db, project_id)
 
     products = db.query(Product).filter(

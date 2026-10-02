@@ -100,7 +100,7 @@ def dashboard_client():
         id="actuary-1",
         roles=[
             SimpleNamespace(
-                name="actuary",
+                name="admin",
                 permissions=[SimpleNamespace(name="projects:read")],
             )
         ],

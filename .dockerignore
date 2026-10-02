@@ -1,0 +1,14 @@
+test_data/
+docs/
+.git/objects/
+.git/logs/
+.git/hooks/
+backend/.venv/
+backend/venv/
+backend/.env
+backend/.pytest_cache/
+backend/.coverage
+backend/artifacts/
+backend/uploads/
+backend/**/__pycache__/
+backend/**/*.pyc

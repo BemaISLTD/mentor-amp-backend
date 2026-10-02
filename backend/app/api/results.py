@@ -9,7 +9,7 @@ from app.core.output.storage import get_run_results
 from app.db.database import get_db
 from app.models.runs import RunResultsResponse, RunSummaryResponse
 
-router = APIRouter(prefix="/runs", tags=["results"])
+router = APIRouter(prefix="/legacy-runs", tags=["legacy-results"], deprecated=True)
 
 
 @router.get("/{run_id}/results", response_model=RunResultsResponse)

@@ -64,10 +64,10 @@ def run_api_client(tmp_path, monkeypatch):
 
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
-        id="actuary-1",
+        id="admin-1",
         roles=[
             SimpleNamespace(
-                name="actuary",
+                name="admin",
                 permissions=[
                     SimpleNamespace(name="runs:read"),
                     SimpleNamespace(name="runs:execute"),
@@ -86,7 +86,7 @@ def run_api_client(tmp_path, monkeypatch):
 
 def _queue_run(client: TestClient) -> str:
     response = client.post(
-        "/v1/runs/",
+        "/v1/legacy-runs/",
         json={
             "name": "Quarter End",
             "project_id": "project-1",
@@ -106,16 +106,16 @@ def test_queue_list_detail_and_manifest(run_api_client):
     client, session, _ = run_api_client
     run_id = _queue_run(client)
 
-    listing = client.get("/v1/runs/")
+    listing = client.get("/v1/legacy-runs/")
     assert listing.status_code == 200
     assert listing.json()["total"] == 1
     assert listing.json()["runs"][0]["status"] == "pending"
 
-    detail = client.get(f"/v1/runs/{run_id}")
+    detail = client.get(f"/v1/legacy-runs/{run_id}")
     assert detail.status_code == 200
     assert detail.json()["project_id"] == "project-1"
 
-    manifest = client.get(f"/v1/runs/{run_id}/manifest")
+    manifest = client.get(f"/v1/legacy-runs/{run_id}/manifest")
     assert manifest.status_code == 200
     assert len(manifest.json()["fingerprint"]) == 64
     assert session.query(AuditLog).filter(AuditLog.action == "run.queued").count() == 1
@@ -145,16 +145,16 @@ def test_result_summary_and_trace_filters(run_api_client):
     buffer.flush_policy(session, "P001")
     session.commit()
 
-    results = client.get(f"/v1/runs/{run_id}/results?month_from=2")
+    results = client.get(f"/v1/legacy-runs/{run_id}/results?month_from=2")
     assert results.status_code == 200
     assert results.json()["total"] == 1
     assert results.json()["results"][0]["value"] == 110.0
 
-    summary = client.get(f"/v1/runs/{run_id}/summary")
+    summary = client.get(f"/v1/legacy-runs/{run_id}/summary")
     assert summary.status_code == 200
     assert summary.json()["summary"]["calculated_variable_count"] == 2
 
-    events = client.get(f"/v1/runs/{run_id}/events?variable=reserve")
+    events = client.get(f"/v1/legacy-runs/{run_id}/events?variable=reserve")
     assert events.status_code == 200
     assert events.json()["total"] == 1
     assert events.json()["events"][0]["lookup_keys"] == {"projection_month": 2}
@@ -163,7 +163,7 @@ def test_result_summary_and_trace_filters(run_api_client):
 def test_queue_rejects_unknown_project(run_api_client):
     client, _, _ = run_api_client
     response = client.post(
-        "/v1/runs/",
+        "/v1/legacy-runs/",
         json={
             "name": "Invalid",
             "project_id": "missing",
@@ -184,7 +184,7 @@ def test_queue_rejects_archived_project(run_api_client):
     session.commit()
 
     response = client.post(
-        "/v1/runs/",
+        "/v1/legacy-runs/",
         json={
             "name": "Archived",
             "project_id": "project-1",
@@ -218,7 +218,7 @@ def test_reconciliation_compares_completed_runs(run_api_client):
     session.commit()
 
     response = client.get(
-        f"/v1/runs/{current_id}/reports/reconciliation",
+        f"/v1/legacy-runs/{current_id}/reports/reconciliation",
         params={"baseline_run_id": baseline_id, "variable": "reserve"},
     )
 
@@ -236,7 +236,7 @@ def test_reconciliation_requires_completed_runs(run_api_client):
     current_id = _queue_run(client)
 
     response = client.get(
-        f"/v1/runs/{current_id}/reports/reconciliation",
+        f"/v1/legacy-runs/{current_id}/reports/reconciliation",
         params={"baseline_run_id": baseline_id},
     )
 

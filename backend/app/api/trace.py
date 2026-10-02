@@ -10,7 +10,7 @@ from app.core.artifacts import read_artifact_rows
 from app.db.database import get_db
 from app.models.runs import RunTraceResponse
 
-router = APIRouter(prefix="/runs", tags=["trace"])
+router = APIRouter(prefix="/legacy-runs", tags=["legacy-trace"], deprecated=True)
 
 
 @router.get("/{run_id}/events", response_model=RunTraceResponse)

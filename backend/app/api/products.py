@@ -20,6 +20,7 @@ from app.models.products import (
     ProductResponse,
     ProductUpdate,
 )
+from app.services import access
 
 router = APIRouter(prefix="/products", tags=["products"])
 
@@ -74,6 +75,7 @@ def create_product(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Session = Depends(get_db),
 ):
+    access.require_project_access(db, current_user, payload.project_id, write=True)
     require_active_project(db, payload.project_id)
     _ensure_unique_code(db, payload.project_id, payload.code)
     product = Product(
@@ -98,6 +100,7 @@ def create_product(
 
 @router.get("/", response_model=ProductListResponse)
 def list_products(
+    user: Annotated[User, Depends(get_current_user)],
     project_id: str | None = Query(None),
     product_type: str | None = Query(None),
     product_status: str | None = Query(None, alias="status"),
@@ -107,7 +110,12 @@ def list_products(
 ):
     query = db.query(Product).filter(Product.deleted_at.is_(None))
     if project_id is not None:
+        access.require_project_access(db, user, project_id)
         query = query.filter(Product.project_id == project_id)
+    else:
+        allowed = access.accessible_project_ids(db, user)
+        if allowed is not None:
+            query = query.filter(Product.project_id.in_(allowed or [""]))
     if product_type is not None:
         query = query.filter(Product.product_type == product_type)
     if product_status is not None:
@@ -120,7 +128,12 @@ def list_products(
 
 
 @router.get("/{product_id}", response_model=ProductResponse)
-def get_product(product_id: str, db: Session = Depends(get_db)):
+def get_product(
+    product_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    access.require_object_access(db, user, "product", product_id)
     return _get_product_or_404(product_id, db)
 
 
@@ -136,6 +149,7 @@ def update_product(
     db: Session = Depends(get_db),
 ):
     product = _get_product_or_404(product_id, db)
+    access.require_project_access(db, current_user, product.project_id, write=True)
     require_active_project(db, product.project_id)
     updates = payload.model_dump(exclude_unset=True)
     if "code" in updates:
@@ -170,6 +184,7 @@ def delete_product(
     db: Session = Depends(get_db),
 ) -> Response:
     product = _get_product_or_404(product_id, db)
+    access.require_project_access(db, current_user, product.project_id, write=True)
     require_active_project(db, product.project_id)
     deleted_at = datetime.now(timezone.utc)
     before_state = _product_state(product)
@@ -214,6 +229,7 @@ def create_mapping(
     db: Session = Depends(get_db),
 ):
     product = _get_product_or_404(product_id, db)
+    access.require_project_access(db, current_user, product.project_id, write=True)
     require_active_project(db, product.project_id)
     duplicate = db.query(ProductMapping).filter(
         ProductMapping.product_id == product_id,
@@ -251,7 +267,12 @@ def create_mapping(
 
 
 @router.get("/{product_id}/mappings", response_model=list[ProductMappingResponse])
-def list_mappings(product_id: str, db: Session = Depends(get_db)):
+def list_mappings(
+    product_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    access.require_object_access(db, user, "product", product_id)
     _get_product_or_404(product_id, db)
     return db.query(ProductMapping).filter(
         ProductMapping.product_id == product_id,
@@ -271,6 +292,7 @@ def delete_mapping(
     db: Session = Depends(get_db),
 ) -> Response:
     product = _get_product_or_404(product_id, db)
+    access.require_project_access(db, current_user, product.project_id, write=True)
     require_active_project(db, product.project_id)
     mapping = db.query(ProductMapping).filter(
         ProductMapping.id == mapping_id,
