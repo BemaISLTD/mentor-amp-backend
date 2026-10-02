@@ -7,7 +7,7 @@ variable, Projection Set, scenario or table cannot change what a submitted run c
 Document layout (``PACKAGE_SCHEMA_VERSION``)::
 
     {
-      "schema_version": "mentoramp.run_package/v1",
+      "schema_version": "mentoramp.run_package/v2",
       "fingerprint_algorithm": "sha256/canonical-json/v1",
       "fingerprint": "<sha256 of configuration>",          # the run_package_fingerprint
       "identity":   {...},   # package_id, frozen_for_run_id, run_set_id, project_id,
@@ -24,11 +24,15 @@ Document layout (``PACKAGE_SCHEMA_VERSION``)::
         "parameters": {...},                               # Projection Set parameters
         "formulas":  [{"id", "name", "output_variable", "function_ref", "version",
                        "dependencies", "expression_text", "unit", "illustrative",
+                       "implementation": {"module", "qualname", "implementation_version",
+                                          "implementation_fingerprint"},
                        "content_fingerprint"}],
         "variables": [{"id", "name", "display_name", "version", "kind", "data_type", "unit",
-                       "required", "default_value", "source", "content_fingerprint"}],
+                       "required", "default_value", "source", "allow_scenario_override",
+                       "definition_id", "content_fingerprint"}],   # model-version definitions
         "datasets": {
-          "inforce":           [{"id", "name", "version_label", "record_count", "fingerprint"}],
+          "inforce":           [{"id", "name", "version_label", "record_count", "fingerprint",
+                                 "fingerprint_scheme"}],
           "assumption_tables": [{"id", "name", "set_id", "set_name", "table_type",
                                  "version_label", "lookup_keys", "value_column", "row_count",
                                  "fingerprint"}],
@@ -41,12 +45,23 @@ Document layout (``PACKAGE_SCHEMA_VERSION``)::
                     "max_traced_policies": int,
                     "published": {"<output>": {"display_name", "unit", "dimension",
                                                "aggregation"}}},
-        "build": {"app_version", "engine_version", "code_version", "source_commit"},
+        "build": {"app_version", "engine_version", "code_version", "build_fingerprint",
+                  "source_commit", "source_dirty", "identity_source"},
       }
     }
 
 Large inputs (policy records, table rows) are referenced by ID and fingerprint, not copied: the
 loader must find exactly the recorded content or the run fails before any calculation.
+
+Before execution a worker checks, in order: the envelope (``verify_envelope``: the package row,
+the document identity and the run's index fields all agree), the configuration fingerprint
+(``verify``), the build identity, every formula implementation fingerprint, and every dataset
+fingerprint. The configuration fingerprint deliberately excludes the identity block, so two runs
+with the same configuration share it; the envelope check is what binds a package to its run.
+
+Schema history: v1 (Work Package 1) had no implementation identity, no model-version variable
+definitions, no inforce fingerprint scheme and no build fingerprint; v1 packages are readable but
+are not executed by this build.
 """
 
 from collections.abc import Iterable, Mapping
@@ -64,7 +79,7 @@ from app.core.projection_engine.run_data import (
     VariableSpec,
 )
 
-PACKAGE_SCHEMA_VERSION = "mentoramp.run_package/v1"
+PACKAGE_SCHEMA_VERSION = "mentoramp.run_package/v2"
 SUPPORTED_SCHEMA_VERSIONS = frozenset({PACKAGE_SCHEMA_VERSION})
 
 
@@ -124,6 +139,54 @@ def verify(package: Mapping[str, Any], expected_fingerprint: str | None) -> dict
     return configuration
 
 
+def verify_envelope(
+    document: Mapping[str, Any], package_row: Mapping[str, Any], run: Mapping[str, Any]
+) -> None:
+    """The package row, the package document and the run must describe the same run.
+
+    ``package_row``: id, run_id, project_id, fingerprint, schema_version, fingerprint_algorithm.
+    ``run``: id, project_id, run_set_id, run_package_fingerprint, scenario_id, model_version_id,
+    projection_set_id, horizon_months, valuation_date (ISO text).
+    Raises ``PACKAGE_IDENTITY_MISMATCH`` (frozen evidence relabelled) or ``RUN_INDEX_MISMATCH``
+    (the mutable run row disagrees with the frozen package).
+    """
+    identity = document.get("identity") or {}
+    configuration = document.get("configuration") or {}
+    identity_checks = {
+        "package_id": (package_row.get("id"), identity.get("package_id")),
+        "run_id": (package_row.get("run_id"), identity.get("frozen_for_run_id"), run.get("id")),
+        "project_id": (package_row.get("project_id"), identity.get("project_id"), run.get("project_id"),
+                       (configuration.get("project") or {}).get("id")),
+        "run_set_id": (identity.get("run_set_id"), run.get("run_set_id")),
+        "fingerprint": (package_row.get("fingerprint"), document.get("fingerprint"),
+                        run.get("run_package_fingerprint")),
+        "schema_version": (package_row.get("schema_version"), document.get("schema_version")),
+        "fingerprint_algorithm": (package_row.get("fingerprint_algorithm"),
+                                  document.get("fingerprint_algorithm")),
+    }
+    mismatched = {name: list(values) for name, values in identity_checks.items() if len(set(values)) != 1}
+    if mismatched:
+        raise RunPackageError(
+            "PACKAGE_IDENTITY_MISMATCH",
+            f"The run package does not belong to this run: {', '.join(sorted(mismatched))} disagree.",
+            {"mismatched": mismatched},
+        )
+    index_checks = {
+        "scenario_id": ((configuration.get("scenario") or {}).get("id"), run.get("scenario_id")),
+        "model_version_id": ((configuration.get("model_version") or {}).get("id"), run.get("model_version_id")),
+        "projection_set_id": ((configuration.get("projection_set") or {}).get("id"), run.get("projection_set_id")),
+        "horizon_months": (configuration.get("horizon_months"), run.get("horizon_months")),
+        "valuation_date": (configuration.get("valuation_date"), run.get("valuation_date")),
+    }
+    mismatched = {name: list(values) for name, values in index_checks.items() if values[0] != values[1]}
+    if mismatched:
+        raise RunPackageError(
+            "RUN_INDEX_MISMATCH",
+            f"The run row disagrees with its frozen package: {', '.join(sorted(mismatched))}.",
+            {"mismatched": mismatched},
+        )
+
+
 def formula_spec(entry: Mapping[str, Any]) -> FormulaSpec:
     return FormulaSpec(
         id=entry["id"],
@@ -148,6 +211,7 @@ def variable_spec(entry: Mapping[str, Any]) -> VariableSpec:
         required=bool(entry.get("required", True)),
         display_name=entry.get("display_name"),
         version=entry.get("version") or "v1",
+        allow_scenario_override=bool(entry.get("allow_scenario_override")),
     )
 
 

@@ -155,8 +155,8 @@ def test_rows_of_a_failed_attempt_stay_invisible_even_if_cleanup_fails(env, monk
     run_id = submitted["by_scenario"]["Base"]
     fail_on_call(monkeypatch, 12)
 
-    def cleanup_that_cannot_reach_the_database(db, run, attempt):
-        attempt.cleanup_status = "failed"
+    def cleanup_that_cannot_reach_the_database(db, run_id, attempt_number):
+        return "failed"
 
     monkeypatch.setattr(run_execution_service, "_delete_attempt_rows", cleanup_that_cannot_reach_the_database)
     env.execute(submitted)

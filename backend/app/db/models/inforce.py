@@ -34,6 +34,8 @@ class InforceFile(Base):
     status: Mapped[str] = mapped_column(String(30), default=lifecycle.UPLOADED, nullable=False)
     version_label: Mapped[str | None] = mapped_column(String(30), nullable=True)
     fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # How ``fingerprint`` was computed (app.core.execution.fingerprints); runs require inforce-v2.
+    fingerprint_scheme: Mapped[str | None] = mapped_column(String(20), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 

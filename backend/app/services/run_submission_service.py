@@ -6,6 +6,7 @@ is created.
 """
 
 import uuid
+from datetime import date
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -28,15 +29,17 @@ def _plan(db: Session, user: Any, payload: dict, write: bool):
     if not projection_set_ids:
         raise ServiceError(422, "VALIDATION_ERROR", "Select at least one Projection Set.")
     requested_scenarios: list[str] = list(dict.fromkeys(payload.get("scenario_ids") or []))
-    plan: list[tuple[ProjectionSet, list[str]]] = []
+    plan: list[tuple[ProjectionSet, list[str], str]] = []
     for projection_set_id in dict.fromkeys(projection_set_ids):
         projection_set = db.get(ProjectionSet, projection_set_id)
         if projection_set is None or projection_set.project_id != project.id:
             raise not_found(f"Projection Set '{projection_set_id}' not found in this project.")
         # A request-level scenario list replaces the Projection Set's own list; each scenario is
         # checked in full when its package is frozen (project, status, fingerprint, overrides).
-        scenario_ids = requested_scenarios or list(projection_set.scenario_ids or [])
-        plan.append((projection_set, scenario_ids))
+        if requested_scenarios:
+            plan.append((projection_set, requested_scenarios, "request"))
+        else:
+            plan.append((projection_set, list(dict.fromkeys(projection_set.scenario_ids or [])), "projection_set"))
     return project, plan
 
 
@@ -45,7 +48,7 @@ def preflight(db: Session, payload: dict, user: Any) -> dict[str, Any]:
     project, plan = _plan(db, user, payload, write=True)
     planned = []
     problems: list[dict[str, Any]] = []
-    for projection_set, scenario_ids in plan:
+    for projection_set, scenario_ids, _source in plan:
         if not scenario_ids:
             problems.append({"code": "NO_SCENARIOS", "message": f"'{projection_set.name}' has no scenarios."})
         for scenario_id in scenario_ids:
@@ -70,20 +73,26 @@ def preflight(db: Session, payload: dict, user: Any) -> dict[str, Any]:
                "Every inforce file and table pinned by ID"),
         _check("formulas_ready", "Formula lineage captured",
                not codes & {"FUNCTION_NOT_REGISTERED", "FORMULA_NOT_RUNNABLE", "NO_FORMULAS",
-                            "FORMULA_GRAPH_INVALID", "VARIABLE_NOT_REGISTERED"},
+                            "FORMULA_GRAPH_INVALID", "VARIABLE_NOT_DEFINED"},
                "Formulas registered; graph valid"),
         _check("scenarios_valid", "Scenarios valid",
                bool(planned) and not {code for code in codes if code.startswith("SCENARIO") or code == "NO_SCENARIOS"},
                f"{len(planned)} scenario run(s)"),
-        {"code": "reports_attached", "label": "Report attachment valid", "status": "pass",
-         "message": "No reports attached (reports arrive later)"},
+        # Reports are not implemented yet: "deferred" is neither a pass nor a failure, and it
+        # does not affect "ok" (a capability that does not exist is never reported as passing).
+        {"code": "reports_attached", "label": "Report attachment", "status": DEFERRED,
+         "message": "Report attachment is not available yet (deferred to a later milestone)."},
     ]
     return {
-        "ok": bool(planned) and not problems,
+        "ok": bool(planned) and not problems
+        and all(check["status"] in ("pass", DEFERRED) for check in checks),
         "checks": checks,
         "planned_runs": planned,
         "problems": problems,
     }
+
+
+DEFERRED = "deferred"
 
 
 def _check(code: str, label: str, passed: bool, message: str) -> dict[str, str]:
@@ -97,7 +106,7 @@ def _run_name(projection_set: ProjectionSet, configuration: dict | None, scenari
 
 def submit_run_set(db: Session, payload: dict, user: Any) -> dict[str, Any]:
     project, plan = _plan(db, user, payload, write=True)
-    for projection_set, scenario_ids in plan:
+    for projection_set, scenario_ids, _source in plan:
         if projection_set.status not in lifecycle.RUNNABLE_PROJECTION_SET_STATUSES:
             raise conflict(
                 f"Projection Set '{projection_set.name}' is not validated "
@@ -111,7 +120,7 @@ def submit_run_set(db: Session, payload: dict, user: Any) -> dict[str, Any]:
     submitted_at = now_utc()
     run_set_id = str(uuid.uuid4())
     frozen: list[tuple[ProjectionSet, str, packages.FrozenPackage]] = []
-    for projection_set, scenario_ids in plan:
+    for projection_set, scenario_ids, _source in plan:
         for scenario_id in scenario_ids:
             run_id = str(uuid.uuid4())
             package = packages.freeze(
@@ -124,8 +133,24 @@ def submit_run_set(db: Session, payload: dict, user: Any) -> dict[str, Any]:
         project_id=project.id,
         name=payload.get("name") or "Run Set",
         notes=payload.get("notes") or None,
-        projection_set_ids=[projection_set.id for projection_set, _ in plan],
-        scenario_ids=list(payload.get("scenario_ids") or []),
+        projection_set_ids=[projection_set.id for projection_set, _ids, _source in plan],
+        # The scenarios actually submitted, first-appearance order across Projection Sets.
+        scenario_ids=list(dict.fromkeys(scenario_id for _ps, ids, _source in plan for scenario_id in ids)),
+        resolution={
+            "requested_scenario_ids": list(dict.fromkeys(payload.get("scenario_ids") or [])),
+            "projection_sets": [
+                {
+                    "projection_set_id": projection_set.id,
+                    "scenario_source": source,
+                    "scenario_ids": list(ids),
+                    "runs": [
+                        {"run_id": run_id, "scenario_id": package.configuration["scenario"]["id"]}
+                        for ps, run_id, package in frozen if ps.id == projection_set.id
+                    ],
+                }
+                for projection_set, ids, source in plan
+            ],
+        },
         status=run_state.RUN_SET_QUEUED,
         created_by=user.id,
         submitted_at=submitted_at,
@@ -146,7 +171,7 @@ def submit_run_set(db: Session, payload: dict, user: Any) -> dict[str, Any]:
             projection_set_id=projection_set.id,
             model_version_id=configuration["model_version"]["id"],
             scenario_id=configuration["scenario"]["id"],
-            valuation_date=projection_set.valuation_date,
+            valuation_date=date.fromisoformat(configuration["valuation_date"]),
             horizon_months=configuration["horizon_months"],
             illustrative=bool(configuration["model_version"]["illustrative"]),
             triggered_by=user.id,

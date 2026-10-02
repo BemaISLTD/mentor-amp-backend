@@ -43,8 +43,10 @@ def get_run(db: Session, run_id: str) -> Run:
     return run
 
 
-def results_available(run: Run) -> bool:
-    return run.status in run_state.RESULT_STATUSES and run.accepted_attempt_number is not None
+def results_available(db: Session, run: Run) -> bool:
+    from app.services.run_finalization import evidence_consistent  # local: avoids an import cycle
+
+    return evidence_consistent(db, run)
 
 
 def run_view(db: Session, run: Run, lookups: Lookups | None = None, include_summary: bool = True) -> dict:
@@ -113,8 +115,8 @@ def run_view(db: Session, run: Run, lookups: Lookups | None = None, include_summ
         "legacy_run": run.run_package_fingerprint is None,
         "attempt_count": run.attempt_count or 0,
         "accepted_attempt_number": run.accepted_attempt_number,
-        "results_available": results_available(run),
-        "results_complete": run.status == run_state.SUCCESS and run.accepted_attempt_number is not None,
+        "results_available": (available := results_available(db, run)),
+        "results_complete": available and run.status == run_state.SUCCESS,
         "illustrative": bool(run.illustrative),
         "summary": run.summary if include_summary else None,
     }
@@ -179,6 +181,9 @@ def _run_set_summary(db: Session, run_set: RunSet, lookups: Lookups) -> dict[str
         "status": run_set.status,
         "projection_sets": projection_sets,
         "scenario_names": scenario_names,
+        # The scenarios actually submitted, and how they were resolved per Projection Set.
+        "scenario_ids": list(run_set.scenario_ids or []),
+        "resolution": run_set.resolution,
         "run_count": len(runs),
         "runs_by_status": by_status,
         "report_count": 0,
@@ -356,23 +361,24 @@ def run_configuration(db: Session, run: Run) -> dict[str, Any]:
 
 
 def _legacy_configuration(db: Session, run: Run) -> dict[str, Any]:
-    from app.db.models.variable import VariableRegistry  # local: only legacy runs need it
-    from app.services.model_definition import variable_default, variable_source
+    """Best-effort view for legacy runs: their migrated manifest plus the run's own model-version
+    variable definitions (never the global catalog)."""
+    from app.services.model_definition import variable_specs  # local: only legacy runs need it
 
     final = db.get(RunManifest, run.id)
     old = dict((final.manifest if final else None) or {})
-    registry = {row.name: row for row in db.query(VariableRegistry).all()}
+    specs = variable_specs(db, run.model_version_id) if run.model_version_id else {}
     variables = []
     for item in old.get("variables") or []:
-        row = registry.get(item.get("name"))
+        spec = specs.get(item.get("name"))
         variables.append({
             "name": item.get("name"),
             "kind": item.get("kind"),
             "version": item.get("version"),
-            "source": item.get("source") or (variable_source(row) if row else {}),
-            "default_value": variable_default(row) if row else None,
-            "unit": row.unit if row else None,
-            "display_name": row.display_name if row else None,
+            "source": item.get("source") or (dict(spec.source) if spec else {}),
+            "default_value": spec.default_value if spec else None,
+            "unit": spec.unit if spec else None,
+            "display_name": spec.display_name if spec else None,
             "content_fingerprint": None,
         })
     return {

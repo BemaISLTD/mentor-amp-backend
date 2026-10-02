@@ -81,7 +81,11 @@ class RunSet(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     projection_set_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    # The scenarios actually submitted (resolved per Projection Set, first-appearance order).
     scenario_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    # How the submission resolved: requested scenario IDs, and per Projection Set the scenario
+    # source ("request" or "projection_set"), the scenarios and the runs created.
+    resolution: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="queued", nullable=False)
     created_by: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True

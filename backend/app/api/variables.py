@@ -1,8 +1,15 @@
-"""API endpoints for the Variable Registry."""
+"""API endpoints for the Variable Registry — the global SEMANTIC variable catalog.
+
+The catalog records what a variable *is*. How a model resolves it (source, default, override
+policy) lives in model-version definitions (``/v1/model-versions/{id}/variables``), which are
+project-scoped. Catalog entries are never used to resolve values; changing them is reserved for
+platform administrators.
+"""
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.api.dependencies import require_roles
 from app.core.variable_registry.registry import (
     delete,
     get_by_name,
@@ -14,6 +21,7 @@ from app.db.database import get_db
 from app.models.schemas import VariableDefinition
 
 router = APIRouter(prefix="/variables", tags=["variables"])
+AdminOnly = [Depends(require_roles("admin"))]
 
 
 @router.get("/", response_model=list[VariableDefinition])
@@ -26,7 +34,7 @@ def list_variables(
     return list_all(db, product=product, kind=kind)
 
 
-@router.post("/", response_model=VariableDefinition, status_code=status.HTTP_201_CREATED)
+@router.post("/", response_model=VariableDefinition, status_code=status.HTTP_201_CREATED, dependencies=AdminOnly)
 def create_variable(variable: VariableDefinition, db: Session = Depends(get_db)):
     """Register a new variable."""
     existing = get_by_name(db, variable.name)
@@ -47,7 +55,7 @@ def get_variable(name: str, db: Session = Depends(get_db)):
     return var
 
 
-@router.put("/{name}", response_model=VariableDefinition)
+@router.put("/{name}", response_model=VariableDefinition, dependencies=AdminOnly)
 def update_variable(name: str, updates: dict, db: Session = Depends(get_db)):
     """Update a variable's fields."""
     var = update(db, name, updates)
@@ -56,7 +64,7 @@ def update_variable(name: str, updates: dict, db: Session = Depends(get_db)):
     return var
 
 
-@router.delete("/{name}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{name}", status_code=status.HTTP_204_NO_CONTENT, dependencies=AdminOnly)
 def delete_variable(name: str, db: Session = Depends(get_db)):
     """Delete a variable by name."""
     success = delete(db, name)

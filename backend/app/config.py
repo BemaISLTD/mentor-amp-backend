@@ -43,10 +43,13 @@ class Settings(BaseSettings):
     # Comma-separated list of browser origins allowed to call the API.
     cors_origins: str = DEFAULT_CORS_ORIGINS
 
-    # Build identity recorded in every run package. CODE_VERSION is a release/build label;
-    # SOURCE_COMMIT is the git commit SHA the process was built from (set it in CI/deployments).
+    # Build identity frozen into every run package (app.services.build_info). CODE_VERSION is a
+    # release label; SOURCE_COMMIT the git commit; BUILD_FINGERPRINT an immutable hash of the built
+    # artifact. staging/production must inject SOURCE_COMMIT and BUILD_FINGERPRINT; elsewhere the
+    # fingerprint is computed from the loaded source (so uncommitted edits change it).
     code_version: str = "development"
     source_commit: str | None = None
+    build_fingerprint: str | None = None
 
     # Upper bound on policies whose calculation trace is stored for one run (frozen per package).
     max_traced_policies: int = 25
@@ -63,6 +66,11 @@ class Settings(BaseSettings):
                 )
             if not self.debug:
                 raise ValueError("AUTH_MODE=disabled is only allowed when DEBUG is true.")
+        if self.app_env in PROTECTED_ENVIRONMENTS and not (self.source_commit and self.build_fingerprint):
+            raise ValueError(
+                f"APP_ENV={self.app_env} requires SOURCE_COMMIT and BUILD_FINGERPRINT (immutable "
+                "build identity for run reproducibility)."
+            )
         origins = self.cors_origin_list
         if "*" in origins:
             raise ValueError("CORS_ORIGINS may not contain '*' (credentials are allowed).")

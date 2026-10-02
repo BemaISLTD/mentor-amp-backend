@@ -10,7 +10,8 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 
 BACKEND = Path(__file__).resolve().parents[2]
-HEAD = "b7e4d2a9c613"
+HEAD = "c9e2a4b6d8f1"  # WP1 correction pass
+WP1 = "b7e4d2a9c613"
 MERGE = "a3c5e7f9b1d2"
 
 
@@ -27,7 +28,8 @@ def test_there_is_exactly_one_head():
 def test_the_merge_joins_the_m1_and_dev_histories():
     merge = script().get_revision(MERGE)
     assert set(merge.down_revision) == {"4d8e2f6a1c90", "c48a2d7159be"}
-    assert script().get_revision(HEAD).down_revision == MERGE
+    assert script().get_revision(WP1).down_revision == MERGE
+    assert script().get_revision(HEAD).down_revision == WP1  # forward-only correction
 
 
 def test_both_branch_heads_and_their_ancestors_are_upgraded_by_head():
@@ -36,6 +38,6 @@ def test_both_branch_heads_and_their_ancestors_are_upgraded_by_head():
         "e0c51a917e8e", "bfc45372c779", "fbe10ad9a08b", "2f6d51e920a4",  # shared base
         "4d8e2f6a1c90",                                                  # main (M1)
         "7c3f19ad0e82", "91b4e26d7fa0", "c48a2d7159be",                  # dev (Noah)
-        MERGE, HEAD,
+        MERGE, WP1, HEAD,
     } <= ancestors
     assert len(script().get_bases()) == 1

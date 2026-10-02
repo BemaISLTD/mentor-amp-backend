@@ -29,15 +29,27 @@ def test_demo_auth_is_allowed_only_in_local_and_test_with_debug(environment):
         make(app_env=environment, auth_mode="disabled", debug=False, jwt_secret_key=PRODUCTION_SECRET)
 
 
+BUILD = {"source_commit": "a" * 40, "build_fingerprint": "b" * 64}
+
+
 def test_jwt_mode_production_needs_explicit_cors_and_a_real_secret():
     with pytest.raises(ValidationError, match="CORS_ORIGINS"):
-        make(app_env="production", debug=False, jwt_secret_key=PRODUCTION_SECRET)
+        make(app_env="production", debug=False, jwt_secret_key=PRODUCTION_SECRET, **BUILD)
     with pytest.raises(ValidationError, match="JWT_SECRET_KEY"):
-        make(app_env="production", debug=False, cors_origins="https://app.example.com")
+        make(app_env="production", debug=False, cors_origins="https://app.example.com", **BUILD)
     settings = make(app_env="production", debug=False, jwt_secret_key=PRODUCTION_SECRET,
-                    cors_origins="https://app.example.com")
+                    cors_origins="https://app.example.com", **BUILD)
     assert settings.demo_auth_permitted is False
     assert make(app_env="local").cors_origins == DEFAULT_CORS_ORIGINS
+
+
+@pytest.mark.parametrize("environment", ["production", "staging"])
+@pytest.mark.parametrize("missing", ["source_commit", "build_fingerprint"])
+def test_protected_environments_require_an_injected_build_identity(environment, missing):
+    build = {key: value for key, value in BUILD.items() if key != missing}
+    with pytest.raises(ValidationError, match="BUILD_FINGERPRINT"):
+        make(app_env=environment, debug=False, jwt_secret_key=PRODUCTION_SECRET,
+             cors_origins="https://app.example.com", **build)
 
 
 def test_wildcard_cors_is_always_refused():

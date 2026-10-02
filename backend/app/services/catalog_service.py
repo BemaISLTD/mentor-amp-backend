@@ -17,9 +17,13 @@ from app.db.models.project import Project
 from app.db.models.projection import ProjectionSet
 from app.db.models.run import Run
 from app.db.models.scenario import ScenarioSet, ScenarioTable
-from app.db.models.variable import VariableRegistry
 from app.services.common import iso, not_found, product_name, user_ref
-from app.services.model_definition import load_variable_closure, to_formula_spec, to_variable_spec
+from app.services.model_definition import (
+    definitions_for,
+    load_variable_closure,
+    to_formula_spec,
+    variable_specs,
+)
 
 CATEGORY_LABELS = {
     "liability_inforce": "Liability Inforce",
@@ -227,7 +231,10 @@ def _projection_sets_for_version(db: Session, model_version_id: str) -> list[Pro
 
 
 def model_version_checks(
-    db: Session, formulas: list[FormulaRegistry], published: list[ModelPublishedOutput]
+    db: Session,
+    formulas: list[FormulaRegistry],
+    published: list[ModelPublishedOutput],
+    model_version_id: str | None = None,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     registered = [row for row in formulas if row.function_ref in FORMULA_FUNCTIONS]
@@ -244,12 +251,13 @@ def model_version_checks(
     except EngineError as error:
         checks.append({"code": "graph_acyclic", "label": "Dependency graph has no cycles",
                        "status": "fail", "message": error.message})
-    names = {row[0] for row in db.query(VariableRegistry.name).all()}
+    version_id = model_version_id or next((row.model_version_id for row in formulas if row.model_version_id), None)
+    names = set(definitions_for(db, version_id)) if version_id else set()
     dependencies = [dep.depends_on_variable for row in formulas for dep in row.dependencies]
     missing = sorted({name for name in dependencies if name not in names})
     checks.append({
         "code": "dependencies_registered",
-        "label": "Every dependency is a registered variable",
+        "label": "Every dependency is defined for this model version",
         "status": "fail" if missing else "pass",
         "message": f"Missing: {', '.join(missing)}" if missing
         else f"All {len(dependencies)} dependencies registered",
@@ -257,7 +265,7 @@ def model_version_checks(
     published_missing = [row.variable_name for row in published if row.variable_name not in names]
     checks.append({
         "code": "outputs_published",
-        "label": "Published outputs exist as variables",
+        "label": "Published outputs are defined for this model version",
         "status": "fail" if published_missing else "pass",
         "message": f"{len(published) - len(published_missing)} of {len(published)}",
     })
@@ -279,7 +287,7 @@ def model_version_structure(db: Session, model_version_id: str) -> dict[str, Any
     for row in formulas:
         if row.group_id:
             group_counts[row.group_id] = group_counts.get(row.group_id, 0) + 1
-    variables = load_variable_closure(db, formulas, [row.variable_name for row in published])
+    variables = load_variable_closure(db, version.id, formulas, [row.variable_name for row in published])
     input_variables = [spec for spec in variables.values() if spec.source_type in DATA_KINDS]
     projection_sets = _projection_sets_for_version(db, version.id)
     linked: set[str] = set()
@@ -342,7 +350,7 @@ def model_version_structure(db: Session, model_version_id: str) -> dict[str, Any
             }
             for group in groups
         ],
-        "validation": model_version_checks(db, formulas, published),
+        "validation": model_version_checks(db, formulas, published, version.id),
     }
 
 
@@ -451,7 +459,7 @@ def formula_detail(db: Session, formula_id: str) -> dict[str, Any]:
     model = db.get(Model, version.model_id) if version else None
     siblings = _model_formulas(db, version.id) if version else [row]
     producers = {item.output_variable: item.id for item in siblings}
-    variables = {item.name: to_variable_spec(item) for item in db.query(VariableRegistry).all()}
+    variables = variable_specs(db, version.id) if version else {}
 
     inputs: list[dict[str, Any]] = []
     formula_dependencies: list[dict[str, Any]] = []
@@ -473,7 +481,7 @@ def formula_detail(db: Session, formula_id: str) -> dict[str, Any]:
                 "variable": dependency,
                 "kind": kind,
                 "unit": spec.unit if spec else None,
-                "source_summary": _source_summary(spec) if spec else "Not registered",
+                "source_summary": _source_summary(spec) if spec else "Not defined for this model version",
             })
 
     dependents = [
@@ -642,10 +650,10 @@ def _input_variables(db: Session, project_id: str) -> list[VariableSpec]:
         .filter(Model.project_id == project_id)
         .all()
     )
-    formulas: list[FormulaRegistry] = []
-    for (version_id,) in versions:
-        formulas.extend(_model_formulas(db, version_id))
-    variables = load_variable_closure(db, formulas, [])
+    variables: dict[str, VariableSpec] = {}
+    for (version_id,) in sorted(versions):
+        for name, spec in load_variable_closure(db, version_id, _model_formulas(db, version_id), []).items():
+            variables.setdefault(name, spec)
     return sorted(
         (spec for spec in variables.values() if spec.source_type in ("input", "context")),
         key=lambda spec: spec.name,
@@ -903,8 +911,8 @@ def get_scenario(db: Session, scenario_id: str) -> dict[str, Any]:
     if scenario is None:
         raise not_found(f"Scenario '{scenario_id}' not found.")
     scenario_set = db.get(ScenarioSet, scenario.set_id)
-    units = {row.name: row.unit for row in db.query(VariableRegistry).all()}
     consumers = _scenario_consumers(db, scenario_set.project_id, scenario.id)
+    units = {name: spec.unit for name, spec in _scenario_variable_specs(db, consumers).items()}
     return {
         "id": scenario.id,
         "set": {"id": scenario_set.id, "name": scenario_set.name},
@@ -931,6 +939,14 @@ def get_scenario(db: Session, scenario_id: str) -> dict[str, Any]:
         "consumers": {"projection_sets": [{"id": ps.id, "name": ps.name} for ps in consumers]},
         "created_at": iso(scenario.created_at),
     }
+
+
+def _scenario_variable_specs(db: Session, consumers: list[ProjectionSet]) -> dict[str, VariableSpec]:
+    """Variable definitions of the model version used by the scenario's first consumer (by name)."""
+    for projection_set in sorted(consumers, key=lambda ps: (ps.name, ps.version_label)):
+        if projection_set.model_version_id:
+            return variable_specs(db, projection_set.model_version_id)
+    return {}
 
 
 def _number(value: Any) -> Any:
@@ -960,7 +976,8 @@ def compare_scenarios(db: Session, baseline_id: str, compare_id: str) -> dict[st
     compare = db.get(ScenarioTable, compare_id)
     if baseline is None or compare is None:
         raise not_found("One or both scenarios were not found.")
-    variables = {row.name: to_variable_spec(row) for row in db.query(VariableRegistry).all()}
+    scenario_set = db.get(ScenarioSet, baseline.set_id)
+    variables = _scenario_variable_specs(db, _scenario_consumers(db, scenario_set.project_id, baseline.id))
     base_overrides = {item.get("target_variable"): item for item in baseline.overrides or []}
     comp_overrides = {item.get("target_variable"): item for item in compare.overrides or []}
     differences = []

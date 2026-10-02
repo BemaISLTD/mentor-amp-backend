@@ -18,6 +18,7 @@ from app.db.models.run import Run  # noqa: F401
 from app.db.models.run_package import RunAttempt, RunPackage  # noqa: F401
 from app.db.models.run_artifact import RunArtifact, RunManifest  # noqa: F401
 from app.db.models.project_member import ProjectMember  # noqa: F401
+from app.db.models.model_variable import ModelVariableDefinition  # noqa: F401
 from app.db.models.run_output import RunOutput  # noqa: F401
 from app.db.models.trace_log import TraceLog  # noqa: F401
 from app.db.models.user import (  # noqa: F401
