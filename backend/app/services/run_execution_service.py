@@ -1,19 +1,22 @@
-"""Executing runs: atomic claim → verify the frozen package and its data → calculate → promote.
+"""Executing runs: atomic claim → verify → calculate → idempotent terminal promotion.
 
 Execution reads the run's immutable package and the datasets it references by ID; it never
 re-reads the editable Projection Set, formula, variable or scenario tables.
 
 1. **Claim** — ``UPDATE runs SET status='running' ... WHERE id=:id AND status='pending'``. Only
    one worker can win; the winner creates attempt N (UNIQUE (run_id, attempt_number) backs it).
-2. **Verify** — package fingerprint, engine version, registered functions, and every dataset's
-   fingerprint and record count. Any mismatch fails the run *before* calculation.
-3. **Calculate** — the pure engine, policy by policy; result/trace rows carry the attempt number
-   and are written as Parquet artifacts every few policies.
-4. **Finish** — in one transaction: final status, accepted attempt (only for success /
-   partial_success), summary and the write-once final manifest.
+2. **Verify** (``run_package_verification`` + ``dataset_loader``) — package envelope and run
+   index, configuration fingerprint, build identity, every formula implementation fingerprint,
+   every dataset fingerprint. Any mismatch fails the run *before* calculation.
+3. **Calculate** — the pure engine with the verified callables, policy by policy. Result and
+   trace rows carry the attempt number and the FROZEN scenario ID, and are written as Parquet
+   artifacts every few policies.
+4. **Promote** (``run_finalization``) — the outcome is recorded on the attempt, then applied in
+   one idempotent transaction (status, accepted attempt, summary, final manifest); an uncertain
+   commit is verified from a fresh session and finished if needed.
 
-Artifacts from failed attempts are retained as noncanonical evidence. Results APIs read only
-``runs.accepted_attempt_number``, which a failed attempt never sets.
+Artifacts from failed attempts are retained as noncanonical evidence. Results require the
+accepted attempt and consistent terminal evidence, which a failed attempt never has.
 """
 
 import json
@@ -29,19 +32,20 @@ from sqlalchemy.orm import Session
 
 from app.core.execution import run_package, run_state
 from app.core.artifacts import get_artifact_store
-from app.core.formula_engine.formulas import FORMULA_FUNCTIONS
-from app.core.projection_engine.engine import ENGINE_VERSION, EngineError, run_policy
+from app.core.execution.run_package import RunPackageError
+from app.core.projection_engine.engine import EngineError, run_policy
 from app.db.database import SessionLocal
 from app.db.models.projection import RunSet
 from app.db.models.run import Run
 from app.db.models.run_artifact import RunArtifact
 from app.db.models.run_package import RunAttempt, RunPackage
 from app.products.registry import register_all_products
-from app.services import dataset_loader
-from app.services.build_info import build_identity
+from app.services import dataset_loader, run_finalization
+from app.services.build_info import build_identity, runtime_environment
 from app.services.common import iso, now_utc
 from app.services.run_events import add_event
-from app.services.run_manifest_service import write_final_manifest
+from app.services.run_finalization import FinalizationError, TerminalOutcome
+from app.services.run_package_verification import verify_for_execution
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +81,10 @@ def claim_run(db: Session, run_id: str, worker_id: str) -> RunAttempt | None:
         db.rollback()
         return None
     number = db.execute(select(RUNS.c.attempt_count).where(RUNS.c.id == run_id)).scalar_one()
+    try:
+        executed_build = build_identity()
+    except Exception:  # noqa: BLE001 - recorded as unknown; verification refuses the run below
+        executed_build = None
     attempt = RunAttempt(
         run_id=run_id,
         attempt_number=number,
@@ -84,7 +92,7 @@ def claim_run(db: Session, run_id: str, worker_id: str) -> RunAttempt | None:
         worker_id=worker_id,
         started_at=now,
         heartbeat_at=now,
-        executed_build=build_identity(),
+        executed_build=executed_build,
     )
     db.add(attempt)
     add_event(db, run_id, "claimed", f"Attempt {number} started on {worker_id}.",
@@ -148,32 +156,11 @@ class _PreflightFailure(Exception):
 
 
 def _load(db: Session, run: Run, package: RunPackage | None):
-    """Verify the package and its datasets; return (configuration, RunData) or raise."""
-    if package is None or not run.run_package_fingerprint:
-        raise _PreflightFailure(
-            "PACKAGE_MISSING", "The run has no frozen run package, so it cannot execute reproducibly.",
-        )
+    """Verify the package, build, implementations and datasets; return what execution needs."""
     try:
-        configuration = run_package.verify(package.package, run.run_package_fingerprint)
-    except run_package.RunPackageError as error:
+        configuration, functions, _build = verify_for_execution(run, package)
+    except RunPackageError as error:
         raise _PreflightFailure(error.code, error.message, error.details) from error
-    if package.fingerprint != run.run_package_fingerprint:
-        raise _PreflightFailure(
-            "PACKAGE_TAMPERED", "The run and its package record different fingerprints.",
-            {"run": run.run_package_fingerprint, "package": package.fingerprint},
-        )
-    frozen_engine = configuration["build"]["engine_version"]
-    if frozen_engine != ENGINE_VERSION:
-        raise _PreflightFailure(
-            "ENGINE_VERSION_MISMATCH",
-            f"The run was frozen for engine '{frozen_engine}' but this worker runs "
-            f"'{ENGINE_VERSION}'; results would not be reproducible.",
-        )
-    missing = [ref for ref in run_package.function_refs(configuration) if ref not in FORMULA_FUNCTIONS]
-    if missing:
-        raise _PreflightFailure(
-            "FUNCTION_NOT_REGISTERED", f"Formula functions not available on this worker: {missing}.",
-        )
     try:
         policies = dataset_loader.load_policies(db, configuration)
         tables = dataset_loader.load_tables(db, configuration)
@@ -184,7 +171,29 @@ def _load(db: Session, run: Run, package: RunPackage | None):
         raise _PreflightFailure(error.error_type, error.message) from error
     if not data.policies:
         raise _PreflightFailure("NO_POLICIES", "The run's inforce files contain no policies.")
-    return configuration, data
+    return configuration, functions, data
+
+
+def _finish(db: Session, outcome: TerminalOutcome) -> str | None:
+    """Promote the outcome; an unrecoverable finalization leaves the run for recovery."""
+    began = perf_counter()
+    try:
+        result = run_finalization.commit_terminal_outcome(db, outcome, SessionLocal)
+    except FinalizationError as error:
+        logger.error("Finalization of run %s failed (%s): %s", outcome.run_id, error.code, error.details)
+        return None
+    seconds = perf_counter() - began
+    try:  # informational log entry, outside the terminal evidence
+        add_event(db, outcome.run_id, "finalized",
+                  f"Terminal outcome committed in {seconds:.2f}s"
+                  + (" after verification from a fresh session." if result.recovered else "."),
+                  data={"finalization_seconds": round(seconds, 4), "recovered": result.recovered,
+                        "state": result.state})
+        db.commit()
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not record the finalization event for run %s", outcome.run_id, exc_info=True)
+        db.rollback()
+    return result.run_status
 
 
 def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str | None:
@@ -193,39 +202,38 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
     attempt = claim_run(db, run_id, worker_id or default_worker_id())
     if attempt is None:
         return None
+    attempt_id, attempt_number = attempt.id, attempt.attempt_number
     run = db.get(Run, run_id)
     package = db.query(RunPackage).filter(RunPackage.run_id == run_id).first()
     metrics: dict[str, float] = {}
     started = perf_counter()
     try:
-        configuration, data = _load(db, run, package)
+        configuration, functions, data = _load(db, run, package)
     except _PreflightFailure as failure:
-        return _finish_failed(
-            db, run, attempt, package, failure.error_type,
-            f"Run refused before calculation: {failure.message}", failure.details, rows_written=False,
-        )
+        return _fail(db, run_id, attempt_id, attempt_number, failure.error_type,
+                     f"Run refused before calculation: {failure.message}", failure.details,
+                     rows_written=False, metrics={"load_seconds": perf_counter() - started})
     except Exception as error:  # noqa: BLE001 - e.g. a lost connection while loading
         logger.exception("Loading run %s failed", run_id)
         db.rollback()
-        run, attempt = db.get(Run, run_id), db.get(RunAttempt, attempt.id)
-        return _finish_failed(
-            db, run, attempt, package, "LOAD_ERROR", f"Run could not be loaded: {error}", {},
-            rows_written=False,
-        )
+        return _fail(db, run_id, attempt_id, attempt_number, "LOAD_ERROR",
+                     f"Run could not be loaded: {error}", {}, rows_written=False)
     metrics["load_seconds"] = perf_counter() - started
 
     run.progress_total = len(data.policies)
     add_event(
         db, run.id, "load",
-        f"Verified run package {package.fingerprint[:12]}… and {len(configuration['datasets']['inforce'])} "
-        f"inforce file(s) + {len(data.tables)} table(s); loaded {len(data.policies)} policies.",
+        f"Verified run package {package.fingerprint[:12]}…, build and {len(functions)} formula "
+        f"implementation(s); {len(configuration['datasets']['inforce'])} inforce file(s) + "
+        f"{len(data.tables)} table(s); loaded {len(data.policies)} policies.",
         data={"policies": len(data.policies), "formulas": len(data.formulas),
               "run_package_fingerprint": package.fingerprint},
     )
     db.commit()
 
     product_code = configuration["model"]["product_code"]
-    scenario_id = run.scenario_id or ""
+    # Evidence is labelled with the FROZEN scenario identity (verified equal to the run index).
+    scenario_id = configuration["scenario"]["id"] or ""
     output_rows: list[dict[str, Any]] = []
     trace_rows: list[dict[str, Any]] = []
     totals: dict[str, float] = {}
@@ -294,11 +302,10 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
     try:
         for index, policy in enumerate(data.policies, start=1):
             began = perf_counter()
-            result = run_policy(data, policy, FORMULA_FUNCTIONS)
+            result = run_policy(data, policy, functions)
             timing["calc"] += perf_counter() - began
             if result.error is not None:
                 failed_policies += 1
-                run.error_count = (run.error_count or 0) + 1
                 message = (f"Policy {policy.policy_id} failed at month {result.error.month}: "
                            f"{result.error.message}")
                 errors.append(message)
@@ -309,7 +316,7 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                 for month, variable, value in result.outputs:
                     output_rows.append({
                         "run_id": run.id,
-                        "attempt_number": attempt.attempt_number,
+                        "attempt_number": attempt_number,
                         "policy_id": policy.policy_id,
                         "scenario_id": scenario_id,
                         "projection_month": month,
@@ -324,7 +331,6 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                           f"Policy {policy.policy_id} complete ({result.months_computed} months).",
                           data={"policy_id": policy.policy_id})
             for warning in result.warnings:
-                run.warning_count = (run.warning_count or 0) + 1
                 warnings.append(f"{policy.policy_id}: {warning}")
                 add_event(db, run.id, "policy", f"{policy.policy_id}: {warning}", level="warning",
                           data={"policy_id": policy.policy_id})
@@ -332,7 +338,7 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                 trace_rows.append({
                     **row,
                     "run_id": run.id,
-                    "attempt_number": attempt.attempt_number,
+                    "attempt_number": attempt_number,
                     "scenario_id": scenario_id,
                     "created_at": now_utc(),
                 })
@@ -342,12 +348,9 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
     except Exception as error:  # noqa: BLE001 - any failure fails the attempt, never the process
         logger.exception("Run %s failed during execution", run_id)
         db.rollback()
-        run = db.get(Run, run_id)
-        attempt = db.get(RunAttempt, attempt.id)
-        return _finish_failed(
-            db, run, attempt, package, "EXECUTION_ERROR",
-            f"Run failed during execution: {error}", {}, rows_written=True,
-        )
+        return _fail(db, run_id, attempt_id, attempt_number, "EXECUTION_ERROR",
+                     f"Run failed during execution: {error}", {}, rows_written=True,
+                     metrics=metrics, prior_errors=errors, warnings=warnings)
 
     status = run_state.outcome_status(len(data.policies), failed_policies)
     metrics.update({
@@ -357,76 +360,96 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
         "commit_seconds": timing["commit"],
         "total_seconds": perf_counter() - started,
     })
+    cleanup_status = "not_needed"
+    error_type = error_message = None
     if status == run_state.FAILED:
         # Every policy failed: nothing is canonical; remove whatever the attempt wrote.
-        _delete_attempt_rows(db, run, attempt)
-        attempt.error_type = "ALL_POLICIES_FAILED"
-        attempt.error_message = errors[0] if errors else None
-    now = now_utc()
-    run_state.transition_run(run, status)
-    run_state.transition_attempt(attempt, status)
-    run.completed_at = attempt.completed_at = now
-    if status in run_state.RESULT_STATUSES:
-        run.accepted_attempt_number = attempt.attempt_number
-        attempt.cleanup_status = "not_needed"
-    attempt.output_row_count = counts["outputs"]
-    attempt.trace_row_count = counts["traces"]
-    attempt.metrics = {key: round(value, 4) for key, value in metrics.items()}
-    run.summary = _build_summary(run, configuration, data, totals, counts, failed_policies, attempt)
-    write_final_manifest(db, run, attempt, package, warnings, errors)
+        cleanup_status = _delete_attempt_rows(db, run_id, attempt_number)
+        error_type, error_message = "ALL_POLICIES_FAILED", (errors[0] if errors else None)
     succeeded = len(data.policies) - failed_policies
-    add_event(
-        db, run.id, "complete",
-        f"Run completed: {succeeded} of {len(data.policies)} policies ({status}).",
-        level="info" if failed_policies == 0 else "warning",
-        data={"status": status, "attempt_number": attempt.attempt_number, "metrics": attempt.metrics},
+    rounded = {key: round(value, 4) for key, value in metrics.items()}
+    outcome = TerminalOutcome(
+        run_id=run_id,
+        attempt_id=attempt_id,
+        attempt_number=attempt_number,
+        status=status,
+        completed_at=now_utc().isoformat(),
+        output_row_count=counts["outputs"],
+        trace_row_count=counts["traces"],
+        error_count=len(errors),
+        warning_count=len(warnings),
+        cleanup_status=cleanup_status,
+        error_type=error_type,
+        error_message=error_message,
+        summary=_build_summary(run, status, configuration, data, totals, counts, failed_policies,
+                               attempt_number, len(errors), len(warnings)),
+        metrics=rounded,
+        warnings=warnings,
+        errors=errors,
+        environment=runtime_environment(),
+        event_step="complete",
+        event_message=f"Run completed: {succeeded} of {len(data.policies)} policies ({status}).",
+        event_level="info" if failed_policies == 0 else "warning",
+        event_data={"status": status, "attempt_number": attempt_number, "metrics": rounded},
     )
-    db.commit()
-    return status
+    return _finish(db, outcome)
 
 
-def _delete_attempt_rows(db: Session, run: Run, attempt: RunAttempt) -> None:
-    """Keep failed-attempt artifacts for evidence; accepted-attempt filtering hides them."""
-    attempt.cleanup_status = "retained_noncanonical"
+def _delete_attempt_rows(db: Session, run_id: str, attempt_number: int) -> str:
+    """Keep failed-attempt Parquet artifacts as noncanonical evidence."""
+    return "retained_noncanonical"
 
 
-def _finish_failed(
+def _fail(
     db: Session,
-    run: Run,
-    attempt: RunAttempt,
-    package: RunPackage | None,
+    run_id: str,
+    attempt_id: str,
+    attempt_number: int,
     error_type: str,
     message: str,
     details: dict,
     *,
     rows_written: bool,
-) -> str:
-    if rows_written:
-        _delete_attempt_rows(db, run, attempt)
-    else:
-        attempt.cleanup_status = "not_needed"
-    now = now_utc()
-    run_state.transition_run(run, run_state.FAILED)
-    run_state.transition_attempt(attempt, run_state.FAILED)
-    run.completed_at = attempt.completed_at = now
-    run.error_count = (run.error_count or 0) + 1
-    attempt.error_type = error_type
-    attempt.error_message = message
-    add_event(db, run.id, "failed", message, level="error",
-              data={"error_type": error_type, "attempt_number": attempt.attempt_number, **details})
-    write_final_manifest(db, run, attempt, package, [], [message])
-    db.commit()
-    return run_state.FAILED
+    metrics: dict[str, float] | None = None,
+    prior_errors: list[str] | None = None,
+    warnings: list[str] | None = None,
+) -> str | None:
+    cleanup_status = _delete_attempt_rows(db, run_id, attempt_number) if rows_written else "not_needed"
+    errors = [*(prior_errors or []), message]
+    outcome = TerminalOutcome(
+        run_id=run_id,
+        attempt_id=attempt_id,
+        attempt_number=attempt_number,
+        status=run_state.FAILED,
+        completed_at=now_utc().isoformat(),
+        error_count=len(errors),
+        warning_count=len(warnings or []),
+        cleanup_status=cleanup_status,
+        error_type=error_type,
+        error_message=message,
+        metrics={key: round(value, 4) for key, value in (metrics or {}).items()} or None,
+        warnings=list(warnings or []),
+        errors=errors,
+        environment=runtime_environment(),
+        event_step="failed",
+        event_message=message,
+        event_level="error",
+        event_data={"error_type": error_type, "attempt_number": attempt_number, **details},
+    )
+    return _finish(db, outcome)
 
 
 def _build_summary(
     run: Run,
+    status: str,
     configuration: dict[str, Any],
     data,
     totals: dict[str, float],
     counts: dict[str, int],
     failed_policies: int,
-    attempt: RunAttempt,
+    attempt_number: int,
+    error_count: int,
+    warning_count: int,
 ) -> dict[str, Any]:
     published = configuration["outputs"].get("published") or {}
     illustrative = bool(configuration["model_version"]["illustrative"])
@@ -454,10 +477,10 @@ def _build_summary(
         }
     return {
         "run_id": run.id,
-        "status": run.status,
-        "complete": run.status == run_state.SUCCESS,
+        "status": status,
+        "complete": status == run_state.SUCCESS,
         "illustrative": illustrative,
-        "attempt_number": attempt.attempt_number,
+        "attempt_number": attempt_number,
         "run_package_fingerprint": run.run_package_fingerprint,
         "scenario": {"id": data.scenario.id, "name": data.scenario.name},
         "valuation_date": iso(data.valuation_date),
@@ -466,8 +489,8 @@ def _build_summary(
         "period_count": data.horizon_months,
         "output_variable_count": len(data.output_variables),
         "output_row_count": counts["outputs"],
-        "error_count": run.error_count,
-        "warning_count": run.warning_count,
+        "error_count": error_count,
+        "warning_count": warning_count,
         "headline": headline,
         "totals": summary_totals,
         "trace": {

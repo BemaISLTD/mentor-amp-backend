@@ -76,7 +76,9 @@ def ids(env):
     client = env["client"]
     settings.auth_mode = "disabled"
     try:
-        project = next(p for p in client.get("/v1/projects/").json()["projects"]
+        project_response = client.get("/v1/projects/")
+        assert project_response.status_code == 200, project_response.text
+        project = next(p for p in project_response.json()["projects"]
                        if p["name"].startswith("MentorAmp Demo"))
         projection_set = client.get(f"/v1/projects/{project['id']}/projection-sets").json()["projection_sets"][0]
         submitted = client.post("/v1/run-sets", json={
@@ -233,6 +235,19 @@ def test_aggregates_export_and_results(env, ids):
     assert results["total"] == 25 and results["rows"][0]["projection_year"] == 1
 
 
+def test_browser_can_read_the_export_completeness_header(env, ids):
+    origin = settings.cors_origin_list[0]
+    export = env["client"].get(f"/v1/runs/{ids['base']}/export.csv", headers={"Origin": origin})
+    assert export.status_code == 200 and export.headers["x-mentoramp-complete"] == "true"
+    exposed = {name.strip().lower() for name in export.headers["access-control-expose-headers"].split(",")}
+    assert "x-mentoramp-complete" in exposed
+
+
+def test_variable_catalog_lists_context_variables(env):
+    kinds = {variable["name"]: variable["kind"] for variable in get(env["client"], "/variables/")}
+    assert kinds["projection_month"] == "context" and kinds["attained_age"] == "context"
+
+
 def test_trace_follows_the_formula_to_the_table_row(env, ids):
     client = env["client"]
     policies = get(client, f"/runs/{ids['base']}/trace/policies")
@@ -302,9 +317,10 @@ def test_manifest_events_dashboard_and_run_lists(env, ids):
     assert {d["name"] for d in final["configuration"]["datasets"]["inforce"]} == {"synthetic_spia_inforce.csv"}
 
     events = get(client, f"/runs/{ids['base']}/events")["events"]
-    assert events[0]["step"] == "queued" and events[-1]["step"] == "complete"
-    later = get(client, f"/runs/{ids['base']}/events", after_id=events[-2]["id"])
-    assert [e["step"] for e in later["events"]] == ["complete"]
+    # "complete" is written with the terminal outcome; "finalized" is an informational entry after it.
+    assert events[0]["step"] == "queued" and [e["step"] for e in events[-2:]] == ["complete", "finalized"]
+    later = get(client, f"/runs/{ids['base']}/events", after_id=events[-3]["id"])
+    assert [e["step"] for e in later["events"]] == ["complete", "finalized"]
 
     run_sets = get(client, f"/projects/{ids['project']}/run-sets")
     assert run_sets["stats"]["ready_projection_set_count"] == 1

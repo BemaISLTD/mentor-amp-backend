@@ -17,8 +17,9 @@ JSON_VALUE = JSON().with_variant(JSONB(), "postgresql")
 class RunManifest(Base):
     __tablename__ = "run_manifests"
 
+    # RESTRICT (Noah's table used CASCADE): the final manifest is audit evidence.
     run_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True
+        String(36), ForeignKey("runs.id", ondelete="RESTRICT"), primary_key=True
     )
     # final_manifest_fingerprint: covers configuration identity AND the execution outcome.
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
@@ -30,9 +31,9 @@ class RunManifest(Base):
     )
     # --- Work Package 1 ---
     schema_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    # CASCADE (not SET NULL): a SET NULL would be an UPDATE, which the immutability trigger refuses.
+    # RESTRICT: neither the package nor the manifest can be removed by deleting the other.
     run_package_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("run_packages.id", ondelete="CASCADE"), nullable=True
+        String(36), ForeignKey("run_packages.id", ondelete="RESTRICT"), nullable=True
     )
     run_package_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     attempt_number: Mapped[int | None] = mapped_column(Integer, nullable=True)

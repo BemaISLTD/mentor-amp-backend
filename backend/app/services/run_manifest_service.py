@@ -18,10 +18,12 @@ from app.core.execution.fingerprints import fingerprint
 from app.db.models.run import Run
 from app.db.models.run_artifact import RunManifest
 from app.db.models.run_package import RunAttempt, RunPackage
-from app.services.build_info import build_identity, runtime_environment
+from app.services.build_info import runtime_environment
 from app.services.common import iso, user_ref
 
-MANIFEST_SCHEMA_VERSION = "mentoramp.run_manifest/v1"
+# v2 (correction pass): formula implementation identities, inforce fingerprint scheme, and the
+# executed build taken from the attempt (the worker that ran it), not from the finalizing process.
+MANIFEST_SCHEMA_VERSION = "mentoramp.run_manifest/v2"
 MAX_MESSAGES = 50
 
 
@@ -47,7 +49,8 @@ def _configuration_identity(package: RunPackage | None) -> dict[str, Any]:
         "parameters": config["parameters"],
         "formulas": [
             {"id": f["id"], "output_variable": f["output_variable"], "version": f["version"],
-             "function_ref": f["function_ref"], "content_fingerprint": f["content_fingerprint"]}
+             "function_ref": f["function_ref"], "content_fingerprint": f["content_fingerprint"],
+             "implementation_fingerprint": (f.get("implementation") or {}).get("implementation_fingerprint")}
             for f in config["formulas"]
         ],
         "variables": [
@@ -57,7 +60,7 @@ def _configuration_identity(package: RunPackage | None) -> dict[str, Any]:
         "datasets": {
             section: [
                 {"id": d["id"], "name": d["name"], "version_label": d.get("version_label"),
-                 "fingerprint": d["fingerprint"]}
+                 "fingerprint": d["fingerprint"], "fingerprint_scheme": d.get("fingerprint_scheme")}
                 for d in datasets.get(section) or []
             ]
             for section in ("inforce", "assumption_tables", "factor_tables")
@@ -79,6 +82,7 @@ def build_final_manifest(
     package: RunPackage | None,
     warnings: list[str],
     errors: list[str],
+    environment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
@@ -110,8 +114,8 @@ def build_final_manifest(
                 if attempt is not None else None
             ),
             "accepted_attempt_number": run.accepted_attempt_number,
-            "executed_build": build_identity(),
-            "environment": runtime_environment(),
+            "executed_build": attempt.executed_build if attempt is not None else None,
+            "environment": environment or runtime_environment(),
             "warning_count": run.warning_count or 0,
             "error_count": run.error_count or 0,
             "warnings": warnings[:MAX_MESSAGES],
@@ -129,9 +133,10 @@ def write_final_manifest(
     package: RunPackage | None,
     warnings: list[str],
     errors: list[str],
+    environment: dict[str, Any] | None = None,
 ) -> RunManifest:
     """Create the run's only final manifest (caller commits in the same transaction as the status)."""
-    document = build_final_manifest(db, run, attempt, package, warnings, errors)
+    document = build_final_manifest(db, run, attempt, package, warnings, errors, environment)
     final_fingerprint = fingerprint(document)
     record = RunManifest(
         run_id=run.id,

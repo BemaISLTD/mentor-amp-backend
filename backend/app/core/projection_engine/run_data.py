@@ -42,6 +42,8 @@ class VariableSpec:
     required: bool = True
     display_name: str | None = None
     version: str = "v1"
+    # Scenario governance (validation only; the engine applies overrides it is given).
+    allow_scenario_override: bool = False
 
     @property
     def source_type(self) -> str:

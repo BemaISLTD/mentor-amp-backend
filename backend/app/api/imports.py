@@ -13,9 +13,13 @@ from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user, require_permissions
 from app.core.project_lifecycle import require_active_project
-from app.data.importers.base import detect_format, import_file, parse_file, preview_file
 from app.core import lifecycle
-from app.core.execution.fingerprints import inforce_fingerprint
+from app.core.execution.fingerprints import (
+    INFORCE_FINGERPRINT_SCHEME,
+    DuplicatePolicyIds,
+    inforce_fingerprint,
+)
+from app.data.importers.base import detect_format, import_file, parse_file, preview_file
 from app.data.validation.inforce_validator import validate_inforce
 from app.data.validation.assumption_validator import validate_assumptions
 from app.data.validation.factor_validator import validate_factors
@@ -94,8 +98,12 @@ def upload_inforce(
         return validation_errors
     def store_inforce(session: Session, rows: list[dict]) -> int:
         # Stored only when validation found no blocking error (import_file); warnings leave the
-        # file in needs_review. The fingerprint uses the same order the run loader reads.
-        ordered = sorted(enumerate(rows), key=lambda item: (str(item[1].get("policy_id", f"row_{item[0]}")), item[0]))
+        # file in needs_review. Fingerprint scheme inforce-v2: {policy_id, data}, unique IDs.
+        records = [(str(row.get("policy_id", f"row_{i}")), row) for i, row in enumerate(rows)]
+        try:
+            file_fingerprint = inforce_fingerprint(records)
+        except DuplicatePolicyIds as error:
+            raise HTTPException(status_code=422, detail=f"Duplicate policy IDs: {error.policy_ids[:5]}") from error
         infile = InforceFile(
             project_id=project_id,
             filename=file.filename or "unknown",
@@ -103,7 +111,8 @@ def upload_inforce(
             row_count=len(rows),
             columns_detected=list(rows[0].keys()) if rows else [],
             status=lifecycle.NEEDS_REVIEW if validation_errors else lifecycle.VALIDATED,
-            fingerprint=inforce_fingerprint(row for _index, row in ordered),
+            fingerprint=file_fingerprint,
+            fingerprint_scheme=INFORCE_FINGERPRINT_SCHEME,
         )
         session.add(infile)
         session.flush()

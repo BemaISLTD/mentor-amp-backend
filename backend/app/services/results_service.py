@@ -36,6 +36,7 @@ from app.services.common import (
     now_utc,
     unwrap_value,
 )
+from app.services.run_finalization import evidence_consistent
 from app.services.run_query_service import get_run, run_configuration, run_view
 
 DEFAULT_VARIABLES = ["reserve", "expected_payment"]
@@ -53,6 +54,14 @@ def result_run(db: Session, run_id: str, include_partial: bool = False) -> Run:
             409, "RESULTS_NOT_AVAILABLE",
             f"Run '{run.id}' has no results (status: {run.status}).",
             {"reason": "RUN_HAS_NO_RESULTS", "status": run.status},
+        )
+    if not evidence_consistent(db, run):
+        # Promoted rows without matching terminal evidence (accepted attempt, final manifest,
+        # attempt status) are never shown; see run_finalization.
+        raise ServiceError(
+            409, "RESULTS_NOT_AVAILABLE",
+            f"Run '{run.id}' has inconsistent terminal evidence; its results are withheld.",
+            {"reason": "FINALIZATION_INCONSISTENT", "status": run.status},
         )
     if run.status == run_state.PARTIAL_SUCCESS and not include_partial:
         raise ServiceError(
@@ -125,7 +134,7 @@ def _requested_variables(config: dict[str, Any], variables: str | None) -> list[
 def summary(db: Session, run_id: str) -> dict[str, Any]:
     """Run facts for any status; headline and totals only when results may be read."""
     run = get_run(db, run_id)
-    available = run.accepted_attempt_number is not None and run.status in run_state.RESULT_STATUSES
+    available = evidence_consistent(db, run)
     if run.summary and available:
         return {**run.summary, "status": run.status, "complete": is_complete(run), "results_available": True}
     scenario = db.get(ScenarioTable, run.scenario_id) if run.scenario_id else None
@@ -496,19 +505,23 @@ def compare_runs(
 # Dashboard (§E.1)
 # =============================================================================
 
-def _successful_runs(db: Session, project_id: str):
-    return db.query(Run).filter(
-        Run.project_id == project_id,
-        Run.status == run_state.SUCCESS,
-        Run.accepted_attempt_number.isnot(None),
+def _successful_runs(db: Session, project_id: str) -> list[Run]:
+    """Complete runs whose terminal evidence is consistent, newest first."""
+    rows = (
+        db.query(Run)
+        .filter(Run.project_id == project_id, Run.status == run_state.SUCCESS,
+                Run.accepted_attempt_number.isnot(None))
+        .order_by(Run.completed_at.desc())
+        .all()
     )
+    return [run for run in rows if evidence_consistent(db, run)]
 
 
 def _latest_comparison(db: Session, project_id: str) -> dict[str, Any] | None:
     for run_set in (
         db.query(RunSet).filter(RunSet.project_id == project_id).order_by(RunSet.created_at.desc()).limit(10).all()
     ):
-        runs = _successful_runs(db, project_id).filter(Run.run_set_id == run_set.id).all()
+        runs = [run for run in _successful_runs(db, project_id) if run.run_set_id == run_set.id]
         by_projection: dict[str, list[Run]] = {}
         for run in runs:
             by_projection.setdefault(run.projection_set_id, []).append(run)
@@ -568,7 +581,7 @@ def dashboard(db: Session, project_id: str) -> dict[str, Any]:
     ).scalar() or 0
 
     inputs = catalog_service.list_inputs(db, project_id)["summary"]
-    latest_success = _successful_runs(db, project_id).order_by(Run.completed_at.desc()).first()
+    latest_success = next(iter(_successful_runs(db, project_id)), None)
     headline = None
     if latest_success and (latest_success.summary or {}).get("headline"):
         head = latest_success.summary["headline"]

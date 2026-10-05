@@ -23,6 +23,7 @@ sys.path.insert(0, str(BACKEND))
 
 from app.core import lifecycle  # noqa: E402
 from app.core.execution.fingerprints import (  # noqa: E402
+    INFORCE_FINGERPRINT_SCHEME,
     inforce_fingerprint,
     scenario_fingerprint,
     table_fingerprint,
@@ -35,6 +36,7 @@ from app.db.models.assumption import AssumptionSet, AssumptionTable  # noqa: E40
 from app.db.models.formula import FormulaRegistry  # noqa: E402
 from app.db.models.formula_dependency import FormulaDependency  # noqa: E402
 from app.db.models.inforce import InforceFile, InforceRecord  # noqa: E402
+from app.db.models.model_variable import ModelVariableDefinition  # noqa: E402
 from app.db.models.modeling import FormulaGroup, Model, ModelPublishedOutput, ModelVersion  # noqa: E402
 from app.db.models.project import Project  # noqa: E402
 from app.db.models.projection import ProjectionSet  # noqa: E402
@@ -44,7 +46,7 @@ from app.products.registry import register_all_products  # noqa: E402
 from app.products.spia_lite import config as spia  # noqa: E402
 from app.services import catalog_service, projection_set_service  # noqa: E402
 from app.services.bootstrap import ensure_demo_user, ensure_member  # noqa: E402
-from app.services.model_definition import to_variable_spec  # noqa: E402
+from app.services.model_definition import variable_specs  # noqa: E402
 from app.services.run_package_service import override_problems  # noqa: E402
 
 SAMPLES = BACKEND.parent / "samples" / "spia"
@@ -117,6 +119,7 @@ def upsert_model(db, project, user) -> tuple[Model, ModelVersion, FormulaGroup]:
 
 
 def upsert_variables(db) -> None:
+    """The global SEMANTIC catalog entries (identity only; never used to resolve values)."""
     for item in spia.VARIABLES:
         row = db.query(VariableRegistry).filter(VariableRegistry.name == item["name"]).first()
         if row is None:
@@ -136,6 +139,42 @@ def upsert_variables(db) -> None:
         row.product_applicability = [spia.PRODUCT_CODE]
         row.basis_applicability = []
         row.version = "v1"
+    db.flush()
+
+
+def upsert_definitions(db, version) -> None:
+    """This model version's own variable definitions (the only source of resolution).
+
+    Scenario overrides are allowed only where the model explicitly permits them (in the SPIA
+    illustrative model: the discount rate, which the Low Interest Rate scenario overrides).
+    """
+    for item in spia.VARIABLES:
+        row = (
+            db.query(ModelVariableDefinition)
+            .filter(ModelVariableDefinition.model_version_id == version.id,
+                    ModelVariableDefinition.variable_name == item["name"])
+            .first()
+        )
+        if row is None:
+            row = ModelVariableDefinition(model_version_id=version.id, variable_name=item["name"], version="v1")
+            db.add(row)
+        values = {
+            "display_name": item["display_name"],
+            "description": item["description"],
+            "kind": item["kind"],
+            "data_type": item["data_type"],
+            "unit": item.get("unit"),
+            "required": item.get("required", True),
+            "default_value": item.get("default_value"),
+            "source": dict(item["source"]),
+            "allow_scenario_override": bool(item.get("allow_scenario_override", False)),
+        }
+        changed = any(getattr(row, key) != value for key, value in values.items())
+        for key, value in values.items():
+            setattr(row, key, value)
+        if changed and row.created_at is not None:
+            number = int((row.version or "v1").lstrip("v") or 1)
+            row.version = f"v{number + 1}"
     db.flush()
 
 
@@ -195,7 +234,7 @@ def upsert_published_outputs(db, version) -> None:
 def validate_model(db, model, version) -> dict:
     formulas = db.query(FormulaRegistry).filter(FormulaRegistry.model_version_id == version.id).all()
     published = db.query(ModelPublishedOutput).filter(ModelPublishedOutput.model_version_id == version.id).all()
-    checks = catalog_service.model_version_checks(db, formulas, published)
+    checks = catalog_service.model_version_checks(db, formulas, published, version.id)
     status = lifecycle.VALIDATED if checks["status"] == "validated" else lifecycle.DRAFT
     version.status = status
     model.status = status
@@ -261,14 +300,15 @@ def upsert_inforce(db, project) -> InforceFile:
     errors = validate_inforce(rows)
     file.status = lifecycle.NEEDS_REVIEW if errors else lifecycle.VALIDATED
     file.version_label = "v2026.12"
-    # Same order the run loader uses: policy_id, then load order.
-    file.fingerprint = inforce_fingerprint(sorted(rows, key=lambda row: row["policy_id"]))
+    # Scheme inforce-v2: {policy_id, data} records ordered by (unique) policy_id.
+    file.fingerprint = inforce_fingerprint((row["policy_id"], row) for row in rows)
+    file.fingerprint_scheme = INFORCE_FINGERPRINT_SCHEME
     file.description = "25 synthetic SPIA policies (SYNTHETIC — not real policyholders)"
     db.flush()
     return file
 
 
-def upsert_scenarios(db, project) -> list[ScenarioTable]:
+def upsert_scenarios(db, project, version) -> list[ScenarioTable]:
     scenario_set = (
         db.query(ScenarioSet)
         .filter(ScenarioSet.project_id == project.id, ScenarioSet.name == SCENARIO_SET_NAME)
@@ -281,7 +321,7 @@ def upsert_scenarios(db, project) -> list[ScenarioTable]:
         )
         db.add(scenario_set)
         db.flush()
-    variables = {row.name: to_variable_spec(row) for row in db.query(VariableRegistry).all()}
+    variables = variable_specs(db, version.id)
     definitions = [
         ("Base", "Discount rate 4.5% (the variable default).", []),
         ("Low Interest Rate", "Discount rate set to 3.0%.",
@@ -350,12 +390,13 @@ def seed(db, project_name: str = PROJECT_NAME) -> dict:
     project = upsert_project(db, user, project_name)
     model, version, group = upsert_model(db, project, user)
     upsert_variables(db)
+    upsert_definitions(db, version)
     upsert_formulas(db, version, group)
     upsert_published_outputs(db, version)
     model_checks = validate_model(db, model, version)
     table = upsert_mortality(db, project)
     inforce = upsert_inforce(db, project)
-    scenarios = upsert_scenarios(db, project)
+    scenarios = upsert_scenarios(db, project, version)
     projection_set = upsert_projection_set(db, project, version, inforce, table, scenarios, user)
     db.commit()
     validated = projection_set_service.validate(db, projection_set.id)

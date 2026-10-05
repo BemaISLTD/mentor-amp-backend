@@ -10,7 +10,12 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.core.execution.fingerprints import inforce_fingerprint, table_fingerprint
+from app.core.execution.fingerprints import (
+    INFORCE_FINGERPRINT_SCHEME,
+    DuplicatePolicyIds,
+    inforce_fingerprint,
+    table_fingerprint,
+)
 from app.core.projection_engine.run_data import PolicyRecord, TableSpec
 from app.db.models.assumption import AssumptionTable
 from app.db.models.factor import FactorTable
@@ -40,16 +45,28 @@ def load_policies(db: Session, configuration: dict[str, Any]) -> list[PolicyReco
                 f"Inforce file '{entry['name']}' ({entry['id']}) no longer exists.",
                 {"dataset_id": entry["id"]},
             )
-        # Sorted in Python, not by the database: text collation differs between databases, and
-        # the fingerprint must not depend on it. Order = (policy_id, load order).
+        if entry.get("fingerprint_scheme") != INFORCE_FINGERPRINT_SCHEME:
+            raise DataIntegrityError(
+                "DATASET_FINGERPRINT_SCHEME_UNSUPPORTED",
+                f"Inforce file '{entry['name']}' was frozen with fingerprint scheme "
+                f"'{entry.get('fingerprint_scheme')}'; this build verifies {INFORCE_FINGERPRINT_SCHEME}.",
+                {"dataset_id": entry["id"]},
+            )
+        # Canonical order is (unique) policy_id, sorted in Python: neither storage order nor the
+        # database's text collation can change the fingerprint.
         records = sorted(
-            db.query(InforceRecord.id, InforceRecord.policy_id, InforceRecord.data)
-            .filter(InforceRecord.file_id == entry["id"])
-            .all(),
-            key=lambda row: (row.policy_id, row.id),
+            ((row.policy_id, dict(row.data or {})) for row in db.query(InforceRecord.policy_id, InforceRecord.data)
+             .filter(InforceRecord.file_id == entry["id"]).all()),
+            key=lambda item: item[0],
         )
-        records = [(row.policy_id, row.data) for row in records]
-        actual = inforce_fingerprint(dict(data or {}) for _policy_id, data in records)
+        try:
+            actual = inforce_fingerprint(records)
+        except DuplicatePolicyIds as error:
+            raise DataIntegrityError(
+                "DATASET_INVALID",
+                f"Inforce file '{entry['name']}' contains duplicate policy IDs {error.policy_ids[:5]}.",
+                {"dataset_id": entry["id"], "duplicate_policy_ids": error.policy_ids[:20]},
+            ) from error
         if len(records) != entry["record_count"] or actual != entry["fingerprint"]:
             raise DataIntegrityError(
                 "DATASET_FINGERPRINT_MISMATCH",

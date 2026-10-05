@@ -26,11 +26,14 @@ from app.api.users import router as users_router
 from app.api.variables import router as variables_router
 from app.config import settings
 from app.products.registry import register_all_products
+from app.services.build_info import build_identity
 from app.services.common import register_service_error_handler
 from app.version import APP_VERSION
 
 # Formula functions are code: register them once at startup (contract §F.4).
 register_all_products()
+# Fix this process's build identity at startup, from the code it actually loaded.
+build_identity()
 
 app = FastAPI(
     title=settings.app_name,
@@ -45,7 +48,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition", "X-MentorAmp-Run-Id", "X-MentorAmp-Illustrative"],
+    expose_headers=["Content-Disposition", "X-MentorAmp-Run-Id", "X-MentorAmp-Illustrative", "X-MentorAmp-Complete"],
 )
 
 register_exception_handlers(app)

@@ -1,14 +1,15 @@
 """Models, model versions, formula groups and formula detail (contract §E.2, §E.5)."""
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import authorize_path
 from app.db.database import get_db
 from app.db.models.user import User
-from app.services import catalog_service
+from app.services import catalog_service, variable_definition_service
 
 router = APIRouter(tags=["models"])
 ProjectReader = Annotated[User, Depends(authorize_path("project", "project_id", "projects:read"))]
@@ -16,7 +17,20 @@ ModelReader = Annotated[User, Depends(authorize_path("model", "model_id", "proje
 VersionReader = Annotated[
     User, Depends(authorize_path("model_version", "model_version_id", "projects:read"))
 ]
+VersionWriter = Annotated[
+    User, Depends(authorize_path("model_version", "model_version_id", "registries:write", write=True))
+]
 FormulaReader = Annotated[User, Depends(authorize_path("formula", "formula_id", "projects:read"))]
+
+
+class VariableDefinitionUpdate(BaseModel):
+    display_name: str | None = None
+    description: str | None = None
+    unit: str | None = None
+    required: bool | None = None
+    default_value: Any = None
+    source: dict[str, Any] | None = None
+    allow_scenario_override: bool | None = None
 
 
 @router.get("/projects/{project_id}/models")
@@ -63,3 +77,24 @@ def formula_groups(model_version_id: str, user: VersionReader, db: Session = Dep
 def formula_detail(formula_id: str, user: FormulaReader, db: Session = Depends(get_db)):
     del user
     return catalog_service.formula_detail(db, formula_id)
+
+
+@router.get("/model-versions/{model_version_id}/variables")
+def model_version_variables(model_version_id: str, user: VersionReader, db: Session = Depends(get_db)):
+    """The model version's own variable definitions (the only source of variable resolution)."""
+    del user
+    return variable_definition_service.list_definitions(db, model_version_id)
+
+
+@router.patch("/model-versions/{model_version_id}/variables/{variable_name}")
+def update_model_version_variable(
+    model_version_id: str,
+    variable_name: str,
+    payload: VariableDefinitionUpdate,
+    user: VersionWriter,
+    db: Session = Depends(get_db),
+):
+    del user
+    return variable_definition_service.update_definition(
+        db, model_version_id, variable_name, payload.model_dump(exclude_unset=True),
+    )

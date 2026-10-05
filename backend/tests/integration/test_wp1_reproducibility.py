@@ -23,6 +23,7 @@ from app.db.models.factor import FactorSet, FactorTable
 from app.db.models.formula import FormulaRegistry
 from app.db.models.formula_dependency import FormulaDependency
 from app.db.models.inforce import InforceRecord
+from app.db.models.model_variable import ModelVariableDefinition
 from app.db.models.modeling import ModelPublishedOutput
 from app.db.models.projection import ProjectionSet
 from app.db.models.run_artifact import RunManifest
@@ -31,7 +32,7 @@ from app.db.models.scenario import ScenarioTable
 from app.db.models.variable import VariableRegistry
 from app.products.spia_lite import config as spia
 from app.services import projection_set_service, run_execution_service, run_package_service
-from app.services.build_info import IMAGE_SOURCE_COMMIT
+from app.services import run_package_verification
 from app.services.common import ServiceError
 
 from .wp1_support import SHORT_HORIZON, Env
@@ -70,17 +71,15 @@ def assert_same_result(actual: dict, expected: dict) -> None:
     assert actual["output_row_count"] == expected["output_row_count"]
 
 
-def test_submitted_package_records_image_source_commit(env):
+def test_submitted_package_records_executable_build_identity(env):
     submitted = env.submit("A", ["Base"])
     run_id = submitted["by_scenario"]["Base"]
     with env.Session() as db:
         package = db.query(RunPackage).filter_by(run_id=run_id).one()
         build = package.package["configuration"]["build"]
         recorded = build["source_commit"]
-    assert re.fullmatch(r"[0-9a-f]{40}", recorded)
-    assert re.fullmatch(r".+\+sha256:[0-9a-f]{64}", build["code_version"])
-    if IMAGE_SOURCE_COMMIT.is_file():
-        assert recorded == IMAGE_SOURCE_COMMIT.read_text().strip()
+    assert recorded is None or re.fullmatch(r"[0-9a-f]{40}", recorded)
+    assert re.fullmatch(r"[0-9a-f]{64}", build["build_fingerprint"])
 
 
 def test_run_submission_rejects_missing_build_identity(env, monkeypatch):
@@ -92,6 +91,7 @@ def test_run_submission_rejects_missing_build_identity(env, monkeypatch):
             "engine_version": "m1-cpu-1",
             "code_version": "development",
             "source_commit": None,
+            "build_fingerprint": None,
         },
     )
     ids = env.projects["A"]
@@ -106,14 +106,15 @@ def test_run_submission_rejects_missing_build_identity(env, monkeypatch):
         assert db.query(RunPackage).count() == 0
 
 
-def test_run_submission_accepts_immutable_code_digest_without_git_commit(env, monkeypatch):
+def test_run_submission_accepts_immutable_build_fingerprint_without_git_commit(env, monkeypatch):
     monkeypatch.setattr(
         run_package_service,
         "build_identity",
         lambda: {
             "app_version": "0.1.0",
             "engine_version": "m1-cpu-1",
-            "code_version": "development+sha256:" + "a" * 64,
+            "code_version": "development",
+            "build_fingerprint": "a" * 64,
             "source_commit": None,
         },
     )
@@ -130,7 +131,7 @@ def test_run_submission_accepts_immutable_code_digest_without_git_commit(env, mo
         for package in packages:
             build = package.package["configuration"]["build"]
             assert build["source_commit"] is None
-            assert build["code_version"].endswith("a" * 64)
+            assert build["build_fingerprint"] == "a" * 64
 
 
 # =============================================================================
@@ -163,9 +164,11 @@ def test_variable_source_edit_after_submit_does_not_change_the_submitted_run(env
     baseline = execute_and_summarise(env, env.submit("A", ["Base"]))["Base"]
     submitted = env.submit("A", ["Base"])
     with env.Session() as db:
-        variable = db.query(VariableRegistry).filter_by(name="discount_rate_annual").one()
+        # The model version's own definition is the source of truth (not the global catalog).
+        variable = db.query(ModelVariableDefinition).filter_by(
+            model_version_id=env.projects["A"]["version"], variable_name="discount_rate_annual").one()
         variable.source = {"type": "manual", "value": 0.10}
-        variable.default_value = {"value": 0.10}
+        variable.default_value = 0.10
         db.commit()
 
     env.execute(submitted)
@@ -366,7 +369,8 @@ def test_tampered_run_package_fails_before_calculation(env, calculation_spy):
     with env.Session() as db:
         package = db.query(RunPackage).filter_by(run_id=run_id).one()
         document = dict(package.package)
-        document["configuration"] = {**document["configuration"], "horizon_months": 6}
+        # A field no run index mirrors, so only the configuration fingerprint can catch it.
+        document["configuration"] = {**document["configuration"], "parameters": {"tampered": True}}
         # Bypass the ORM guard, as a direct database edit would (PostgreSQL also has a trigger).
         db.execute(update(RunPackage.__table__).where(RunPackage.__table__.c.id == package.id)
                    .values(package=document))
@@ -377,9 +381,11 @@ def test_tampered_run_package_fails_before_calculation(env, calculation_spy):
 
 def test_package_frozen_for_another_engine_version_is_refused(env, calculation_spy, monkeypatch):
     submitted = env.submit("A", ["Base"])
-    monkeypatch.setattr(run_execution_service, "ENGINE_VERSION", "some-later-engine")
+    current = run_package_verification.current_build_identity()
+    monkeypatch.setattr(run_package_verification, "current_build_identity",
+                        lambda: {**current, "engine_version": "some-later-engine"})
     env.execute(submitted)
-    assert_refused_before_calculation(env, submitted["by_scenario"]["Base"], "ENGINE_VERSION_MISMATCH", calculation_spy)
+    assert_refused_before_calculation(env, submitted["by_scenario"]["Base"], "BUILD_IDENTITY_MISMATCH", calculation_spy)
 
 
 # =============================================================================
@@ -418,6 +424,19 @@ def add_factor_model(env: Env, key: str) -> list[str]:
         db.flush()
         db.add_all([FormulaDependency(formula_id=formula.id, depends_on_variable=name)
                     for name in ("expected_payment", "payment_scale")])
+        # The model version's own definitions (resolution never reads the global catalog).
+        db.add_all([
+            ModelVariableDefinition(
+                model_version_id=ids["version"], variable_name="payment_scale", kind="factor",
+                data_type="number", unit="factor", required=True,
+                source={"type": "factor", "table": "TEST_PAYMENT_SCALE", "value_column": "scale",
+                        "key_map": {"gender": "gender"}},
+            ),
+            ModelVariableDefinition(
+                model_version_id=ids["version"], variable_name="scaled_payment", kind="formula",
+                data_type="number", unit="USD", required=False, source={"type": "formula"},
+            ),
+        ])
         db.add(ModelPublishedOutput(
             model_version_id=ids["version"], variable_name="scaled_payment", display_name="Scaled payment",
             unit="USD", aggregation="sum", dimension="Policy × scenario × projection month",

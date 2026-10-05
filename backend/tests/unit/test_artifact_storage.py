@@ -11,7 +11,11 @@ from app.core.output import storage as output_storage
 from app.core.projection_engine import runner
 from app.core.variable_registry.resolver import _prior_period_lookup
 from app.db.database import Base
-from app.core.formula_engine.formulas import FORMULA_FUNCTIONS
+from app.core.formula_engine.formulas import (
+    FORMULA_REGISTRY,
+    RegisteredFormulaFunction,
+    implementation_fingerprint,
+)
 from app.db.models.run import Run
 from app.db.models.run_artifact import RunArtifact
 from app.models.schemas import FormulaDefinition, ProjectionContext, ProjectionRunDefinition
@@ -131,7 +135,21 @@ def test_projection_runner_writes_outputs_without_run_output_rows(
         lambda run_id: RunArtifactBuffer(run_id, store=store),
     )
     monkeypatch.setattr(artifacts, "get_artifact_store", lambda: store)
-    monkeypatch.setitem(FORMULA_FUNCTIONS, "test_constant_reserve", lambda: 42.0)
+    def constant_reserve():
+        return 42.0
+
+    monkeypatch.setitem(
+        FORMULA_REGISTRY,
+        "test_constant_reserve",
+        RegisteredFormulaFunction(
+            key="test_constant_reserve",
+            func=constant_reserve,
+            module=constant_reserve.__module__,
+            qualname=constant_reserve.__qualname__,
+            implementation_version=None,
+            implementation_fingerprint=implementation_fingerprint(constant_reserve),
+        ),
+    )
 
     result = runner.run_projection(
         ProjectionRunDefinition(

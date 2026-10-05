@@ -39,11 +39,13 @@ class RunPackage(Base):
     __tablename__ = "run_packages"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # RESTRICT: frozen evidence never disappears through a parent delete (retention is a
+    # separate, explicit workflow; the database also refuses DELETE without its override).
     run_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, unique=True
+        String(36), ForeignKey("runs.id", ondelete="RESTRICT"), nullable=False, unique=True
     )
     project_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+        String(36), ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
     fingerprint_algorithm: Mapped[str] = mapped_column(String(40), nullable=False)
@@ -76,7 +78,7 @@ class RunAttempt(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     run_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True
+        String(36), ForeignKey("runs.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -94,6 +96,9 @@ class RunAttempt(Base):
     cleanup_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
     executed_build: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     metrics: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # The terminal outcome the worker computed, recorded BEFORE the terminal transaction so that
+    # an uncertain final commit can be finished idempotently (app.services.run_finalization).
+    intended_outcome: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, nullable=False
     )

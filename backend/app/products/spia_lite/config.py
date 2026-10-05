@@ -28,6 +28,8 @@ MORTALITY_TABLE_MIN_AGE = 40
 MORTALITY_TABLE_TERMINAL_AGE = 120
 MORTALITY_TABLE_MAX_AGE = 150
 DEFAULT_DISCOUNT_RATE = 0.045
+# Label of the registered implementations below (their code fingerprint is computed separately).
+IMPLEMENTATION_VERSION = "spia-illustrative-m1"
 
 
 # =============================================================================
@@ -110,6 +112,7 @@ def register_functions() -> None:
             expression_text=expression,
             explanation=explanation,
             illustrative=True,
+            implementation_version=IMPLEMENTATION_VERSION,
         )
 
 
@@ -158,6 +161,8 @@ VARIABLES: list[dict] = [
         "data_type": "number", "unit": "rate", "required": True,
         "default_value": DEFAULT_DISCOUNT_RATE,
         "source": {"type": "manual", "value": DEFAULT_DISCOUNT_RATE},
+        # The only variable the demo scenarios override (Low Interest Rate); explicitly allowed.
+        "allow_scenario_override": True,
         "description": "Flat annual discount rate. Scenarios may override it.",
     },
     {

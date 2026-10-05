@@ -26,8 +26,8 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.core import lifecycle
 from app.core.execution import run_package
-from app.core.execution.fingerprints import scenario_fingerprint
-from app.core.formula_engine.formulas import FORMULA_FUNCTIONS
+from app.core.execution.fingerprints import INFORCE_FINGERPRINT_SCHEME, scenario_fingerprint
+from app.core.formula_engine.formulas import FORMULA_FUNCTIONS, FORMULA_REGISTRY
 from app.core.projection_engine.engine import OVERRIDE_OPERATIONS, EngineError, order_formulas
 from app.core.projection_engine.run_data import VariableSpec
 from app.db.models.assumption import AssumptionSet, AssumptionTable
@@ -38,21 +38,20 @@ from app.db.models.modeling import Model, ModelPublishedOutput, ModelVersion
 from app.db.models.project import Project
 from app.db.models.projection import ProjectionSet
 from app.db.models.scenario import ScenarioSet, ScenarioTable
-from app.db.models.variable import VariableRegistry
+from app.db.models.model_variable import ModelVariableDefinition
 from app.products.registry import register_all_products
-from app.services.build_info import build_identity
+from app.services.build_info import BuildIdentityUnavailable, build_identity
 from app.services.common import ServiceError, iso, now_utc
 from app.services.model_definition import (
     load_model_formulas,
     to_variable_spec,
     variable_closure_rows,
-    variable_default,
-    variable_source,
 )
 
 TABLE_KINDS = ("assumption", "factor")
 TRACE_MODES = ("none", "selected_policies", "all")
 CALCULATED_KINDS = ("formula", "valuation")
+MAX_PERIOD = 1200  # the longest horizon a Projection Set allows
 
 
 @dataclass(frozen=True)
@@ -96,7 +95,7 @@ class ModelResolution:
     version: ModelVersion | None = None
     model: Model | None = None
     formulas: list[FormulaRegistry] = field(default_factory=list)
-    variable_rows: dict[str, VariableRegistry] = field(default_factory=dict)
+    variable_rows: dict[str, ModelVariableDefinition] = field(default_factory=dict)
     variables: dict[str, VariableSpec] = field(default_factory=dict)
     published: dict[str, ModelPublishedOutput] = field(default_factory=dict)
     problems: list[Problem] = field(default_factory=list)
@@ -136,10 +135,13 @@ def check_model(db: Session, project_id: str, projection_set: ProjectionSet) -> 
                 "FORMULA_NOT_RUNNABLE",
                 f"Formula '{formula.name}' is '{formula.status}', not validated.",
             ))
-    rows, missing = variable_closure_rows(db, result.formulas, list(projection_set.output_variables or []))
+    rows, missing = variable_closure_rows(
+        db, version.id, result.formulas, list(projection_set.output_variables or []),
+    )
     for name in sorted(missing):
         result.problems.append(Problem(
-            "VARIABLE_NOT_REGISTERED", f"Variable '{name}' is used but not registered.",
+            "VARIABLE_NOT_DEFINED",
+            f"Variable '{name}' is used but not defined for model version {version.version_label}.",
         ))
     result.variable_rows = rows
     result.variables = {name: to_variable_spec(row) for name, row in rows.items()}
@@ -210,6 +212,13 @@ def check_inforce(db: Session, project_id: str, file_ids: list[str]) -> tuple[li
         files.append(file)
         label = f"Inforce file '{file.filename}'"
         problems += _input_problems(label, file.id, file.status, file.fingerprint)
+        if file.fingerprint and file.fingerprint_scheme != INFORCE_FINGERPRINT_SCHEME:
+            problems.append(Problem(
+                "INPUT_FINGERPRINT_OUTDATED",
+                f"{label} has a '{file.fingerprint_scheme}' fingerprint; re-validate it to "
+                f"{INFORCE_FINGERPRINT_SCHEME} before running.",
+                {"id": file.id},
+            ))
         if not file.row_count:
             problems.append(Problem("INPUT_EMPTY", f"{label} has no records.", {"id": file.id}))
     return files, problems
@@ -327,8 +336,29 @@ def check_scenario(
     return scenario, scenario_set, problems
 
 
+def _period(value: Any) -> int | None | bool:
+    """A valid month number, None when absent, or False when invalid."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_PERIOD:
+        return False
+    return value
+
+
 def override_problems(label: str, overrides: list, variables: dict[str, VariableSpec]) -> list[Problem]:
+    """Deterministic override contract (the engine applies an override for months
+    ``applies_from_period <= month <= applies_to_period``, both inclusive, either open):
+
+    - the target is a variable of this model version, numeric, not calculated (formula /
+      valuation), and its definition explicitly allows scenario overrides;
+    - the operation is one of set / add / subtract / multiply / percent_change, with a numeric
+      (non-boolean) value;
+    - periods are whole months in 0..1200 and ``from <= to``;
+    - two overrides of the same variable may not overlap in time (stacking is not defined, so
+      ambiguity is rejected rather than resolved by list order).
+    """
     problems: list[Problem] = []
+    ranges: dict[str, list[tuple[int, float, int]]] = {}
     for index, override in enumerate(overrides):
         if not isinstance(override, dict):
             problems.append(Problem("SCENARIO_OVERRIDE_INVALID", f"{label}: override {index} is not an object."))
@@ -344,16 +374,46 @@ def override_problems(label: str, overrides: list, variables: dict[str, Variable
             problems.append(Problem(
                 "SCENARIO_TARGET_CALCULATED", f"{label}: '{target}' is calculated and cannot be overridden.",
             ))
+        elif not spec.allow_scenario_override:
+            problems.append(Problem(
+                "SCENARIO_TARGET_NOT_OVERRIDABLE",
+                f"{label}: '{target}' does not allow scenario overrides in this model version.",
+            ))
+        if spec.data_type != "number":
+            problems.append(Problem(
+                "SCENARIO_TARGET_NOT_NUMERIC", f"{label}: '{target}' is not numeric; overrides are numeric.",
+            ))
         operation = override.get("operation", "set")
         if operation not in OVERRIDE_OPERATIONS:
             problems.append(Problem("SCENARIO_OPERATION_INVALID", f"{label}: unknown operation '{operation}'."))
         value = override.get("value")
-        if spec.data_type == "number" and (isinstance(value, bool) or not _is_number(value)):
-            problems.append(Problem("SCENARIO_VALUE_INVALID", f"{label}: '{target}' needs a numeric value."))
-        for key in ("applies_from_period", "applies_to_period"):
-            period = override.get(key)
-            if period is not None and (isinstance(period, bool) or not isinstance(period, int) or period < 0):
-                problems.append(Problem("SCENARIO_PERIOD_INVALID", f"{label}: {key} must be a month number."))
+        if isinstance(value, bool) or not _is_number(value):
+            problems.append(Problem(
+                "SCENARIO_VALUE_INVALID", f"{label}: '{target}' {operation} needs a numeric value.",
+            ))
+        start, end = _period(override.get("applies_from_period")), _period(override.get("applies_to_period"))
+        for key, parsed in (("applies_from_period", start), ("applies_to_period", end)):
+            if parsed is False:
+                problems.append(Problem(
+                    "SCENARIO_PERIOD_INVALID", f"{label}: {key} must be a whole month from 0 to {MAX_PERIOD}.",
+                ))
+        if start is False or end is False:
+            continue
+        if start is not None and end is not None and start > end:
+            problems.append(Problem(
+                "SCENARIO_PERIOD_RANGE_INVALID",
+                f"{label}: override of '{target}' starts at month {start} after it ends at month {end}.",
+            ))
+            continue
+        low, high = start if start is not None else 0, end if end is not None else float("inf")
+        for other_low, other_high, other_index in ranges.get(target, []):
+            if low <= other_high and other_low <= high:
+                problems.append(Problem(
+                    "SCENARIO_OVERRIDE_OVERLAP",
+                    f"{label}: overrides {other_index} and {index} of '{target}' overlap in time; "
+                    "overlapping overrides are ambiguous and not allowed.",
+                ))
+        ranges.setdefault(target, []).append((low, high, index))
     return problems
 
 
@@ -369,6 +429,11 @@ def _is_number(value: Any) -> bool:
 # Freezing
 # =============================================================================
 
+def _implementation(function_ref: str) -> dict[str, Any] | None:
+    registration = FORMULA_REGISTRY.get(function_ref)
+    return registration.identity() if registration else None
+
+
 def _formula_entry(row: FormulaRegistry) -> dict[str, Any]:
     entry = {
         "id": row.id,
@@ -380,23 +445,27 @@ def _formula_entry(row: FormulaRegistry) -> dict[str, Any]:
         "expression_text": row.expression_text,
         "unit": row.unit,
         "illustrative": bool(row.illustrative),
+        # The exact executable code frozen with the formula (verified again before execution).
+        "implementation": _implementation(row.function_ref),
     }
     entry["content_fingerprint"] = run_package.content_fingerprint(entry)
     return entry
 
 
-def _variable_entry(row: VariableRegistry) -> dict[str, Any]:
+def _variable_entry(row: ModelVariableDefinition) -> dict[str, Any]:
     entry = {
         "id": row.id,
-        "name": row.name,
+        "definition_id": row.id,
+        "name": row.variable_name,
         "display_name": row.display_name,
         "version": row.version or "v1",
-        "kind": row.source_type,
+        "kind": row.kind,
         "data_type": row.data_type,
         "unit": row.unit,
         "required": bool(row.required),
-        "default_value": variable_default(row),
-        "source": variable_source(row),
+        "default_value": row.default_value,
+        "source": dict(row.source or {}),
+        "allow_scenario_override": bool(row.allow_scenario_override),
     }
     entry["content_fingerprint"] = run_package.content_fingerprint(entry)
     return entry
@@ -443,6 +512,10 @@ def collect(
     problems += binding_problems
     scenario, scenario_set, scenario_problems = check_scenario(db, project.id, scenario_id, model.variables)
     problems += scenario_problems
+    try:
+        build = build_identity()
+    except BuildIdentityUnavailable as error:
+        problems.append(Problem("BUILD_IDENTITY_UNAVAILABLE", str(error)))
     if problems:
         return None, None, problems
 
@@ -480,6 +553,7 @@ def collect(
                     "version_label": file.version_label,
                     "record_count": file.row_count,
                     "fingerprint": file.fingerprint,
+                    "fingerprint_scheme": file.fingerprint_scheme,
                 }
                 for file in sorted(files, key=lambda item: item.id)
             ],
@@ -520,7 +594,7 @@ def collect(
                 for name in projection_set.output_variables or []
             },
         },
-        "build": build_identity(),
+        "build": build,
     }
     governance = {
         "projection_set": {
@@ -554,17 +628,16 @@ def freeze(
     if problems:
         raise PackageInvalid(problems, projection_set_id=projection_set.id, scenario_id=scenario_id)
     build = configuration["build"]
-    code_version = build.get("code_version") or ""
-    digest = code_version.rpartition("+sha256:")[2] if "+sha256:" in code_version else ""
+    executable_fingerprint = build.get("build_fingerprint") or ""
     source_commit = build.get("source_commit") or ""
-    immutable_code_id = bool(re.fullmatch(r"[0-9a-fA-F]{64}", digest))
+    immutable_code_id = bool(re.fullmatch(r"[0-9a-fA-F]{64}", executable_fingerprint))
     valid_commit = bool(re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", source_commit))
     if source_commit and not valid_commit:
         raise ServiceError(503, "BUILD_IDENTITY_INVALID", "SOURCE_COMMIT must be a Git commit SHA.")
-    if not valid_commit and not immutable_code_id:
+    if not immutable_code_id:
         raise ServiceError(
             503, "BUILD_IDENTITY_MISSING",
-            "Run submission requires a source commit or immutable build identifier.",
+            "Run submission requires an immutable build fingerprint.",
         )
     now = now_utc()
     identity = {

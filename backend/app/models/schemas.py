@@ -66,7 +66,10 @@ class VariableDefinition(BaseModel):
     id: str
     name: str
     label: Optional[str] = None
-    kind: Literal["input", "assumption", "factor", "formula", "output", "lookup", "manual", "prior_output", "scenario"] = "input"
+    kind: Literal[
+        "input", "assumption", "factor", "formula", "output", "lookup", "manual", "prior_output", "scenario",
+        "context", "valuation",
+    ] = "input"
     data_type: Literal["number", "string", "boolean", "date", "vector", "table"] = "number"
     source: Optional[dict] = None
     dependencies: list[str] = Field(default_factory=list)
