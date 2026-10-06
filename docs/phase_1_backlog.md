@@ -86,30 +86,39 @@ it is considered complete.
 - **[BUILD] Audit Logs — COMPLETE**
   - Track actor, action, entity, before/after values, and timestamp for metadata
     mutations.
-- **[IMPROVE] Actor Audit Fields — IN PROGRESS**
-  - Projects, products, asset positions, variables, and formulas now record mutation
-    actors. Variable and formula create/update/delete operations write before/after
-    audit records in the same database transaction as the mutation.
-  - Extend this contract to other actuarial metadata as their mutation APIs are
-    implemented. Formula `created_by` predates the actor migration; existing rows
-    remain nullable/unchanged.
-- **[IMPROVE] Soft Deletes — IN PROGRESS**
+- **[IMPROVE] Actor Audit Fields — COMPLETE**
+  - Projects, products, asset positions, variables, formulas, model versions,
+    model-variable definitions, Projection Sets, rollforward metadata, reports,
+    and derived datasets record mutation actors and transactional before/after
+    audit history through their mutation APIs.
+  - Formula `created_by` predates the actor migration; existing rows remain
+    nullable/unchanged.
+- **[IMPROVE] Soft Deletes — COMPLETE FOR GOVERNED DELETE APIS**
   - Project archival and its retention contract are complete. Archived projects
     reject project, import, catalog, asset, mapping, and run mutations while
     retaining historical data.
-  - Extend soft deletion to remaining auditable actuarial metadata and avoid
-    accidental hard deletion of governed records.
+  - Variable, formula, model-version, rollforward-template, report, and
+    derived-dataset delete APIs retain governed rows with deletion actor and
+    timestamp. Normal reads and authorization resolvers exclude archived rows.
 - **[BUILD] Products and Assets — COMPLETE**
   - Build `products`, `asset_positions`, and `product_mappings`.
-- **[BUILD] Actuarial Workflows — OPEN**
-  - Build `rollforward_templates`, `rollforward_jobs`, and `rollforward_steps`.
-- **[BUILD] Reporting Metadata — OPEN**
-  - Build metadata persistence for reports and derived datasets; large report
-    bodies belong in analytical storage.
-- **[BUILD] Execution Metadata — OPEN**
-  - Add `run_steps`; decide whether projection keys require a normalized model.
-- **[BUILD] Model Versioning — OPEN**
-  - Add model-level version tracking beyond individual formula versions.
+- **[BUILD] Actuarial Workflows — COMPLETE**
+  - Versioned, publishable rollforward templates persist ordered steps; jobs copy
+    the published definition and expose governed lifecycle transitions.
+- **[BUILD] Reporting Metadata — COMPLETE**
+  - Versioned report definitions and derived-dataset lineage/schema/artifact
+    metadata are persisted. Large bodies remain in analytical storage by URI.
+- **[BUILD] Execution Metadata — COMPLETE**
+  - Runs persist verification, calculation, and finalization steps with status,
+    progress, metrics, and failure details; the run-step API exposes them.
+  - Projection output keys remain in Parquet because normalized projection-value
+    rows would violate the established analytical-storage boundary.
+- **[BUILD] Model Versioning — COMPLETE**
+  - Whole-model versions track parent, sequence, configuration, change summary,
+    actor, publication, and archival metadata; child formula groups, formulas,
+    dependencies, variable definitions, and published outputs clone from a parent.
+  - Published model versions are immutable and use the existing runnable
+    `approved` lifecycle state.
 
 ## 4. Actuarial Execution and Large Data
 

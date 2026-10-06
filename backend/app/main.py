@@ -10,6 +10,7 @@ from app.api.dependencies import get_current_user, require_permissions, require_
 from app.api.errors import register_exception_handlers
 from app.api.execution import router as execution_router
 from app.api.formulas import router as formulas_router
+from app.api.governance import router as governance_router
 from app.api.imports import router as imports_router
 from app.api.inputs import router as inputs_router
 from app.api.modeling import router as modeling_router
@@ -112,6 +113,7 @@ app.include_router(scenarios_router, prefix=API_PREFIX)
 app.include_router(projection_sets_router, prefix=API_PREFIX)
 app.include_router(execution_router, prefix=API_PREFIX)
 app.include_router(analysis_router, prefix=API_PREFIX)
+app.include_router(governance_router, prefix=API_PREFIX)
 
 
 @app.get("/health", tags=["health"])

@@ -21,6 +21,14 @@ from app.db.models.product import AssetPosition, Product, ProductMapping  # noqa
 from app.db.models.run_package import RunAttempt, RunPackage  # noqa: F401
 from app.db.models.project_member import ProjectMember  # noqa: F401
 from app.db.models.model_variable import ModelVariableDefinition  # noqa: F401
+from app.db.models.governance import (  # noqa: F401
+    DerivedDataset,
+    Report,
+    RollforwardJob,
+    RollforwardStep,
+    RollforwardTemplate,
+    RunStep,
+)
 from app.db.models.user import (  # noqa: F401
     Permission,
     Role,

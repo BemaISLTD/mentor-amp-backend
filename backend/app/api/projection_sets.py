@@ -100,14 +100,14 @@ def get_projection_set(projection_set_id: str, user: SetReader, db: Session = De
 def update_projection_set(
     projection_set_id: str, payload: ProjectionSetUpdate, user: SetWriter, db: Session = Depends(get_db)
 ):
-    del user
-    return projection_set_service.update(db, projection_set_id, payload.model_dump(exclude_unset=True))
+    return projection_set_service.update(
+        db, projection_set_id, payload.model_dump(exclude_unset=True), user
+    )
 
 
 @router.post("/projection-sets/{projection_set_id}/validate")
 def validate_projection_set(projection_set_id: str, user: SetWriter, db: Session = Depends(get_db)):
-    del user
-    return projection_set_service.validate(db, projection_set_id)
+    return projection_set_service.validate(db, projection_set_id, user)
 
 
 @router.post("/projection-sets/{projection_set_id}/duplicate", status_code=status.HTTP_201_CREATED)
@@ -126,5 +126,4 @@ def duplicate_projection_set(
 def attach_scenario(
     projection_set_id: str, payload: AttachScenario, user: SetWriter, db: Session = Depends(get_db)
 ):
-    del user
-    return projection_set_service.attach_scenario(db, projection_set_id, payload.scenario_id)
+    return projection_set_service.attach_scenario(db, projection_set_id, payload.scenario_id, user)

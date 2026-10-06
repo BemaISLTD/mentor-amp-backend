@@ -27,8 +27,12 @@ def build_manifest(db: Session, run_def: ProjectionRunDefinition) -> dict[str, A
         if run_def.dataset_ids
         else []
     )
-    formulas = db.query(FormulaRegistry).order_by(FormulaRegistry.id).all()
-    variables = db.query(VariableRegistry).order_by(VariableRegistry.id).all()
+    formulas = db.query(FormulaRegistry).filter(
+        FormulaRegistry.deleted_at.is_(None)
+    ).order_by(FormulaRegistry.id).all()
+    variables = db.query(VariableRegistry).filter(
+        VariableRegistry.deleted_at.is_(None)
+    ).order_by(VariableRegistry.id).all()
     return {
         "schema_version": "v1",
         "code_version": settings.code_version,

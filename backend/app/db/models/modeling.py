@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.database import Base
@@ -34,6 +34,16 @@ class Model(Base):
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     status: Mapped[str] = mapped_column(String(30), default="draft", nullable=False)
+    created_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    updated_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    deleted_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
@@ -53,6 +63,10 @@ class ModelVersion(Base):
         String(36), ForeignKey("models.id", ondelete="CASCADE"), nullable=False, index=True
     )
     version_label: Mapped[str] = mapped_column(String(30), nullable=False)
+    version_number: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    parent_version_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("model_versions.id", ondelete="RESTRICT"), nullable=True
+    )
     block_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     profile_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     basis: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -61,6 +75,22 @@ class ModelVersion(Base):
     is_current: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     illustrative: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    change_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    configuration: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    updated_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    published_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now

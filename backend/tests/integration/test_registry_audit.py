@@ -87,5 +87,10 @@ def test_variable_and_formula_mutations_have_actor_and_audit_history(registry_cl
     assert events[4].before_state["status"] == "draft"
     assert events[4].after_state["status"] == "active"
     assert events[5].before_state["function_ref"] == "spia.reserve"
-    assert events[5].after_state is None
+    assert events[5].after_state["deleted_by"] == actor_id
+    assert events[5].after_state["deleted_at"] is not None
+    assert events[5].context == {"deletion": "soft"}
     assert events[6].before_state["name"] == "premium"
+    assert events[6].after_state["deleted_by"] == actor_id
+    assert client.get("/v1/formulas/formula-reserve").status_code == 404
+    assert client.get("/v1/variables/premium").status_code == 404

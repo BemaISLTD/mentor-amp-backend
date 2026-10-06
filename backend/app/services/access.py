@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.db.models.assumption import AssumptionSet, AssumptionTable
 from app.db.models.factor import FactorSet, FactorTable
 from app.db.models.formula import FormulaRegistry
+from app.db.models.governance import DerivedDataset, Report, RollforwardJob, RollforwardTemplate
 from app.db.models.inforce import InforceFile
 from app.db.models.modeling import Model, ModelVersion
 from app.db.models.project import Project
@@ -79,7 +80,7 @@ def require_project_access(db: Session, user: Any, project_id: str, write: bool 
 # -- object -> owning project ----------------------------------------------------------------
 
 def _model_project(db: Session, object_id: str) -> str | None:
-    model = db.get(Model, object_id)
+    model = db.query(Model).filter(Model.id == object_id, Model.deleted_at.is_(None)).first()
     return model.project_id if model else None
 
 
@@ -87,14 +88,20 @@ def _model_version_project(db: Session, object_id: str) -> str | None:
     row = (
         db.query(Model.project_id)
         .join(ModelVersion, ModelVersion.model_id == Model.id)
-        .filter(ModelVersion.id == object_id)
+        .filter(
+            ModelVersion.id == object_id,
+            ModelVersion.deleted_at.is_(None),
+            Model.deleted_at.is_(None),
+        )
         .first()
     )
     return row[0] if row else None
 
 
 def _formula_project(db: Session, object_id: str) -> str | None:
-    formula = db.get(FormulaRegistry, object_id)
+    formula = db.query(FormulaRegistry).filter(
+        FormulaRegistry.id == object_id, FormulaRegistry.deleted_at.is_(None)
+    ).first()
     if formula is None:
         return None
     if formula.model_version_id is None:
@@ -162,6 +169,15 @@ def _asset_position_project(db: Session, object_id: str) -> str | None:
     return row.project_id if row and row.deleted_at is None else None
 
 
+def _governed_project(model: type, *, soft_delete: bool = False):
+    def resolve(db: Session, object_id: str) -> str | None:
+        row = db.get(model, object_id)
+        if row is None or (soft_delete and row.deleted_at is not None):
+            return None
+        return row.project_id
+    return resolve
+
+
 def _project_itself(db: Session, object_id: str) -> str | None:
     return object_id if db.get(Project, object_id) is not None else None
 
@@ -180,6 +196,10 @@ RESOLVERS: dict[str, Callable[[Session, str], str | None]] = {
     "factor_table": _factor_table_project,
     "product": _product_project,
     "asset_position": _asset_position_project,
+    "rollforward_template": _governed_project(RollforwardTemplate, soft_delete=True),
+    "rollforward_job": _governed_project(RollforwardJob),
+    "report": _governed_project(Report, soft_delete=True),
+    "derived_dataset": _governed_project(DerivedDataset, soft_delete=True),
 }
 
 LABELS = {
@@ -188,6 +208,8 @@ LABELS = {
     "scenario": "Scenario", "inforce_file": "Inforce file", "assumption_table": "Table",
     "factor_table": "Table",
     "product": "Product", "asset_position": "Asset position",
+    "rollforward_template": "Rollforward template", "rollforward_job": "Rollforward job",
+    "report": "Report", "derived_dataset": "Derived dataset",
 }
 
 

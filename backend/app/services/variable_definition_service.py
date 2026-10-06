@@ -10,6 +10,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.core.audit import record_audit
 from app.db.models.model_variable import ModelVariableDefinition
 from app.services.common import ServiceError, not_found
 from app.services.model_definition import definition_view, definitions_for
@@ -35,7 +36,8 @@ def _next_version(label: str | None) -> str:
 
 
 def update_definition(
-    db: Session, model_version_id: str, variable_name: str, changes: dict[str, Any]
+    db: Session, model_version_id: str, variable_name: str, changes: dict[str, Any],
+    user: Any | None = None,
 ) -> dict[str, Any]:
     row = (
         db.query(ModelVariableDefinition)
@@ -45,6 +47,7 @@ def update_definition(
     )
     if row is None:
         raise not_found(f"Variable '{variable_name}' is not defined for this model version.")
+    before = definition_view(row)
     # Fields that cannot be null: an explicit null means "no change".
     changes = {key: value for key, value in changes.items()
                if not (value is None and key in ("required", "allow_scenario_override", "source"))}
@@ -63,6 +66,14 @@ def update_definition(
             changed = True
     if changed:
         row.version = _next_version(row.version)
+        row.updated_by = user.id if user else row.updated_by
+        db.flush()
+        if user is not None:
+            record_audit(
+                db, actor_user_id=user.id, action="model_variable_definition.updated",
+                entity_type="model_variable_definition", entity_id=row.id,
+                before_state=before, after_state=definition_view(row),
+            )
     db.commit()
     db.refresh(row)
     return definition_view(row)

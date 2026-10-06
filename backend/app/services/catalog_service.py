@@ -56,7 +56,9 @@ def get_project(db: Session, project_id: str) -> Project:
 
 
 def get_model_version(db: Session, model_version_id: str) -> tuple[ModelVersion, Model]:
-    version = db.get(ModelVersion, model_version_id)
+    version = db.query(ModelVersion).filter(
+        ModelVersion.id == model_version_id, ModelVersion.deleted_at.is_(None)
+    ).first()
     if version is None:
         raise not_found(f"Model version '{model_version_id}' not found.")
     model = db.get(Model, version.model_id)
@@ -85,7 +87,7 @@ def _versions_by_model(db: Session, model_ids: list[str]) -> dict[str, list[Mode
         return grouped
     for version in (
         db.query(ModelVersion)
-        .filter(ModelVersion.model_id.in_(model_ids))
+        .filter(ModelVersion.model_id.in_(model_ids), ModelVersion.deleted_at.is_(None))
         .order_by(ModelVersion.created_at)
         .all()
     ):
@@ -151,7 +153,9 @@ def list_models(
     sort: str = "updated_desc",
 ) -> dict[str, Any]:
     get_project(db, project_id)
-    models = db.query(Model).filter(Model.project_id == project_id).all()
+    models = db.query(Model).filter(
+        Model.project_id == project_id, Model.deleted_at.is_(None)
+    ).all()
     versions = _versions_by_model(db, [model.id for model in models])
     run_counts = _run_counts(db, [v.id for vs in versions.values() for v in vs])
 
@@ -196,7 +200,7 @@ def list_models(
 
 
 def get_model(db: Session, model_id: str, current_user_id: str | None) -> dict[str, Any]:
-    model = db.get(Model, model_id)
+    model = db.query(Model).filter(Model.id == model_id, Model.deleted_at.is_(None)).first()
     if model is None:
         raise not_found(f"Model '{model_id}' not found.")
     versions = _versions_by_model(db, [model.id])[model.id]
@@ -211,7 +215,10 @@ def get_model(db: Session, model_id: str, current_user_id: str | None) -> dict[s
 def _model_formulas(db: Session, model_version_id: str) -> list[FormulaRegistry]:
     return (
         db.query(FormulaRegistry)
-        .filter(FormulaRegistry.model_version_id == model_version_id)
+        .filter(
+            FormulaRegistry.model_version_id == model_version_id,
+            FormulaRegistry.deleted_at.is_(None),
+        )
         .order_by(FormulaRegistry.output_variable)
         .all()
     )

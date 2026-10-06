@@ -40,7 +40,7 @@ from app.db.models.run import Run
 from app.db.models.run_artifact import RunArtifact
 from app.db.models.run_package import RunAttempt, RunPackage
 from app.products.registry import register_all_products
-from app.services import dataset_loader, run_finalization
+from app.services import dataset_loader, governance_service, run_finalization
 from app.services.build_info import build_identity, runtime_environment
 from app.services.common import iso, now_utc
 from app.services.run_events import add_event
@@ -95,6 +95,7 @@ def claim_run(db: Session, run_id: str, worker_id: str) -> RunAttempt | None:
         executed_build=executed_build,
     )
     db.add(attempt)
+    governance_service.reset_run_steps(db, run_id)
     add_event(db, run_id, "claimed", f"Attempt {number} started on {worker_id}.",
               data={"attempt_number": number, "worker_id": worker_id})
     db.commit()
@@ -207,20 +208,55 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
     package = db.query(RunPackage).filter(RunPackage.run_id == run_id).first()
     metrics: dict[str, float] = {}
     started = perf_counter()
+    governance_service.update_run_step(db, run_id, "verify_inputs", "running")
+    db.commit()
     try:
         configuration, functions, data = _load(db, run, package)
     except _PreflightFailure as failure:
-        return _fail(db, run_id, attempt_id, attempt_number, failure.error_type,
-                     f"Run refused before calculation: {failure.message}", failure.details,
-                     rows_written=False, metrics={"load_seconds": perf_counter() - started})
+        governance_service.update_run_step(
+            db, run_id, "verify_inputs", "failed", error_code=failure.error_type,
+            error_message=failure.message,
+        )
+        governance_service.update_run_step(db, run_id, "calculate", "skipped")
+        governance_service.update_run_step(db, run_id, "finalize", "running")
+        db.commit()
+        result = _fail(db, run_id, attempt_id, attempt_number, failure.error_type,
+                       f"Run refused before calculation: {failure.message}", failure.details,
+                       rows_written=False, metrics={"load_seconds": perf_counter() - started})
+        governance_service.update_run_step(
+            db, run_id, "finalize", "success" if result is not None else "failed",
+            error_code=None if result is not None else "FINALIZATION_ERROR",
+        )
+        db.commit()
+        return result
     except Exception as error:  # noqa: BLE001 - e.g. a lost connection while loading
         logger.exception("Loading run %s failed", run_id)
         db.rollback()
-        return _fail(db, run_id, attempt_id, attempt_number, "LOAD_ERROR",
-                     f"Run could not be loaded: {error}", {}, rows_written=False)
+        governance_service.update_run_step(
+            db, run_id, "verify_inputs", "failed", error_code="LOAD_ERROR",
+            error_message=str(error),
+        )
+        governance_service.update_run_step(db, run_id, "calculate", "skipped")
+        governance_service.update_run_step(db, run_id, "finalize", "running")
+        db.commit()
+        result = _fail(db, run_id, attempt_id, attempt_number, "LOAD_ERROR",
+                       f"Run could not be loaded: {error}", {}, rows_written=False)
+        governance_service.update_run_step(
+            db, run_id, "finalize", "success" if result is not None else "failed",
+            error_code=None if result is not None else "FINALIZATION_ERROR",
+        )
+        db.commit()
+        return result
     metrics["load_seconds"] = perf_counter() - started
 
     run.progress_total = len(data.policies)
+    governance_service.update_run_step(
+        db, run_id, "verify_inputs", "success",
+        metrics={"load_seconds": round(metrics["load_seconds"], 4)},
+    )
+    governance_service.update_run_step(
+        db, run_id, "calculate", "running", progress_total=len(data.policies),
+    )
     add_event(
         db, run.id, "load",
         f"Verified run package {package.fingerprint[:12]}…, build and {len(functions)} formula "
@@ -343,14 +379,31 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                     "created_at": now_utc(),
                 })
             run.progress_done = index
+            governance_service.update_run_step(
+                db, run_id, "calculate", "running",
+                progress_total=len(data.policies), progress_done=index,
+            )
             if index % FLUSH_EVERY_POLICIES == 0 or index == len(data.policies):
                 flush()
     except Exception as error:  # noqa: BLE001 - any failure fails the attempt, never the process
         logger.exception("Run %s failed during execution", run_id)
         db.rollback()
-        return _fail(db, run_id, attempt_id, attempt_number, "EXECUTION_ERROR",
-                     f"Run failed during execution: {error}", {}, rows_written=True,
-                     metrics=metrics, prior_errors=errors, warnings=warnings)
+        governance_service.update_run_step(
+            db, run_id, "calculate", "failed", error_code="EXECUTION_ERROR",
+            error_message=str(error), progress_total=len(data.policies),
+            progress_done=run.progress_done,
+        )
+        governance_service.update_run_step(db, run_id, "finalize", "running")
+        db.commit()
+        result = _fail(db, run_id, attempt_id, attempt_number, "EXECUTION_ERROR",
+                       f"Run failed during execution: {error}", {}, rows_written=True,
+                       metrics=metrics, prior_errors=errors, warnings=warnings)
+        governance_service.update_run_step(
+            db, run_id, "finalize", "success" if result is not None else "failed",
+            error_code=None if result is not None else "FINALIZATION_ERROR",
+        )
+        db.commit()
+        return result
 
     status = run_state.outcome_status(len(data.policies), failed_policies)
     metrics.update({
@@ -392,7 +445,20 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
         event_level="info" if failed_policies == 0 else "warning",
         event_data={"status": status, "attempt_number": attempt_number, "metrics": rounded},
     )
-    return _finish(db, outcome)
+    governance_service.update_run_step(
+        db, run_id, "calculate", "success" if status != run_state.FAILED else "failed",
+        progress_total=len(data.policies), progress_done=len(data.policies), metrics=rounded,
+        error_code=error_type, error_message=error_message,
+    )
+    governance_service.update_run_step(db, run_id, "finalize", "running")
+    db.commit()
+    result = _finish(db, outcome)
+    governance_service.update_run_step(
+        db, run_id, "finalize", "success" if result is not None else "failed",
+        error_code=None if result is not None else "FINALIZATION_ERROR",
+    )
+    db.commit()
+    return result
 
 
 def _delete_attempt_rows(db: Session, run_id: str, attempt_number: int) -> str:

@@ -1,5 +1,7 @@
 """CRUD operations for the Formula Registry — backed by PostgreSQL."""
 
+from datetime import datetime, timezone
+
 from sqlalchemy.orm import Session
 
 from app.core.audit import record_audit
@@ -27,6 +29,8 @@ def _state(model: FormulaModel) -> dict:
         "illustrative": model.illustrative,
         "created_by": model.created_by,
         "updated_by": model.updated_by,
+        "deleted_by": model.deleted_by,
+        "deleted_at": model.deleted_at.isoformat() if model.deleted_at else None,
     }
 
 
@@ -75,21 +79,25 @@ def register(db: Session, formula: FormulaDefinition, actor_user_id: str) -> For
 
 
 def get_by_id(db: Session, formula_id: str) -> FormulaDefinition | None:
-    model = db.query(FormulaModel).filter(FormulaModel.id == formula_id).first()
+    model = db.query(FormulaModel).filter(
+        FormulaModel.id == formula_id, FormulaModel.deleted_at.is_(None)
+    ).first()
     if model is None:
         return None
     return _model_to_definition(model)
 
 
 def get_by_output(db: Session, output_variable: str) -> FormulaDefinition | None:
-    model = db.query(FormulaModel).filter(FormulaModel.output_variable == output_variable).first()
+    model = db.query(FormulaModel).filter(
+        FormulaModel.output_variable == output_variable, FormulaModel.deleted_at.is_(None)
+    ).first()
     if model is None:
         return None
     return _model_to_definition(model)
 
 
 def list_all(db: Session, category: str | None = None, product: str | None = None) -> list[FormulaDefinition]:
-    query = db.query(FormulaModel)
+    query = db.query(FormulaModel).filter(FormulaModel.deleted_at.is_(None))
     if category:
         query = query.filter(FormulaModel.category == category)
     if product:
@@ -98,7 +106,9 @@ def list_all(db: Session, category: str | None = None, product: str | None = Non
 
 
 def update(db: Session, formula_id: str, updates: dict, actor_user_id: str) -> FormulaDefinition | None:
-    model = db.query(FormulaModel).filter(FormulaModel.id == formula_id).first()
+    model = db.query(FormulaModel).filter(
+        FormulaModel.id == formula_id, FormulaModel.deleted_at.is_(None)
+    ).first()
     if model is None:
         return None
     before = _state(model)
@@ -120,15 +130,20 @@ def update(db: Session, formula_id: str, updates: dict, actor_user_id: str) -> F
 
 
 def delete(db: Session, formula_id: str, actor_user_id: str) -> bool:
-    model = db.query(FormulaModel).filter(FormulaModel.id == formula_id).first()
+    model = db.query(FormulaModel).filter(
+        FormulaModel.id == formula_id, FormulaModel.deleted_at.is_(None)
+    ).first()
     if model is None:
         return False
     before = _state(model)
-    db.delete(model)
+    model.deleted_at = datetime.now(timezone.utc)
+    model.deleted_by = actor_user_id
+    model.updated_by = actor_user_id
     db.flush()
     record_audit(
         db, actor_user_id=actor_user_id, action="formula.deleted",
         entity_type="formula", entity_id=model.id, before_state=before,
+        after_state=_state(model), context={"deletion": "soft"},
     )
     db.commit()
     return True

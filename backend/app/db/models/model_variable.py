@@ -54,6 +54,12 @@ class ModelVariableDefinition(Base):
     # Scenario governance: a scenario may override this variable only if explicitly allowed.
     allow_scenario_override: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     version: Mapped[str] = mapped_column(String(20), default="v1", nullable=False)
+    created_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    updated_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now, nullable=False

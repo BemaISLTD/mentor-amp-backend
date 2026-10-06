@@ -1,5 +1,7 @@
 """CRUD operations for the Variable Registry — backed by PostgreSQL."""
 
+from datetime import datetime, timezone
+
 from sqlalchemy.orm import Session
 
 from app.core.audit import record_audit
@@ -25,6 +27,8 @@ def _state(model: VariableModel) -> dict:
         "unit": model.unit,
         "created_by": model.created_by,
         "updated_by": model.updated_by,
+        "deleted_by": model.deleted_by,
+        "deleted_at": model.deleted_at.isoformat() if model.deleted_at else None,
     }
 
 
@@ -94,21 +98,25 @@ def register(db: Session, variable: VariableDefinition, actor_user_id: str) -> V
 
 
 def get_by_name(db: Session, name: str) -> VariableDefinition | None:
-    model = db.query(VariableModel).filter(VariableModel.name == name).first()
+    model = db.query(VariableModel).filter(
+        VariableModel.name == name, VariableModel.deleted_at.is_(None)
+    ).first()
     if model is None:
         return None
     return _model_to_definition(model)
 
 
 def get_by_id(db: Session, variable_id: str) -> VariableDefinition | None:
-    model = db.query(VariableModel).filter(VariableModel.id == variable_id).first()
+    model = db.query(VariableModel).filter(
+        VariableModel.id == variable_id, VariableModel.deleted_at.is_(None)
+    ).first()
     if model is None:
         return None
     return _model_to_definition(model)
 
 
 def list_all(db: Session, product: str | None = None, kind: str | None = None) -> list[VariableDefinition]:
-    query = db.query(VariableModel)
+    query = db.query(VariableModel).filter(VariableModel.deleted_at.is_(None))
     if kind:
         query = query.filter(VariableModel.source_type == kind)
     if product:
@@ -117,7 +125,9 @@ def list_all(db: Session, product: str | None = None, kind: str | None = None) -
 
 
 def update(db: Session, name: str, updates: dict, actor_user_id: str) -> VariableDefinition | None:
-    model = db.query(VariableModel).filter(VariableModel.name == name).first()
+    model = db.query(VariableModel).filter(
+        VariableModel.name == name, VariableModel.deleted_at.is_(None)
+    ).first()
     if model is None:
         return None
     before = _state(model)
@@ -139,15 +149,20 @@ def update(db: Session, name: str, updates: dict, actor_user_id: str) -> Variabl
 
 
 def delete(db: Session, name: str, actor_user_id: str) -> bool:
-    model = db.query(VariableModel).filter(VariableModel.name == name).first()
+    model = db.query(VariableModel).filter(
+        VariableModel.name == name, VariableModel.deleted_at.is_(None)
+    ).first()
     if model is None:
         return False
     before = _state(model)
-    db.delete(model)
+    model.deleted_at = datetime.now(timezone.utc)
+    model.deleted_by = actor_user_id
+    model.updated_by = actor_user_id
     db.flush()
     record_audit(
         db, actor_user_id=actor_user_id, action="variable.deleted",
         entity_type="variable", entity_id=model.id, before_state=before,
+        after_state=_state(model), context={"deletion": "soft"},
     )
     db.commit()
     return True

@@ -59,7 +59,10 @@ def referenced_names(spec: VariableSpec) -> set[str]:
 def load_model_formulas(db: Session, model_version_id: str) -> list[FormulaRegistry]:
     return (
         db.query(FormulaRegistry)
-        .filter(FormulaRegistry.model_version_id == model_version_id)
+        .filter(
+            FormulaRegistry.model_version_id == model_version_id,
+            FormulaRegistry.deleted_at.is_(None),
+        )
         .order_by(FormulaRegistry.output_variable)
         .all()
     )

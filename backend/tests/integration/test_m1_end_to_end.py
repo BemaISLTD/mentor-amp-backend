@@ -194,6 +194,10 @@ def test_run_set_completes_with_expected_numbers(env, ids):
     run = get(client, f"/runs/{ids['base']}")
     assert run["progress"] == {"total": 25, "done": 25, "percent": 100.0, "unit": "policies", "eta_seconds": None}
     assert run["illustrative"] is True and run["manifest_fingerprint"]
+    steps = get(client, f"/runs/{ids['base']}/steps")["steps"]
+    assert [step["step_key"] for step in steps] == ["verify_inputs", "calculate", "finalize"]
+    assert [step["status"] for step in steps] == ["success", "success", "success"]
+    assert steps[1]["progress_done"] == steps[1]["progress_total"] == 25
 
     summary = get(client, f"/runs/{ids['base']}/summary")
     assert summary["status"] == "success" and summary["failed_policy_count"] == 0

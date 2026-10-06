@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.core import lifecycle
+from app.core.audit import record_audit
 from app.db.models.assumption import AssumptionTable
 from app.db.models.factor import FactorTable
 from app.db.models.formula import FormulaRegistry
@@ -38,6 +39,25 @@ REFERENCE_FIELDS = (
 )
 
 
+def _audit_state(row: ProjectionSet) -> dict[str, Any]:
+    return {
+        column.name: iso(getattr(row, column.name))
+        if column.name.endswith("_at") or column.name.endswith("_date")
+        else getattr(row, column.name)
+        for column in row.__table__.columns
+        if column.name not in {"created_at", "updated_at"}
+    }
+
+
+def _audit(db: Session, user: Any | None, action: str, row: ProjectionSet,
+           before: dict[str, Any] | None = None) -> None:
+    if user is not None:
+        record_audit(
+            db, actor_user_id=user.id, action=action, entity_type="projection_set",
+            entity_id=row.id, before_state=before, after_state=_audit_state(row),
+        )
+
+
 def get(db: Session, projection_set_id: str) -> ProjectionSet:
     projection_set = db.get(ProjectionSet, projection_set_id)
     if projection_set is None:
@@ -60,7 +80,10 @@ def serialize(db: Session, projection_set: ProjectionSet) -> dict[str, Any]:
         scenario = db.get(ScenarioTable, scenario_id)
         scenarios.append({"id": scenario_id, "name": scenario.scenario_name if scenario else None})
     formula_count = (
-        db.query(FormulaRegistry).filter(FormulaRegistry.model_version_id == version.id).count()
+        db.query(FormulaRegistry).filter(
+            FormulaRegistry.model_version_id == version.id,
+            FormulaRegistry.deleted_at.is_(None),
+        ).count()
         if version else 0
     )
     return {
@@ -174,14 +197,19 @@ def create(db: Session, project_id: str, payload: dict[str, Any], user: Any) -> 
         trace_scope=checks.normalise_trace_scope(payload.get("trace_scope")),
         parameters=dict(payload.get("parameters") or {}),
         created_by=user.id,
+        updated_by=user.id,
     )
     db.add(projection_set)
-    _commit_unique(db, projection_set)
+    _commit_unique(db, projection_set, user=user, action="projection_set.created")
     return serialize(db, projection_set)
 
 
-def _commit_unique(db: Session, projection_set: ProjectionSet) -> None:
+def _commit_unique(db: Session, projection_set: ProjectionSet, *, user: Any | None = None,
+                   action: str | None = None, before: dict[str, Any] | None = None) -> None:
     try:
+        db.flush()
+        if action:
+            _audit(db, user, action, projection_set, before)
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -192,8 +220,10 @@ def _commit_unique(db: Session, projection_set: ProjectionSet) -> None:
     db.refresh(projection_set)
 
 
-def update(db: Session, projection_set_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def update(db: Session, projection_set_id: str, payload: dict[str, Any],
+           user: Any | None = None) -> dict[str, Any]:
     projection_set = get(db, projection_set_id)
+    before = _audit_state(projection_set)
     _check_references(db, projection_set.project_id, payload)
     changed = False
     for field in EDITABLE_FIELDS:
@@ -210,7 +240,11 @@ def update(db: Session, projection_set_id: str, payload: dict[str, Any]) -> dict
         # each one executes its own frozen run package.
         projection_set.status = lifecycle.DRAFT
         projection_set.validation = None
-    _commit_unique(db, projection_set)
+        projection_set.updated_by = user.id if user else projection_set.updated_by
+    _commit_unique(
+        db, projection_set, user=user,
+        action="projection_set.updated" if changed else None, before=before,
+    )
     return serialize(db, projection_set)
 
 
@@ -242,19 +276,25 @@ def duplicate(db: Session, projection_set_id: str, version_label: str | None, us
         trace_scope=dict(source.trace_scope or {}),
         parameters=dict(source.parameters or {}),
         created_by=user.id,
+        updated_by=user.id,
     )
     db.add(copy)
-    _commit_unique(db, copy)
+    _commit_unique(db, copy, user=user, action="projection_set.version_created")
     return serialize(db, copy)
 
 
-def attach_scenario(db: Session, projection_set_id: str, scenario_id: str) -> dict[str, Any]:
+def attach_scenario(db: Session, projection_set_id: str, scenario_id: str,
+                    user: Any | None = None) -> dict[str, Any]:
     projection_set = get(db, projection_set_id)
+    before = _audit_state(projection_set)
     _check_references(db, projection_set.project_id, {"scenario_ids": [scenario_id]})
     if scenario_id not in (projection_set.scenario_ids or []):
         projection_set.scenario_ids = list(projection_set.scenario_ids or []) + [scenario_id]
         projection_set.status = lifecycle.DRAFT
         projection_set.validation = None
+        projection_set.updated_by = user.id if user else projection_set.updated_by
+        db.flush()
+        _audit(db, user, "projection_set.scenario_attached", projection_set, before)
         db.commit()
         db.refresh(projection_set)
     return serialize(db, projection_set)
@@ -279,8 +319,9 @@ def _messages(problems: list) -> str:
     return "; ".join(problem.message for problem in problems[:4])
 
 
-def validate(db: Session, projection_set_id: str) -> dict[str, Any]:
+def validate(db: Session, projection_set_id: str, user: Any | None = None) -> dict[str, Any]:
     projection_set = get(db, projection_set_id)
+    before = _audit_state(projection_set)
     project_id = projection_set.project_id
     result: list[dict[str, str]] = []
 
@@ -397,6 +438,9 @@ def validate(db: Session, projection_set_id: str) -> dict[str, Any]:
         overall, status = lifecycle.VALIDATED, lifecycle.VALIDATED
     projection_set.validation = {"status": overall, "validated_at": iso(now_utc()), "checks": result}
     projection_set.status = status
+    projection_set.updated_by = user.id if user else projection_set.updated_by
+    db.flush()
+    _audit(db, user, "projection_set.validated", projection_set, before)
     db.commit()
     db.refresh(projection_set)
     return serialize(db, projection_set)
