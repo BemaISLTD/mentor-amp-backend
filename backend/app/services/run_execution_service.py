@@ -21,6 +21,7 @@ accepted attempt and consistent terminal evidence, which a failed attempt never 
 
 import json
 import logging
+import math
 import os
 import socket
 import threading
@@ -107,10 +108,13 @@ def claim_run(db: Session, run_id: str, worker_id: str) -> RunAttempt | None:
 # =============================================================================
 
 def refresh_run_set_status(db: Session, run_set: RunSet) -> None:
+    db.flush()
     statuses = [row[0] for row in db.query(Run.status).filter(Run.run_set_id == run_set.id).all()]
     run_set.status = run_state.derive_run_set_status(statuses)
     if run_set.status in run_state.TERMINAL_STATUSES and run_set.completed_at is None:
         run_set.completed_at = now_utc()
+    elif run_set.status not in run_state.TERMINAL_STATUSES:
+        run_set.completed_at = None
 
 
 def execute_run_set(run_set_id: str, worker_id: str | None = None) -> None:
@@ -139,6 +143,23 @@ def execute_run_set(run_set_id: str, worker_id: str | None = None) -> None:
         db.commit()
     except Exception:  # noqa: BLE001 - a background task must never crash silently
         logger.exception("Run Set %s failed", run_set_id)
+        db.rollback()
+    finally:
+        db.close()
+
+
+def execute_run_by_id(run_id: str, worker_id: str | None = None) -> None:
+    """Execute one queued run in a background-safe session and refresh its Run Set."""
+    db = SessionLocal()
+    try:
+        execute_run(db, run_id, worker_id)
+        run = db.get(Run, run_id)
+        run_set = db.get(RunSet, run.run_set_id) if run and run.run_set_id else None
+        if run_set is not None:
+            refresh_run_set_status(db, run_set)
+            db.commit()
+    except Exception:  # noqa: BLE001 - background execution must be observable, never escape
+        logger.exception("Run %s failed in its background task", run_id)
         db.rollback()
     finally:
         db.close()
@@ -272,12 +293,13 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
     scenario_id = configuration["scenario"]["id"] or ""
     output_rows: list[dict[str, Any]] = []
     trace_rows: list[dict[str, Any]] = []
-    totals: dict[str, float] = {}
+    total_values: dict[str, list[float]] = {}
     counts = {"outputs": 0, "traces": 0}
     timing = {"calc": 0.0, "outputs": 0.0, "traces": 0.0, "commit": 0.0}
     failed_policies = 0
     warnings: list[str] = []
     errors: list[str] = []
+    cancelled = False
 
     def flush() -> None:
         nonlocal output_rows, trace_rows
@@ -337,6 +359,10 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
 
     try:
         for index, policy in enumerate(data.policies, start=1):
+            db.refresh(run, attribute_names=["cancel_requested_at"])
+            if run.cancel_requested_at is not None:
+                cancelled = True
+                break
             began = perf_counter()
             result = run_policy(data, policy, functions)
             timing["calc"] += perf_counter() - began
@@ -362,7 +388,7 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                         "created_at": created_at,
                     })
                 for name, value in result.sums.items():
-                    totals[name] = totals.get(name, 0.0) + value
+                    total_values.setdefault(name, []).append(value)
                 add_event(db, run.id, "policy",
                           f"Policy {policy.policy_id} complete ({result.months_computed} months).",
                           data={"policy_id": policy.policy_id})
@@ -385,6 +411,11 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
             )
             if index % FLUSH_EVERY_POLICIES == 0 or index == len(data.policies):
                 flush()
+        if not cancelled:
+            db.refresh(run, attribute_names=["cancel_requested_at"])
+            cancelled = run.cancel_requested_at is not None
+        if cancelled and (output_rows or trace_rows):
+            flush()
     except Exception as error:  # noqa: BLE001 - any failure fails the attempt, never the process
         logger.exception("Run %s failed during execution", run_id)
         db.rollback()
@@ -405,7 +436,12 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
         db.commit()
         return result
 
-    status = run_state.outcome_status(len(data.policies), failed_policies)
+    totals = {name: math.fsum(values) for name, values in total_values.items()}
+    status = (
+        run_state.CANCELLED
+        if cancelled
+        else run_state.outcome_status(len(data.policies), failed_policies)
+    )
     metrics.update({
         "calculation_seconds": timing["calc"],
         "output_write_seconds": timing["outputs"],
@@ -415,7 +451,9 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
     })
     cleanup_status = "not_needed"
     error_type = error_message = None
-    if status == run_state.FAILED:
+    if status == run_state.CANCELLED:
+        cleanup_status = "retained_noncanonical"
+    elif status == run_state.FAILED:
         # Every policy failed: nothing is canonical; remove whatever the attempt wrote.
         cleanup_status = _delete_attempt_rows(db, run_id, attempt_number)
         error_type, error_message = "ALL_POLICIES_FAILED", (errors[0] if errors else None)
@@ -440,14 +478,20 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
         warnings=warnings,
         errors=errors,
         environment=runtime_environment(),
-        event_step="complete",
-        event_message=f"Run completed: {succeeded} of {len(data.policies)} policies ({status}).",
-        event_level="info" if failed_policies == 0 else "warning",
+        event_step="cancelled" if cancelled else "complete",
+        event_message=(
+            f"Run cancelled after {run.progress_done} of {len(data.policies)} policies."
+            if cancelled
+            else f"Run completed: {succeeded} of {len(data.policies)} policies ({status})."
+        ),
+        event_level="warning" if cancelled or failed_policies else "info",
         event_data={"status": status, "attempt_number": attempt_number, "metrics": rounded},
     )
     governance_service.update_run_step(
-        db, run_id, "calculate", "success" if status != run_state.FAILED else "failed",
-        progress_total=len(data.policies), progress_done=len(data.policies), metrics=rounded,
+        db, run_id, "calculate",
+        "cancelled" if cancelled else ("success" if status != run_state.FAILED else "failed"),
+        progress_total=len(data.policies),
+        progress_done=run.progress_done if cancelled else len(data.policies), metrics=rounded,
         error_code=error_type, error_message=error_message,
     )
     governance_service.update_run_step(db, run_id, "finalize", "running")

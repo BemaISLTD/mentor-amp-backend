@@ -115,6 +115,13 @@ def run_view(db: Session, run: Run, lookups: Lookups | None = None, include_summ
         "legacy_run": run.run_package_fingerprint is None,
         "attempt_count": run.attempt_count or 0,
         "accepted_attempt_number": run.accepted_attempt_number,
+        "cancel_requested_at": iso(run.cancel_requested_at),
+        "cancel_requested_by": user_ref(db, run.cancel_requested_by),
+        "retried_from_run_id": run.retried_from_run_id,
+        "can_cancel": run.status in run_state.ACTIVE_STATUSES,
+        "can_retry": run.status in {
+            run_state.FAILED, run_state.CANCELLED, run_state.PARTIAL_SUCCESS,
+        },
         "results_available": (available := results_available(db, run)),
         "results_complete": available and run.status == run_state.SUCCESS,
         "illustrative": bool(run.illustrative),
@@ -267,6 +274,10 @@ def list_attempts(db: Session, run_id: str) -> dict[str, Any]:
     return {
         "run_id": run.id,
         "accepted_attempt_number": run.accepted_attempt_number,
+        "can_cancel": run.status in run_state.ACTIVE_STATUSES,
+        "can_retry": run.status in {
+            run_state.FAILED, run_state.CANCELLED, run_state.PARTIAL_SUCCESS,
+        },
         "attempts": [
             {
                 "attempt_number": row.attempt_number,

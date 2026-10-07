@@ -9,7 +9,12 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import authorize_path, require_permissions
 from app.db.database import get_db
 from app.db.models.user import User
-from app.services import run_execution_service, run_query_service, run_submission_service
+from app.services import (
+    run_control_service,
+    run_execution_service,
+    run_query_service,
+    run_submission_service,
+)
 
 router = APIRouter(tags=["runs"])
 Reader = Annotated[User, Depends(require_permissions("projects:read"))]
@@ -17,6 +22,9 @@ Executor = Annotated[User, Depends(require_permissions("runs:execute"))]
 ProjectReader = Annotated[User, Depends(authorize_path("project", "project_id", "projects:read"))]
 RunSetReader = Annotated[User, Depends(authorize_path("run_set", "run_set_id", "projects:read"))]
 RunReader = Annotated[User, Depends(authorize_path("run", "run_id", "projects:read"))]
+RunExecutor = Annotated[
+    User, Depends(authorize_path("run", "run_id", "runs:execute", write=True))
+]
 
 
 class RunSetRequest(BaseModel):
@@ -84,6 +92,23 @@ def list_runs(
 def get_run(run_id: str, user: RunReader, db: Session = Depends(get_db)):
     del user
     return run_query_service.run_view(db, run_query_service.get_run(db, run_id))
+
+
+@router.post("/runs/{run_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
+def cancel_run(run_id: str, user: RunExecutor, db: Session = Depends(get_db)):
+    return run_control_service.cancel_run(db, run_id, user)
+
+
+@router.post("/runs/{run_id}/retry", status_code=status.HTTP_202_ACCEPTED)
+def retry_run(
+    run_id: str,
+    background_tasks: BackgroundTasks,
+    user: RunExecutor,
+    db: Session = Depends(get_db),
+):
+    retried = run_control_service.retry_run(db, run_id, user)
+    background_tasks.add_task(run_execution_service.execute_run_by_id, retried["id"])
+    return retried
 
 
 @router.get("/runs/{run_id}/events")

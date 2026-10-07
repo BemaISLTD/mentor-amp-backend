@@ -74,3 +74,14 @@ class Run(Base):
     accepted_attempt_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # run_manifests.fingerprint, set once when the run reaches a terminal status.
     final_manifest_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # --- M2: cooperative cancellation and immutable retry lineage ---
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancel_requested_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    retried_from_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("runs.id", ondelete="RESTRICT"), nullable=True, index=True
+    )

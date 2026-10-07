@@ -12,35 +12,40 @@ it is considered complete.
 
 | Area | Verified state | Status |
 | --- | --- | --- |
-| Tests | Original `test_*.py` modules were empty placeholders | 156 tests pass in the clean Docker image; 5 opt-in PostgreSQL tests pass separately |
+| Tests | Original `test_*.py` modules were empty placeholders | **Current evidence:** 257 tests pass and 12 are skipped when opt-in PostgreSQL tests have no database URL; all 11 PostgreSQL migration/concurrency tests pass separately |
 | Seed data | No seed script existed | Complete for illustrative SPIA demo; broader product and workflow seed remains open |
 | Authentication/RBAC | No auth dependency or user/RBAC models existed | **Complete:** JWT and the administrator, actuary, model developer, reviewer, and read-only permission matrix are enforced |
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
 | Error contract | Default FastAPI `detail` responses were used | **Complete:** standardized error envelope added |
 | Projects | POST and GET only | **Complete:** permission-protected PATCH and audited archival added; hard deletion is not exposed |
 | Run APIs | `runs.py`, `results.py`, and `trace.py` were empty | **Complete for local execution:** consolidated run-set, result, comparison, and trace APIs are canonical at `/v1`; older backlog run routes are deprecated under `/v1/legacy-runs` and administrator-only |
+| Data Manager | Imports were disconnected one-shot validators | **Complete:** governed upload, browser preview, mapping, validation, immutable version commit, peer approval, comparison, rejected records, and import history cover inforce, assumptions, factors, and scenarios |
+| Run controls | Runs could not be cancelled or retried | **Complete:** pending/running cancellation and frozen-configuration retry are exposed through the canonical run API |
 | Large outputs | Runner previously wrote outputs and traces to PostgreSQL | **Complete for local execution:** Parquet artifacts replace the removed legacy tables; production object storage remains open |
 | Run manifests | Runs did not snapshot inputs/configuration | **Complete:** immutable version snapshot added |
 | Reconciliation | No comparison service or API existed | **Complete:** deterministic on-demand comparison over immutable artifacts |
 
 ## 1. Environment, Recovery, and Testing
 
-- **[BUILD] Implement the Pytest Suite — IN PROGRESS**
+- **[BUILD] Implement the Pytest Suite — COMPLETE FOR CURRENT LOCAL SCOPE**
   - Build coverage for database connectivity, migrations, model constraints,
     validation, authentication/authorization, API behavior, engine behavior,
     and golden policies.
-  - Current evidence: clean-image `pytest -q` returned `156 passed, 5 skipped`;
-    the five opt-in PostgreSQL migration/concurrency tests passed separately.
+  - Current evidence: the clean Docker suite returned `257 passed, 12 skipped`
+    when the opt-in PostgreSQL URL was absent; all 11 PostgreSQL
+    migration/concurrency tests passed separately on a disposable PostgreSQL 15
+    database.
 - **[IMPROVE] Database Seeding Scripts — IN PROGRESS**
   - `scripts/seed_demo.py` idempotently creates synthetic SPIA users, project,
     inputs, scenarios, model, and a validated projection set. Broader product
     and workflow seed data remains open.
-- **[IMPROVE] Upload Recovery — COMPLETE FOR LOCAL UPLOADS**
-  - Uploads use atomic staging, sanitize client filenames, and remove staged or
-    partially copied files on success and failure.
-  - In-force database writes commit only after staging cleanup and roll back on
-    parsing, validation, storage, cleanup, or commit failures.
-  - Reapply the same lifecycle when an object-storage-backed import path is added.
+- **[IMPROVE] Governed Upload Recovery — COMPLETE FOR LOCAL ARTIFACT STORAGE**
+  - Every upload is retained as an immutable raw artifact with its SHA-256
+    fingerprint and persistent import-session history.
+  - CSV, TSV, XLSX, and Parquet files share one preview, mapping, validation,
+    rejected-record, commit, version, and approval lifecycle.
+  - Canonical fingerprints are independent of upload format. Production object
+    storage remains deferred behind the existing artifact-store interface.
 
 ## 2. API Contract and Security
 
@@ -51,6 +56,9 @@ it is considered complete.
     record APIs now enforce the same project boundary.
   - Administrator, actuary, model developer, reviewer, and read-only roles use
     an explicit project, registry, import, and run permission matrix.
+  - Dataset approval uses the separate `imports:approve` permission for admin,
+    actuary, and reviewer roles; model developers cannot approve and committers
+    cannot approve their own dataset versions.
   - Read and mutation routes enforce stored permissions rather than role names.
 - **[IMPROVE] API Versioning and Error Handling — COMPLETE**
   - Public application routers are mounted below `/v1`.
@@ -113,6 +121,14 @@ it is considered complete.
     progress, metrics, and failure details; the run-step API exposes them.
   - Projection output keys remain in Parquet because normalized projection-value
     rows would violate the established analytical-storage boundary.
+- **[BUILD] Governed Data Manager — COMPLETE**
+  - Persistent import sessions implement upload → preview → map → validate →
+    commit immutable version → peer approve/reject for liability inforce,
+    assumption tables, factor tables, and scenarios.
+  - Mapping profiles and dataset versions are immutable chains. Validation issues,
+    rejected rows, actors, raw/canonical fingerprints, and import events remain
+    queryable. Legacy `/v1/imports/*` writes are deprecated one-shot wrappers over
+    the same lifecycle.
 - **[BUILD] Model Versioning — COMPLETE**
   - Whole-model versions track parent, sequence, configuration, change summary,
     actor, publication, and archival metadata; child formula groups, formulas,
@@ -146,6 +162,13 @@ it is considered complete.
     endpoints after the target persistence boundary exists.
   - Replace the in-process background-task adapter with a durable worker queue
     before multi-instance production deployment.
+- **[BUILD] Run Cancel and Retry — COMPLETE FOR LOCAL EXECUTION**
+  - Pending cancellation is immediate; running cancellation is cooperative
+    between policies and produces terminal manifest evidence while retaining
+    partial artifacts as noncanonical evidence.
+  - Failed, cancelled, and partial-success runs can create a new linked run from
+    the exact frozen configuration. Build-identity mismatches and successful-run
+    retries are refused.
 - **[BUILD] Reconciliation Service — COMPLETE**
   - Compare prior/current output datasets and return reserve bridges and exact
     variance components.
@@ -159,10 +182,11 @@ it is considered complete.
    authorization tests. **Complete:** expanded roles and route-level read,
    write, and execute permissions are enforced.
 3. Audit logs and project actor fields. **Complete.**
-4. Local/S3 Parquet storage interface and immutable run manifests. **In progress:**
-   local Parquet, manifests, and legacy table removal are complete; S3 remains.
+4. Local/S3 Parquet storage interface and immutable run manifests. **Complete for
+   local execution:** local Parquet, manifests, and legacy table removal are
+   complete; S3 remains deferred.
 5. Run, status, result, and trace APIs. **Complete for local execution.**
-   Durable workers remain open; reconciliation is complete.
+   Cancel/retry and reconciliation are complete; durable workers remain open.
 6. Product, asset, and dashboard domains. **Complete.** Workflow, reporting,
    and record-viewer domains remain open.
 7. Conditional `/files` and `/tables` adapters after frontend confirmation.
@@ -198,6 +222,15 @@ Before an item moves to complete, record:
 - Legacy run-storage removal: `backend/app/db/migrations/versions/a7f4c2d9e180_remove_legacy_run_storage.py`
 - Parquet storage tests: `backend/tests/unit/test_artifact_storage.py`
 - M1 execution integration: `backend/app/services/run_execution_service.py`
+- Data Manager API and service: `backend/app/api/data_manager.py`,
+  `backend/app/services/data_manager_service.py`
+- Data Manager migration: `backend/app/db/migrations/versions/f3b8d6a1e240_data_manager_lifecycle.py`
+- Data Manager tests: `backend/tests/integration/test_data_manager.py`,
+  `backend/tests/integration/test_data_manager_rebuild.py`
+- Run controls: `backend/app/services/run_control_service.py`,
+  `backend/app/api/execution.py`
+- Run-control migration: `backend/app/db/migrations/versions/e6a9c4d2f817_run_cancel_retry.py`
+- Run-control tests: `backend/tests/integration/test_run_control.py`
 - Attempt-scoped artifact migration: `backend/app/db/migrations/versions/f9d3e5a7b012_attempt_scoped_artifacts.py`
 - Registry actor migration: `backend/app/db/migrations/versions/c6e1a4b9d203_registry_actor_fields.py`
 - M1 end-to-end tests: `backend/tests/integration/test_m1_end_to_end.py`
@@ -206,4 +239,6 @@ Before an item moves to complete, record:
 - Products/assets tests: `backend/tests/integration/test_products_api.py`
 - Dashboard API: `backend/app/api/dashboard.py`
 - Dashboard tests: `backend/tests/integration/test_dashboard_api.py`
-- Verification command: `docker compose exec -T api pytest -q`
+- Verification command: `pytest tests/unit tests/integration -q`; PostgreSQL
+  verification uses `MENTORAMP_TEST_POSTGRES_URL` pointing only to a disposable
+  database whose name contains `test`.
