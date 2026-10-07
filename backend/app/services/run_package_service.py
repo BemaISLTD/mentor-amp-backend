@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.core import lifecycle
 from app.core.execution import run_package
-from app.core.execution.fingerprints import INFORCE_FINGERPRINT_SCHEME, scenario_fingerprint
+from app.core.execution.fingerprints import SUPPORTED_INFORCE_FINGERPRINT_SCHEMES, scenario_fingerprint
 from app.core.formula_engine.formulas import FORMULA_FUNCTIONS, FORMULA_REGISTRY
 from app.core.projection_engine.engine import OVERRIDE_OPERATIONS, EngineError, order_formulas
 from app.core.projection_engine.run_data import VariableSpec
@@ -212,11 +212,11 @@ def check_inforce(db: Session, project_id: str, file_ids: list[str]) -> tuple[li
         files.append(file)
         label = f"Inforce file '{file.filename}'"
         problems += _input_problems(label, file.id, file.status, file.fingerprint)
-        if file.fingerprint and file.fingerprint_scheme != INFORCE_FINGERPRINT_SCHEME:
+        if file.fingerprint and file.fingerprint_scheme not in SUPPORTED_INFORCE_FINGERPRINT_SCHEMES:
             problems.append(Problem(
                 "INPUT_FINGERPRINT_OUTDATED",
                 f"{label} has a '{file.fingerprint_scheme}' fingerprint; re-validate it to "
-                f"{INFORCE_FINGERPRINT_SCHEME} before running.",
+                f"one of {sorted(SUPPORTED_INFORCE_FINGERPRINT_SCHEMES)} before running.",
                 {"id": file.id},
             ))
         if not file.row_count:

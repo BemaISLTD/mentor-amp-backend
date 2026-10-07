@@ -54,3 +54,29 @@ class ScenarioTable(Base):
     scenario_type: Mapped[str] = mapped_column(String(30), default="deterministic", nullable=False)
     as_of_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     path_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    version_number: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    version_group_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    parent_table_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("scenario_tables.id", ondelete="RESTRICT"), nullable=True
+    )
+    import_session_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("import_sessions.id", ondelete="RESTRICT"), nullable=True
+    )
+    raw_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    mapping_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    validation_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("validation_runs.id", ondelete="RESTRICT"), nullable=True
+    )
+    committed_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_reason: Mapped[str | None] = mapped_column(Text, nullable=True)

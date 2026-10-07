@@ -45,6 +45,12 @@ def fingerprint_sequence(items: Iterable[Any]) -> str:
 # v2 hashes {"policy_id", "data"} per record, ordered by policy_id alone, and requires unique
 # policy IDs, so neither identity nor storage order can change without changing the fingerprint.
 INFORCE_FINGERPRINT_SCHEME = "inforce-v2"
+# Data Manager v3 canonicalizes mapped field types before hashing. The record envelope and
+# unique-policy ordering remain the v2 rules; the distinct label prevents silent reinterpretation.
+DATA_MANAGER_INFORCE_FINGERPRINT_SCHEME = "inforce-v3"
+SUPPORTED_INFORCE_FINGERPRINT_SCHEMES = frozenset({
+    INFORCE_FINGERPRINT_SCHEME, DATA_MANAGER_INFORCE_FINGERPRINT_SCHEME,
+})
 
 
 class DuplicatePolicyIds(ValueError):

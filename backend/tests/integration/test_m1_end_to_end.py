@@ -74,7 +74,10 @@ def get(client, path, **params):
 @pytest.fixture(scope="module")
 def ids(env):
     client = env["client"]
+    previous_auth_mode = settings.auth_mode
+    previous_app_env = settings.app_env
     settings.auth_mode = "disabled"
+    settings.app_env = "test"
     try:
         project_response = client.get("/v1/projects/")
         assert project_response.status_code == 200, project_response.text
@@ -94,7 +97,8 @@ def ids(env):
             "submitted": body,
         }
     finally:
-        settings.auth_mode = "jwt"
+        settings.auth_mode = previous_auth_mode
+        settings.app_env = previous_app_env
 
 
 def test_demo_mode_needs_no_token(env):

@@ -11,7 +11,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.execution.fingerprints import (
-    INFORCE_FINGERPRINT_SCHEME,
+    SUPPORTED_INFORCE_FINGERPRINT_SCHEMES,
     DuplicatePolicyIds,
     inforce_fingerprint,
     table_fingerprint,
@@ -45,11 +45,12 @@ def load_policies(db: Session, configuration: dict[str, Any]) -> list[PolicyReco
                 f"Inforce file '{entry['name']}' ({entry['id']}) no longer exists.",
                 {"dataset_id": entry["id"]},
             )
-        if entry.get("fingerprint_scheme") != INFORCE_FINGERPRINT_SCHEME:
+        if entry.get("fingerprint_scheme") not in SUPPORTED_INFORCE_FINGERPRINT_SCHEMES:
             raise DataIntegrityError(
                 "DATASET_FINGERPRINT_SCHEME_UNSUPPORTED",
                 f"Inforce file '{entry['name']}' was frozen with fingerprint scheme "
-                f"'{entry.get('fingerprint_scheme')}'; this build verifies {INFORCE_FINGERPRINT_SCHEME}.",
+                f"'{entry.get('fingerprint_scheme')}'; this build verifies "
+                f"{sorted(SUPPORTED_INFORCE_FINGERPRINT_SCHEMES)}.",
                 {"dataset_id": entry["id"]},
             )
         # Canonical order is (unique) policy_id, sorted in Python: neither storage order nor the

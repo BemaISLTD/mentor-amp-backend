@@ -29,6 +29,14 @@ from app.db.models.governance import (  # noqa: F401
     RollforwardTemplate,
     RunStep,
 )
+from app.db.models.data_manager import (  # noqa: F401
+    ImportSession,
+    ImportSessionEvent,
+    MappingProfile,
+    RejectedRecord,
+    ValidationIssue,
+    ValidationRun,
+)
 from app.db.models.user import (  # noqa: F401
     Permission,
     Role,

@@ -33,7 +33,7 @@ RAW_URL = os.environ.get("MENTORAMP_TEST_POSTGRES_URL")
 pytestmark = pytest.mark.skipif(
     not RAW_URL, reason="set MENTORAMP_TEST_POSTGRES_URL to a disposable PostgreSQL database"
 )
-HEAD, WP1_HEAD, MERGE = "d8b4e1c7a205", "b7e4d2a9c613", "a3c5e7f9b1d2"
+HEAD, WP1_HEAD, MERGE = "f3b8d6a1e240", "b7e4d2a9c613", "a3c5e7f9b1d2"
 M1_HEAD, DEV_HEAD = "4d8e2f6a1c90", "c48a2d7159be"
 BACKEND = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

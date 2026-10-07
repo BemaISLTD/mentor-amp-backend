@@ -37,6 +37,32 @@ class InforceFile(Base):
     # How ``fingerprint`` was computed (app.core.execution.fingerprints); runs require inforce-v2.
     fingerprint_scheme: Mapped[str | None] = mapped_column(String(20), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    version_number: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    version_group_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    parent_file_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("inforce_files.id", ondelete="RESTRICT"), nullable=True
+    )
+    import_session_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("import_sessions.id", ondelete="RESTRICT"), nullable=True
+    )
+    raw_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    mapping_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    validation_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("validation_runs.id", ondelete="RESTRICT"), nullable=True
+    )
+    committed_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class InforceRecord(Base):

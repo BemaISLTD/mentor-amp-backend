@@ -13,22 +13,14 @@ from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user, require_permissions
 from app.core.project_lifecycle import require_active_project
-from app.core import lifecycle
-from app.core.execution.fingerprints import (
-    INFORCE_FINGERPRINT_SCHEME,
-    DuplicatePolicyIds,
-    inforce_fingerprint,
-)
-from app.data.importers.base import detect_format, import_file, parse_file, preview_file
-from app.data.validation.inforce_validator import validate_inforce
-from app.data.validation.assumption_validator import validate_assumptions
-from app.data.validation.factor_validator import validate_factors
-from app.data.validation.scenario_validator import validate_scenarios
+from app.data.importers.base import preview_file
 from app.db.database import get_db
 from app.db.models import InforceFile, InforceRecord
 from app.db.models.user import User
 from app.models.schemas import ImportPreviewResponse, InforceRecordListResponse
 from app.services import access
+from app.services import data_manager_service
+from app.services.common import ServiceError
 
 router = APIRouter(prefix="/imports", tags=["imports"])
 
@@ -72,10 +64,47 @@ def _staged_upload(file: UploadFile) -> Iterator[Path]:
         path.unlink(missing_ok=True)
 
 
+def _legacy_one_shot(db: Session, user: User, project_id: str, category: str,
+                     file: UploadFile, *, name: str | None = None,
+                     options: dict | None = None) -> dict:
+    """Run an old upload endpoint through the governed lifecycle."""
+    session = data_manager_service.create_session(db, {
+        "project_id": project_id, "category": category,
+        "name": name or Path(file.filename or "upload").stem,
+        "options": options or {},
+    }, user)
+    row = data_manager_service.require_session_access(db, user, session["id"], write=True)
+    uploaded = data_manager_service.upload_file(
+        db, row, file.filename or "upload.csv", file.file.read(), user
+    )
+    columns = list(uploaded["columns"])
+    fields = []
+    for column in columns:
+        target = "scenario_name" if category == "scenario" and column == "scenario_id" else column
+        fields.append({"source_column": column, "target_field": target})
+    data_manager_service.set_mapping(db, row, {"fields": fields}, user)
+    validation = data_manager_service.validate_session(db, row, user)
+    issues = data_manager_service.validation_issues(db, validation["id"])
+    if validation["error_count"]:
+        raise ServiceError(
+            422, "IMPORT_VALIDATION_FAILED", "The upload was retained but could not be committed.",
+            {"import_session_id": row.id, "validation_run_id": validation["id"], "issues": issues},
+        )
+    dataset = data_manager_service.commit_session(db, row, user)
+    return {
+        "import_session_id": row.id, "validation_run_id": validation["id"],
+        "dataset_id": dataset["id"], "dataset_ids": dataset.get("dataset_ids", [dataset["id"]]),
+        "file_id": dataset["id"] if category == "liability_inforce" else None,
+        "row_count": uploaded["row_count"], "stored_count": uploaded["row_count"],
+        "columns": columns, "errors": issues, "status": dataset["status"],
+    }
+
+
 @router.post(
     "/inforce",
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permissions("imports:write"))],
+    deprecated=True,
 )
 def upload_inforce(
     user: CurrentUser,
@@ -83,129 +112,73 @@ def upload_inforce(
     project_id: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    """Upload an inforce file, validate, and store."""
+    """Deprecated one-shot wrapper over the Data Manager lifecycle."""
     access.require_project_access(db, user, project_id, write=True)
     require_active_project(db, project_id)
-    try:
-        fmt = detect_format(file.filename or "unknown.tsv")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Unsupported file format. Use .tsv, .csv, or .xlsx.")
-
-    validation_errors: list[dict] = []
-
-    def validate(rows: list[dict]) -> list[dict]:
-        validation_errors.extend(validate_inforce(rows))
-        return validation_errors
-    def store_inforce(session: Session, rows: list[dict]) -> int:
-        # Stored only when validation found no blocking error (import_file); warnings leave the
-        # file in needs_review. Fingerprint scheme inforce-v2: {policy_id, data}, unique IDs.
-        records = [(str(row.get("policy_id", f"row_{i}")), row) for i, row in enumerate(rows)]
-        try:
-            file_fingerprint = inforce_fingerprint(records)
-        except DuplicatePolicyIds as error:
-            raise HTTPException(status_code=422, detail=f"Duplicate policy IDs: {error.policy_ids[:5]}") from error
-        infile = InforceFile(
-            project_id=project_id,
-            filename=file.filename or "unknown",
-            file_type=fmt,
-            row_count=len(rows),
-            columns_detected=list(rows[0].keys()) if rows else [],
-            status=lifecycle.NEEDS_REVIEW if validation_errors else lifecycle.VALIDATED,
-            fingerprint=file_fingerprint,
-            fingerprint_scheme=INFORCE_FINGERPRINT_SCHEME,
-        )
-        session.add(infile)
-        session.flush()
-
-        records = [
-            InforceRecord(
-                file_id=infile.id,
-                policy_id=row.get("policy_id", f"row_{i}"),
-                data=row,
-            )
-            for i, row in enumerate(rows)
-        ]
-        session.add_all(records)
-        session.flush()
-        return len(records)
-
-    try:
-        # Remove the staging file before commit. If cleanup fails, the database
-        # work is rolled back instead of returning a misleading success.
-        with _staged_upload(file) as file_path:
-            result = import_file(str(file_path), db, validate, store_inforce)
-        db.commit()
-        return result
-    except Exception:
-        db.rollback()
-        raise
+    return _legacy_one_shot(db, user, project_id, "liability_inforce", file)
 
 
 @router.post(
     "/assumptions",
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permissions("imports:write"))],
+    deprecated=True,
 )
 def upload_assumptions(
     user: CurrentUser,
     file: UploadFile = File(...),
     project_id: str = Query(...),
+    table_name: str | None = Query(None),
+    table_type: str = Query("generic"),
+    lookup_keys: str | None = Query(None),
+    value_column: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
-    """Upload an assumption file, validate, and store."""
+    """Deprecated one-shot wrapper over the Data Manager lifecycle."""
     access.require_project_access(db, user, project_id, write=True)
     require_active_project(db, project_id)
-    try:
-        detect_format(file.filename or "unknown.tsv")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Unsupported file format.")
-
-    # For now, validate only — storage will be product-specific (Stages 7-9)
-    with _staged_upload(file) as file_path:
-        rows = parse_file(str(file_path))
-        errors = validate_assumptions(rows)
-    return {
-        "row_count": len(rows),
-        "columns": list(rows[0].keys()) if rows else [],
-        "errors": errors,
-        "preview": rows[:20],
-    }
+    options = {"table_type": table_type}
+    if lookup_keys:
+        options["lookup_keys"] = [item.strip() for item in lookup_keys.split(",") if item.strip()]
+    if value_column:
+        options["value_column"] = value_column
+    return _legacy_one_shot(db, user, project_id, "assumption_table", file,
+                            name=table_name, options=options)
 
 
 @router.post(
     "/factors",
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permissions("imports:write"))],
+    deprecated=True,
 )
 def upload_factors(
     user: CurrentUser,
     file: UploadFile = File(...),
     project_id: str = Query(...),
+    table_name: str | None = Query(None),
+    table_type: str = Query("generic"),
+    lookup_keys: str | None = Query(None),
+    value_column: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
-    """Upload a factor file, validate, and store."""
+    """Deprecated one-shot wrapper over the Data Manager lifecycle."""
     access.require_project_access(db, user, project_id, write=True)
     require_active_project(db, project_id)
-    try:
-        detect_format(file.filename or "unknown.tsv")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Unsupported file format.")
-
-    with _staged_upload(file) as file_path:
-        rows = parse_file(str(file_path))
-        errors = validate_factors(rows)
-    return {
-        "row_count": len(rows),
-        "columns": list(rows[0].keys()) if rows else [],
-        "errors": errors,
-        "preview": rows[:20],
-    }
+    options = {"table_type": table_type}
+    if lookup_keys:
+        options["lookup_keys"] = [item.strip() for item in lookup_keys.split(",") if item.strip()]
+    if value_column:
+        options["value_column"] = value_column
+    return _legacy_one_shot(db, user, project_id, "factor_table", file,
+                            name=table_name, options=options)
 
 
 @router.post(
     "/scenarios",
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permissions("imports:write"))],
+    deprecated=True,
 )
 def upload_scenarios(
     user: CurrentUser,
@@ -213,23 +186,10 @@ def upload_scenarios(
     project_id: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    """Upload a scenario file, validate, and store."""
+    """Deprecated one-shot wrapper over the Data Manager lifecycle."""
     access.require_project_access(db, user, project_id, write=True)
     require_active_project(db, project_id)
-    try:
-        detect_format(file.filename or "unknown.tsv")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Unsupported file format.")
-
-    with _staged_upload(file) as file_path:
-        rows = parse_file(str(file_path))
-        errors = validate_scenarios(rows)
-    return {
-        "row_count": len(rows),
-        "columns": list(rows[0].keys()) if rows else [],
-        "errors": errors,
-        "preview": rows[:20],
-    }
+    return _legacy_one_shot(db, user, project_id, "scenario", file)
 
 
 def _file_columns(infile: InforceFile) -> list[str]:
@@ -324,7 +284,7 @@ def list_inforce_records(
     )
 
 
-@router.get("/preview", response_model=ImportPreviewResponse)
+@router.get("/preview", response_model=ImportPreviewResponse, deprecated=True)
 def preview_upload(file_path: str = Query(...)):
     """Preview an uploaded file (first 20 rows) without storing anything.
 

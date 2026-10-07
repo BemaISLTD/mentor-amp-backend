@@ -9,6 +9,7 @@ from app.core.formula_engine.formulas import FORMULA_FUNCTIONS
 from app.core.projection_engine.engine import EngineError, order_formulas
 from app.core.projection_engine.run_data import VariableSpec
 from app.db.models.assumption import AssumptionSet, AssumptionTable
+from app.db.models.data_manager import ImportSession, ValidationIssue, ValidationRun
 from app.db.models.factor import FactorSet, FactorTable
 from app.db.models.formula import FormulaRegistry
 from app.db.models.inforce import InforceFile, InforceRecord
@@ -861,6 +862,41 @@ def validation_issues(db: Session, project_id: str) -> dict[str, Any]:
                     "message": check.get("message") or check.get("label"),
                     "target": {"type": "projection_set", "id": projection_set.id},
                 })
+    sessions = db.query(ImportSession).filter(ImportSession.project_id == project_id).all()
+    for session in sessions:
+        latest = (
+            db.query(ValidationRun)
+            .filter(ValidationRun.import_session_id == session.id)
+            .order_by(ValidationRun.created_at.desc(), ValidationRun.id.desc())
+            .first()
+        )
+        if latest is None:
+            continue
+        target = (
+            {"type": f"{session.dataset_kind}_dataset", "id": session.dataset_id}
+            if session.dataset_kind and session.dataset_id
+            else {"type": "import_session", "id": session.id}
+        )
+        label = CATEGORY_LABELS.get(session.category, session.category.replace("_", " ").title())
+        for issue in (
+            db.query(ValidationIssue)
+            .filter(ValidationIssue.validation_run_id == latest.id)
+            .order_by(ValidationIssue.id)
+            .all()
+        ):
+            issues.append({
+                "id": f"validation_issue:{issue.id}",
+                "category": session.category,
+                "category_label": label,
+                "severity": issue.severity,
+                "status": "needs_review",
+                "title": f"{label} — {session.name}",
+                "message": issue.message,
+                "code": issue.code,
+                "row_number": issue.row_number,
+                "column_name": issue.column_name,
+                "target": target,
+            })
     return {"issues": issues, "total": len(issues)}
 
 

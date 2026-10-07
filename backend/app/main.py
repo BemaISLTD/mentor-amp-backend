@@ -6,6 +6,7 @@ from app.api.auth import router as auth_router
 from app.api.audit_logs import router as audit_logs_router
 from app.api.assets import router as assets_router
 from app.api.dashboard import router as dashboard_router
+from app.api.data_manager import router as data_manager_router
 from app.api.dependencies import get_current_user, require_permissions, require_roles
 from app.api.errors import register_exception_handlers
 from app.api.execution import router as execution_router
@@ -114,6 +115,7 @@ app.include_router(projection_sets_router, prefix=API_PREFIX)
 app.include_router(execution_router, prefix=API_PREFIX)
 app.include_router(analysis_router, prefix=API_PREFIX)
 app.include_router(governance_router, prefix=API_PREFIX)
+app.include_router(data_manager_router, prefix=API_PREFIX)
 
 
 @app.get("/health", tags=["health"])

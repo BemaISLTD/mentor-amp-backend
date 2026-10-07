@@ -1,4 +1,5 @@
 import io
+from types import SimpleNamespace
 
 import pytest
 from fastapi import UploadFile
@@ -67,51 +68,54 @@ def test_upload_filename_cannot_escape_staging_directory(tmp_path, monkeypatch):
         assert path.name.endswith("_outside.csv")
 
 
-def test_inforce_upload_commits_after_staging_cleanup(tmp_path, monkeypatch):
+def test_inforce_upload_delegates_to_governed_lifecycle(monkeypatch):
     session = RecordingSession()
-    observed_path = None
+    row = SimpleNamespace(id="session-1")
+    observed = {}
 
-    def successful_import(file_path, db, validate_func, store_func):
-        nonlocal observed_path
-        del db, validate_func, store_func
-        observed_path = file_path
-        assert imports.Path(file_path).exists()
-        return {
-            "row_count": 1,
-            "stored_count": 1,
-            "columns": ["policy_id"],
-            "errors": [],
-        }
-
-    monkeypatch.setattr(imports, "UPLOAD_DIR", tmp_path)
-    monkeypatch.setattr(imports, "import_file", successful_import)
+    monkeypatch.setattr(imports.data_manager_service, "create_session",
+                        lambda db, payload, user: {"id": "session-1"})
+    monkeypatch.setattr(imports.data_manager_service, "require_session_access",
+                        lambda db, user, session_id, write: row)
+    def upload_file(db, lifecycle_row, filename, content, user):
+        observed.update(filename=filename, content=content)
+        return {"row_count": 1, "columns": ["policy_id"]}
+    monkeypatch.setattr(imports.data_manager_service, "upload_file", upload_file)
+    monkeypatch.setattr(imports.data_manager_service, "set_mapping",
+                        lambda db, lifecycle_row, payload, user: None)
+    monkeypatch.setattr(imports.data_manager_service, "validate_session",
+                        lambda db, lifecycle_row, user: {"id": "validation-1", "error_count": 0})
+    monkeypatch.setattr(imports.data_manager_service, "validation_issues", lambda db, value: [])
+    monkeypatch.setattr(imports.data_manager_service, "commit_session",
+                        lambda db, lifecycle_row, user: {"id": "dataset-1", "status": "validated"})
     monkeypatch.setattr(imports, "require_active_project", lambda db, project_id: None)
     monkeypatch.setattr(imports.access, "require_project_access", lambda db, user, project_id, write: None)
 
     result = imports.upload_inforce(user=object(), file=upload(), project_id="project-1", db=session)
 
     assert result["stored_count"] == 1
-    assert observed_path is not None and not imports.Path(observed_path).exists()
-    assert session.commits == 1
+    assert result["dataset_id"] == "dataset-1"
+    assert observed == {"filename": "policies.csv", "content": b"policy_id\nP1\n"}
+    # Transaction boundaries belong to the persistent lifecycle service.
+    assert session.commits == 0
     assert session.rollbacks == 0
 
 
-def test_inforce_upload_rolls_back_and_removes_file_on_failure(tmp_path, monkeypatch):
+def test_inforce_upload_preserves_session_when_lifecycle_upload_fails(monkeypatch):
     session = RecordingSession()
-
-    def failed_import(file_path, db, validate_func, store_func):
-        del db, validate_func, store_func
-        assert imports.Path(file_path).exists()
+    row = SimpleNamespace(id="session-1")
+    monkeypatch.setattr(imports.data_manager_service, "create_session",
+                        lambda db, payload, user: {"id": "session-1"})
+    monkeypatch.setattr(imports.data_manager_service, "require_session_access",
+                        lambda db, user, session_id, write: row)
+    def failed_upload(db, lifecycle_row, filename, content, user):
         raise RuntimeError("database write failed")
-
-    monkeypatch.setattr(imports, "UPLOAD_DIR", tmp_path)
-    monkeypatch.setattr(imports, "import_file", failed_import)
+    monkeypatch.setattr(imports.data_manager_service, "upload_file", failed_upload)
     monkeypatch.setattr(imports, "require_active_project", lambda db, project_id: None)
     monkeypatch.setattr(imports.access, "require_project_access", lambda db, user, project_id, write: None)
 
     with pytest.raises(RuntimeError, match="database write failed"):
         imports.upload_inforce(user=object(), file=upload(), project_id="project-1", db=session)
 
-    assert list(tmp_path.iterdir()) == []
     assert session.commits == 0
-    assert session.rollbacks == 1
+    assert session.rollbacks == 0

@@ -61,6 +61,36 @@ class LocalParquetArtifactStore:
             checksum_sha256=checksum,
         )
 
+    def write_bytes(self, namespace: str, artifact_type: str, filename: str,
+                    content: bytes) -> StoredArtifact:
+        """Persist an immutable raw upload without interpreting or rewriting it."""
+        suffix = Path(filename).suffix.lower()
+        relative = (
+            Path(self._safe_component(namespace)) / self._safe_component(artifact_type)
+            / f"{uuid.uuid4()}{suffix}"
+        )
+        destination = self.root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(f"{destination.suffix}.tmp")
+        try:
+            temporary.write_bytes(content)
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return StoredArtifact(
+            uri=f"local://{relative.as_posix()}", row_count=0,
+            checksum_sha256=hashlib.sha256(content).hexdigest(),
+        )
+
+    def read_bytes(self, uri: str) -> bytes:
+        prefix = "local://"
+        if not uri.startswith(prefix):
+            raise ValueError(f"Unsupported local artifact URI: {uri}")
+        path = (self.root / uri.removeprefix(prefix)).resolve()
+        if path != self.root and self.root not in path.parents:
+            raise ValueError("Artifact URI escapes the configured storage root.")
+        return path.read_bytes()
+
     def read_rows(self, uri: str) -> list[dict[str, Any]]:
         prefix = "local://"
         if not uri.startswith(prefix):

@@ -22,6 +22,7 @@ BUILTIN_PERMISSIONS = {
     "registries:write": "Modify actuarial registries.",
     "imports:read": "View imported actuarial data.",
     "imports:write": "Upload actuarial data files.",
+    "imports:approve": "Approve or reject actuarial dataset versions.",
     "runs:read": "View projection runs and results.",
     "runs:execute": "Start projection runs.",
 }
@@ -53,6 +54,7 @@ BUILTIN_ROLES = {
             "projects:read",
             "registries:read",
             "imports:read",
+            "imports:approve",
             "runs:read",
         },
     },
@@ -66,6 +68,9 @@ BUILTIN_ROLES = {
         },
     },
 }
+
+# Peer approval is intentionally unavailable to model developers. Actuaries and
+# administrators retain it through their full permission sets.
 
 
 def _user_response(user: User) -> UserResponse:
