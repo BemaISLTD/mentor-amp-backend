@@ -1,5 +1,6 @@
 """WP2 Data Manager lifecycle across all governed dataset categories."""
 
+import hashlib
 from datetime import datetime, timezone
 from io import BytesIO
 from types import SimpleNamespace
@@ -112,6 +113,10 @@ def test_inforce_mapping_version_approval_and_comparison(data_manager):
         client, project.id, "liability_inforce", "SPIA policies", csv, mapping,
         {"valuation_date": "2026-01-01", "expected_record_count": 2},
     )
+    raw = client.get(f"/v1/import-sessions/{session_id}/file")
+    assert raw.status_code == 200
+    assert hashlib.sha256(raw.content).hexdigest() == first["raw_fingerprint"]
+    assert "attachment" in raw.headers["content-disposition"]
     assert first["fingerprint_scheme"] == "inforce-v3"
     assert first["status"] == "validated"
     denied = client.post(f"/v1/datasets/inforce/{first['id']}/approve", json={"reason": "checked"})
@@ -144,7 +149,16 @@ def test_inforce_mapping_version_approval_and_comparison(data_manager):
     events = client.get(f"/v1/import-sessions/{session_id}/log").json()["events"]
     assert [event["action"] for event in events] == ["opened", "uploaded", "mapped", "validated", "committed"]
     assert validation["canonical_fingerprint"] != second_validation["canonical_fingerprint"]
-    assert db.query(AuditLog).filter(AuditLog.actor_user_id == creator.id).count() >= 5
+    audit = db.query(AuditLog).filter(
+        AuditLog.entity_type == "import_session", AuditLog.entity_id == session_id,
+    ).order_by(AuditLog.id).all()
+    assert [entry.action for entry in audit] == [
+        "import_session.opened", "import_session.uploaded", "import_session.mapped",
+        "import_session.validated", "import_session.committed",
+    ]
+    assert all(entry.actor_user_id == creator.id and entry.after_state for entry in audit)
+    assert audit[0].before_state is None
+    assert all(entry.before_state for entry in audit[1:])
 
 
 @pytest.mark.parametrize("category,name,csv,mapping,options,kind", [
@@ -188,11 +202,12 @@ def test_validation_keeps_issues_and_rejected_records(data_manager):
     client, _db, project, _current, _creator, _reviewer = data_manager
     opened = client.post("/v1/import-sessions", json={
         "project_id": project.id, "category": "liability_inforce", "name": "Bad policies",
+        "options": {"valuation_date": "2026-01-01"},
     }).json()
     csv = (
         "policy_id,product_type,issue_date,issue_age,gender,premium,monthly_payment\n"
         "DUP,SPIA,2024-01-01,65,F,100000,700\n"
-        "DUP,SPIA,not-a-date,abc,X,-5,700\n"
+        "DUP,SPIA,2027-01-01,abc,X,-5,\n"
     )
     assert client.post(f"/v1/import-sessions/{opened['id']}/files",
                        files={"file": ("bad.csv", csv.encode(), "text/csv")}).status_code == 200
@@ -206,7 +221,10 @@ def test_validation_keeps_issues_and_rejected_records(data_manager):
     body = validation.json()
     assert body["error_count"] >= 3 and body["rejected_count"] == 1
     issues = client.get(f"/v1/validation-runs/{body['id']}/issues").json()["issues"]
-    assert {issue["code"] for issue in issues} >= {"DUPLICATE_KEY", "TYPE_MISMATCH", "INVALID_GENDER"}
+    assert {issue["code"] for issue in issues} >= {
+        "DUPLICATE_KEY", "TYPE_MISMATCH", "INVALID_GENDER", "MISSING_VALUE",
+        "EFFECTIVE_DATE_INVALID",
+    }
     rejected = client.get(
         f"/v1/validation-runs/{body['id']}/rejected-records"
     ).json()["rejected_records"]
@@ -342,6 +360,7 @@ def test_scenario_validation_enforces_model_variable_governance(data_manager):
         "scenario_name,target_variable,operation,value,applies_from_period,applies_to_period\n"
         "Stress,discount_rate_annual,set,0.03,0,1200\n"
         "Stress,unknown_rate,set,0.02,0,1200\n"
+        "Stress,discount_rate_annual,set,0.025,12,24\n"
     )
     opened = client.post("/v1/import-sessions", json={
         "project_id": project.id, "category": "scenario", "name": "Governed stress",
@@ -358,8 +377,54 @@ def test_scenario_validation_enforces_model_variable_governance(data_manager):
     validation = client.post(f"/v1/import-sessions/{opened['id']}/validate").json()
     issues = client.get(f"/v1/validation-runs/{validation['id']}/issues").json()["issues"]
     assert {issue["code"] for issue in issues} >= {
-        "SCENARIO_OVERRIDE_FORBIDDEN", "VARIABLE_NOT_DEFINED",
+        "SCENARIO_TARGET_NOT_OVERRIDABLE", "SCENARIO_TARGET_UNKNOWN",
+        "SCENARIO_OVERRIDE_OVERLAP",
     }
+
+
+def test_required_columns_table_ranges_and_unsupported_files_are_refused(data_manager):
+    client, _db, project, _current, _creator, _reviewer = data_manager
+    opened = client.post("/v1/import-sessions", json={
+        "project_id": project.id, "category": "liability_inforce", "name": "Missing identity",
+    }).json()
+    missing = b"product_type,issue_date,issue_age,gender,premium,monthly_payment\nSPIA,2024-01-01,65,F,1,1\n"
+    assert client.post(
+        f"/v1/import-sessions/{opened['id']}/files", files={"file": ("missing.csv", missing)},
+    ).status_code == 200
+    fields = [{"source_column": key, "target_field": key} for key in (
+        "product_type", "issue_date", "issue_age", "gender", "premium", "monthly_payment",
+    )]
+    assert client.put(f"/v1/import-sessions/{opened['id']}/mapping", json={"fields": fields}).status_code == 200
+    validation = client.post(f"/v1/import-sessions/{opened['id']}/validate").json()
+    codes = {item["code"] for item in client.get(
+        f"/v1/validation-runs/{validation['id']}/issues"
+    ).json()["issues"]}
+    assert "REQUIRED_FIELD_NOT_MAPPED" in codes
+    assert client.post(f"/v1/import-sessions/{opened['id']}/commit").status_code == 409
+
+    table = client.post("/v1/import-sessions", json={
+        "project_id": project.id, "category": "assumption_table", "name": "Invalid mortality",
+        "options": {"lookup_keys": ["age", "gender"], "value_column": "qx"},
+    }).json()
+    content = b"age,gender,qx\n65,F,1.4\n65,F,0.01\n"
+    assert client.post(f"/v1/import-sessions/{table['id']}/files",
+                       files={"file": ("mortality.csv", content)}).status_code == 200
+    mapping = [{"source_column": key, "target_field": key} for key in ("age", "gender", "qx")]
+    assert client.put(f"/v1/import-sessions/{table['id']}/mapping",
+                      json={"fields": mapping}).status_code == 200
+    table_validation = client.post(f"/v1/import-sessions/{table['id']}/validate").json()
+    table_codes = {item["code"] for item in client.get(
+        f"/v1/validation-runs/{table_validation['id']}/issues"
+    ).json()["issues"]}
+    assert table_codes >= {"PROBABILITY_RANGE", "DUPLICATE_KEY"}
+    assert client.post(f"/v1/import-sessions/{table['id']}/commit").status_code == 409
+
+    unsupported = client.post("/v1/import-sessions", json={
+        "project_id": project.id, "category": "scenario", "name": "Unsupported",
+    }).json()
+    response = client.post(f"/v1/import-sessions/{unsupported['id']}/files",
+                           files={"file": ("input.pdf", b"not a dataset")})
+    assert response.status_code == 400
 
 
 def test_viewer_cannot_write_and_archived_project_rejects_import(data_manager):

@@ -12,7 +12,7 @@ it is considered complete.
 
 | Area | Verified state | Status |
 | --- | --- | --- |
-| Tests | Original `test_*.py` modules were empty placeholders | **Current evidence:** 257 tests pass and 12 are skipped when opt-in PostgreSQL tests have no database URL; all 11 PostgreSQL migration/concurrency tests pass separately |
+| Tests | Original `test_*.py` modules were empty placeholders | **Current evidence:** 259 tests pass and 12 are skipped when opt-in PostgreSQL tests have no database URL; all 11 PostgreSQL migration/concurrency tests pass separately |
 | Seed data | No seed script existed | Complete for illustrative SPIA demo; broader product and workflow seed remains open |
 | Authentication/RBAC | No auth dependency or user/RBAC models existed | **Complete:** JWT and the administrator, actuary, model developer, reviewer, and read-only permission matrix are enforced |
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
@@ -31,7 +31,7 @@ it is considered complete.
   - Build coverage for database connectivity, migrations, model constraints,
     validation, authentication/authorization, API behavior, engine behavior,
     and golden policies.
-  - Current evidence: the clean Docker suite returned `257 passed, 12 skipped`
+  - Current evidence: the clean Docker suite returned `259 passed, 12 skipped`
     when the opt-in PostgreSQL URL was absent; all 11 PostgreSQL
     migration/concurrency tests passed separately on a disposable PostgreSQL 15
     database.

@@ -1,12 +1,14 @@
 """Governed upload → preview → map → validate → commit → approve lifecycle."""
 
 import json
+import mimetypes
 import tempfile
 import uuid
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from sqlalchemy.orm import Session
 
@@ -64,7 +66,7 @@ TRANSFORMS = {None, "", "strip", "upper", "lower", "integer", "number", "date_is
 
 
 def _event(db: Session, row: ImportSession, user: Any, action: str,
-           details: dict[str, Any] | None = None) -> None:
+           details: dict[str, Any] | None = None, before_status: str | None = None) -> None:
     details = details or {}
     db.add(ImportSessionEvent(
         import_session_id=row.id, action=action, actor_user_id=user.id, details=details,
@@ -72,6 +74,7 @@ def _event(db: Session, row: ImportSession, user: Any, action: str,
     record_audit(
         db, actor_user_id=user.id, action=f"import_session.{action}",
         entity_type="import_session", entity_id=row.id,
+        before_state={"status": before_status} if before_status is not None else None,
         after_state={"status": row.status, "category": row.category, **details},
     )
 
@@ -187,6 +190,7 @@ def upload_file(db: Session, row: ImportSession, filename: str, content: bytes,
                 user: Any) -> dict[str, Any]:
     if row.status == "committed":
         raise conflict("A committed import session cannot accept another file.")
+    before_status = row.status
     try:
         file_format = detect_format(filename)
         rows = _parse_bytes(filename, content)
@@ -210,7 +214,7 @@ def upload_file(db: Session, row: ImportSession, filename: str, content: bytes,
     _event(db, row, user, "uploaded", {
         "filename": row.original_filename, "format": file_format,
         "row_count": len(rows), "raw_fingerprint": stored.checksum_sha256,
-    })
+    }, before_status)
     db.commit()
     return {
         **serialize_session(row), "file_id": row.id,
@@ -231,6 +235,17 @@ def preview(row: ImportSession, count: int) -> dict[str, Any]:
         "detected_types": dict(row.detected_types or {}), "row_count": len(rows),
         "sample_rows": rows[:count], "raw_fingerprint": row.raw_fingerprint,
     }
+
+
+def raw_file(row: ImportSession) -> tuple[bytes, str, str]:
+    if not row.raw_storage_uri or not row.original_filename:
+        raise conflict("Upload a file before downloading it.")
+    media_type = mimetypes.guess_type(row.original_filename)[0] or "application/octet-stream"
+    return get_artifact_store().read_bytes(row.raw_storage_uri), row.original_filename, media_type
+
+
+def content_disposition(filename: str) -> str:
+    return f"attachment; filename*=UTF-8''{quote(filename, safe='')}"
 
 
 def serialize_profile(row: MappingProfile) -> dict[str, Any]:
@@ -295,6 +310,7 @@ def set_mapping(db: Session, row: ImportSession, payload: dict[str, Any], user: 
         raise conflict("A committed import session is immutable.")
     if not row.raw_storage_uri:
         raise conflict("Upload a file before mapping it.")
+    before_status = row.status
     profile_id, fields = payload.get("profile_id"), payload.get("fields")
     if bool(profile_id) == bool(fields):
         raise ServiceError(422, "VALIDATION_ERROR", "Provide either profile_id or fields.")
@@ -316,7 +332,7 @@ def set_mapping(db: Session, row: ImportSession, payload: dict[str, Any], user: 
     db.flush()
     _event(db, row, user, "mapped", {
         "profile_id": row.mapping_profile_id, "field_count": len(fields),
-    })
+    }, before_status)
     db.commit()
     return serialize_session(row)
 
@@ -504,18 +520,18 @@ def _validate_scenario(db: Session, row: ImportSession, rows: list[dict[str, Any
             target = f"{item.get('scenario_name', '')}:{item.get('target_variable', '')}"
             for prior_start, prior_end, prior_row in intervals[target]:
                 if start <= prior_end and prior_start <= end:
-                    issues.append(_issue("error", "OVERLAPPING_OVERRIDE",
+                    issues.append(_issue("error", "SCENARIO_OVERRIDE_OVERLAP",
                                          f"Override overlaps row {prior_row}.", number,
                                          "target_variable", target))
             intervals[target].append((start, end, number))
         if definitions:
             definition = definitions.get(str(item.get("target_variable", "")))
             if definition is None:
-                issues.append(_issue("error", "VARIABLE_NOT_DEFINED",
+                issues.append(_issue("error", "SCENARIO_TARGET_UNKNOWN",
                                      "Scenario target is not defined by the model version.", number,
                                      "target_variable", item.get("target_variable")))
             elif not definition.allow_scenario_override:
-                issues.append(_issue("error", "SCENARIO_OVERRIDE_FORBIDDEN",
+                issues.append(_issue("error", "SCENARIO_TARGET_NOT_OVERRIDABLE",
                                      "The model version does not allow this override.", number,
                                      "target_variable", item.get("target_variable")))
 
@@ -540,6 +556,7 @@ def _canonical_fingerprint(category: str, rows: list[dict[str, Any]]) -> tuple[s
 def validate_session(db: Session, row: ImportSession, user: Any) -> dict[str, Any]:
     if row.status not in {"mapped", "validated", "needs_review", "invalid"}:
         raise conflict("Upload and map the file before validation.")
+    before_status = row.status
     mapped, issues = _mapped_rows(row)
     if not mapped:
         issues.append(_issue("error", "EMPTY_FILE", "The uploaded file contains no records."))
@@ -600,7 +617,7 @@ def validate_session(db: Session, row: ImportSession, user: Any) -> dict[str, An
         "validation_run_id": validation.id, "errors": len(errors), "warnings": len(warnings),
         "accepted": len(accepted), "rejected": len(rejected_numbers),
         "canonical_fingerprint": canonical_fingerprint,
-    })
+    }, before_status)
     db.commit()
     return serialize_validation(validation)
 
@@ -705,6 +722,7 @@ def commit_session(db: Session, row: ImportSession, user: Any) -> dict[str, Any]
         raise conflict("This import session has already been committed.")
     if row.status not in {"validated", "needs_review"}:
         raise conflict("A session with validation errors cannot be committed.")
+    before_status = row.status
     validation = _latest_validation(db, row)
     if validation.status != "passed" or not validation.canonical_storage_uri:
         raise conflict("The latest validation did not produce a committable dataset.")
@@ -780,7 +798,7 @@ def commit_session(db: Session, row: ImportSession, user: Any) -> dict[str, Any]
         "dataset_ids": [item.id for item in datasets],
         "version_number": dataset.version_number,
         "canonical_fingerprint": validation.canonical_fingerprint,
-    })
+    }, before_status)
     for item in datasets:
         record_audit(db, actor_user_id=user.id, action="dataset.committed",
                      entity_type=f"{kind}_dataset", entity_id=item.id,

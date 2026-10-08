@@ -154,3 +154,19 @@ def test_project_viewer_cannot_cancel_or_retry(env):
     viewer = env.user("run-viewer@example.com", role="actuary", memberships={"A": "viewer"})
     assert post(env, f"/runs/{run_id}/cancel", viewer["headers"]).status_code == 403
     assert env.run(run_id).status == run_state.PENDING
+    assert post(env, f"/runs/{run_id}/cancel").status_code == 202
+    assert post(env, f"/runs/{run_id}/retry", viewer["headers"]).status_code == 403
+
+    env.seed("B")
+    other_run = env.submit("B", ["Base"])["by_scenario"]["Base"]
+    editor = env.user("project-a-editor@example.com", memberships={"A": "editor"})
+    assert post(env, f"/runs/{other_run}/cancel", editor["headers"]).status_code == 404
+    assert post(env, f"/runs/{other_run}/retry", editor["headers"]).status_code == 404
+
+
+def test_mixed_success_and_cancelled_run_set_is_partial_success(env):
+    submitted = env.submit("A", ["Base", "Low Interest Rate"])
+    assert post(env, f"/runs/{submitted['by_scenario']['Base']}/cancel").status_code == 202
+    env.execute(submitted)
+    with env.Session() as db:
+        assert db.get(RunSet, submitted["run_set"]["id"]).status == "partial_success"

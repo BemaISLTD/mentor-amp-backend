@@ -2,7 +2,7 @@
 
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Query, Response, UploadFile, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -81,6 +81,17 @@ def preview_import(session_id: str, user: ImportReader, rows: int = Query(20, ge
                    db: Session = Depends(get_db)):
     row = service.require_session_access(db, user, session_id)
     return service.preview(row, rows)
+
+
+@router.get("/import-sessions/{session_id}/file")
+def download_import_file(session_id: str, user: ImportReader, db: Session = Depends(get_db)):
+    row = service.require_session_access(db, user, session_id)
+    content, filename, media_type = service.raw_file(row)
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": service.content_disposition(filename)},
+    )
 
 
 @router.put("/import-sessions/{session_id}/mapping")
