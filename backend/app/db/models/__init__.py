@@ -7,9 +7,36 @@ from app.db.models.scenario import ScenarioSet, ScenarioTable  # noqa: F401
 from app.db.models.variable import VariableRegistry  # noqa: F401
 from app.db.models.formula import FormulaRegistry  # noqa: F401
 from app.db.models.formula_dependency import FormulaDependency  # noqa: F401
+from app.db.models.modeling import (  # noqa: F401
+    FormulaGroup,
+    Model,
+    ModelPublishedOutput,
+    ModelVersion,
+)
+from app.db.models.projection import ProjectionSet, RunEvent, RunSet  # noqa: F401
 from app.db.models.run import Run  # noqa: F401
-from app.db.models.run_output import RunOutput  # noqa: F401
-from app.db.models.trace_log import TraceLog  # noqa: F401
+from app.db.models.audit_log import AuditLog  # noqa: F401
+from app.db.models.run_artifact import RunArtifact, RunManifest  # noqa: F401
+from app.db.models.product import AssetPosition, Product, ProductMapping  # noqa: F401
+from app.db.models.run_package import RunAttempt, RunPackage  # noqa: F401
+from app.db.models.project_member import ProjectMember  # noqa: F401
+from app.db.models.model_variable import ModelVariableDefinition  # noqa: F401
+from app.db.models.governance import (  # noqa: F401
+    DerivedDataset,
+    Report,
+    RollforwardJob,
+    RollforwardStep,
+    RollforwardTemplate,
+    RunStep,
+)
+from app.db.models.data_manager import (  # noqa: F401
+    ImportSession,
+    ImportSessionEvent,
+    MappingProfile,
+    RejectedRecord,
+    ValidationIssue,
+    ValidationRun,
+)
 from app.db.models.user import (  # noqa: F401
     Permission,
     Role,

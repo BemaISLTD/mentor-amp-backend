@@ -66,7 +66,10 @@ class VariableDefinition(BaseModel):
     id: str
     name: str
     label: Optional[str] = None
-    kind: Literal["input", "assumption", "factor", "formula", "output", "lookup", "manual", "prior_output", "scenario"] = "input"
+    kind: Literal[
+        "input", "assumption", "factor", "formula", "output", "lookup", "manual", "prior_output", "scenario",
+        "context", "valuation",
+    ] = "input"
     data_type: Literal["number", "string", "boolean", "date", "vector", "table"] = "number"
     source: Optional[dict] = None
     dependencies: list[str] = Field(default_factory=list)
@@ -88,7 +91,8 @@ class FormulaDefinition(BaseModel):
     product_applicability: list[str] = Field(default_factory=list)
     basis_applicability: list[str] = Field(default_factory=list)
     version: str = "v1"
-    status: Literal["draft", "active", "deprecated"] = "draft"
+    # Legacy statuses plus the lifecycle statuses M1 formulas use (app.core.lifecycle).
+    status: Literal["draft", "active", "deprecated", "needs_review", "validated", "approved"] = "draft"
     test_case_ids: list[str] = Field(default_factory=list)
 
 
@@ -249,6 +253,11 @@ class ProjectResponse(BaseModel):
     id: str
     name: str
     description: Optional[str] = None
+    created_by: Optional[str] = None
+    updated_by: Optional[str] = None
+    archived_by: Optional[str] = None
+    archive_reason: Optional[str] = None
+    archived_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
     model_config = {"from_attributes": True}
@@ -257,6 +266,10 @@ class ProjectResponse(BaseModel):
 class ProjectUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     description: Optional[str] = None
+
+
+class ProjectArchive(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=1000)
 
 
 class ProjectListResponse(BaseModel):
@@ -268,6 +281,25 @@ class ImportPreviewResponse(BaseModel):
     columns: list[str] = Field(default_factory=list)
     row_count: int = 0
     sample_rows: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class InforceRecordResponse(BaseModel):
+    id: int
+    policy_id: str
+    data: dict[str, Any]
+    created_at: datetime
+    model_config = {"from_attributes": True}
+
+
+class InforceRecordListResponse(BaseModel):
+    file_id: str
+    filename: str
+    columns: list[str] = Field(default_factory=list)
+    records: list[InforceRecordResponse] = Field(default_factory=list)
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
 
 
 class RunStatusResponse(BaseModel):

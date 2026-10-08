@@ -1,6 +1,7 @@
 """Base importer — format detection, parsing, validation, and storage."""
 
 import os
+import polars as pl
 from pathlib import Path
 from typing import Any, Callable
 
@@ -10,7 +11,7 @@ from app.data.importers.excel_importer import parse_excel
 
 
 def detect_format(filename: str) -> str:
-    """Detect file format from extension. Returns 'tsv', 'csv', or 'xlsx'."""
+    """Detect an accepted tabular format from its extension."""
     ext = Path(filename).suffix.lower()
     if ext in (".tsv", ".tab"):
         return "tsv"
@@ -18,7 +19,9 @@ def detect_format(filename: str) -> str:
         return "csv"
     elif ext in (".xlsx", ".xls"):
         return "xlsx"
-    raise ValueError(f"Unsupported file format: {ext}. Supported: .tsv, .csv, .xlsx")
+    elif ext == ".parquet":
+        return "parquet"
+    raise ValueError(f"Unsupported file format: {ext}. Supported: .tsv, .csv, .xlsx, .parquet")
 
 
 def parse_file(file_path: str) -> list[dict]:
@@ -28,6 +31,7 @@ def parse_file(file_path: str) -> list[dict]:
         "tsv": parse_tsv,
         "csv": parse_csv,
         "xlsx": parse_excel,
+        "parquet": lambda path: pl.read_parquet(path).to_dicts(),
     }
     return parsers[fmt](file_path)
 
