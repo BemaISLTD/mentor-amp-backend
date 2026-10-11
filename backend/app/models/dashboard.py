@@ -16,11 +16,16 @@ class NamedValue(BaseModel):
     value: Decimal
 
 
+class CurrencyNamedValue(NamedValue):
+    currency: str
+
+
 class ProductValue(BaseModel):
     product_id: str
     code: str
     name: str
     product_type: str
+    currency: str
     market_value: Decimal
 
 
@@ -38,8 +43,7 @@ class DashboardStatsResponse(BaseModel):
     products_by_type: list[NamedCount] = Field(default_factory=list)
     products_by_status: list[NamedCount] = Field(default_factory=list)
     asset_as_of_date: date | None = None
-    total_market_value: Decimal = Decimal("0")
-    assets_by_class: list[NamedValue] = Field(default_factory=list)
+    assets_by_class: list[CurrencyNamedValue] = Field(default_factory=list)
     product_mix: list[ProductValue] = Field(default_factory=list)
     currency_totals: list[NamedValue] = Field(default_factory=list)
     run_count: int

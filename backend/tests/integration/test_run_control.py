@@ -8,6 +8,8 @@ from app.db.models.run import Run
 from app.db.models.run_package import RunAttempt, RunPackage
 from app.db.models.user import User
 from app.services import run_control_service, run_execution_service, run_package_verification
+from app.services.common import now_utc
+from app.services.run_finalization import TerminalOutcome, finalize_attempt, record_intended_outcome
 from app.services.run_execution_service import claim_run
 
 from .wp1_support import Env
@@ -112,6 +114,9 @@ def test_failed_run_retry_reuses_frozen_configuration_and_succeeds(env, monkeypa
     response = post(env, f"/runs/{source_id}/retry")
     assert response.status_code == 202, response.text
     retry_id = response.json()["id"]
+    repeated = post(env, f"/runs/{source_id}/retry")
+    assert repeated.status_code == 202
+    assert repeated.json()["id"] == retry_id
     retried = env.run(retry_id)
     assert retried.status == "success"
     assert retried.retried_from_run_id == source_id
@@ -126,7 +131,7 @@ def test_failed_run_retry_reuses_frozen_configuration_and_succeeds(env, monkeypa
         assert retry_package.package["identity"]["frozen_for_run_id"] == retry_id
         assert retry_package.fingerprint == source_package.fingerprint
         assert db.get(RunSet, source.run_set_id).status == "partial_success"
-    assert env.summary(retry_id)["headline"]["value"] == pytest.approx(893043.9157255866)
+    assert env.summary(retry_id)["headline"]["value"] == 893043.9157255866
 
 
 def test_retry_refuses_success_and_changed_build(env, monkeypatch):
@@ -168,5 +173,60 @@ def test_mixed_success_and_cancelled_run_set_is_partial_success(env):
     submitted = env.submit("A", ["Base", "Low Interest Rate"])
     assert post(env, f"/runs/{submitted['by_scenario']['Base']}/cancel").status_code == 202
     env.execute(submitted)
+    low_id = submitted["by_scenario"]["Low Interest Rate"]
+    assert env.summary(low_id)["headline"]["value"] == 906298.662195956
     with env.Session() as db:
         assert db.get(RunSet, submitted["run_set"]["id"]).status == "partial_success"
+
+
+def terminal_success(run_id: str, attempt: RunAttempt) -> TerminalOutcome:
+    return TerminalOutcome(
+        run_id=run_id,
+        attempt_id=attempt.id,
+        attempt_number=attempt.attempt_number,
+        status=run_state.SUCCESS,
+        completed_at=now_utc().isoformat(),
+        output_row_count=10,
+        trace_row_count=2,
+        cleanup_status="not_needed",
+        summary={"status": "success", "complete": True, "headline": {"value": 1}, "totals": {}},
+        event_step="complete",
+        event_message="Run completed successfully.",
+        event_data={"status": "success", "attempt_number": attempt.attempt_number},
+    )
+
+
+def test_cancel_committed_before_finalizer_wins_terminal_race(env):
+    run_id = env.submit("A", ["Base"])["by_scenario"]["Base"]
+    with env.Session() as worker:
+        attempt = claim_run(worker, run_id, "race-worker")
+        outcome = terminal_success(run_id, attempt)
+        record_intended_outcome(worker, outcome)
+
+    response = post(env, f"/runs/{run_id}/cancel")
+    assert response.status_code == 202
+
+    with env.Session() as finalizer:
+        result = finalize_attempt(finalizer, outcome)
+        assert result.run_status == run_state.CANCELLED
+    run = env.run(run_id)
+    assert run.status == run_state.CANCELLED
+    assert run.accepted_attempt_number is None
+    manifest = env.get(f"/runs/{run_id}/manifest").json()["final_manifest"]["manifest"]
+    assert manifest["runtime"]["status"] == run_state.CANCELLED
+    assert manifest["runtime"]["accepted_attempt_number"] is None
+    assert env.get(f"/runs/{run_id}/results").status_code == 409
+
+
+def test_finalizer_committed_before_cancel_wins_terminal_race(env):
+    run_id = env.submit("A", ["Base"])["by_scenario"]["Base"]
+    with env.Session() as worker:
+        attempt = claim_run(worker, run_id, "race-worker")
+        outcome = terminal_success(run_id, attempt)
+        record_intended_outcome(worker, outcome)
+        assert finalize_attempt(worker, outcome).run_status == run_state.SUCCESS
+
+    response = post(env, f"/runs/{run_id}/cancel")
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "RUN_NOT_CANCELLABLE"
+    assert env.run(run_id).status == run_state.SUCCESS

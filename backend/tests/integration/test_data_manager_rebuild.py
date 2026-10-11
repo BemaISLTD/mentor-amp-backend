@@ -67,12 +67,9 @@ def test_uploaded_files_reproduce_the_spia_golden_reserves(env):
     reviewer = env.user(
         "file-reviewer@example.com", role="reviewer", memberships={"A": "viewer"},
     )
-    seeded_run_set = env.submit("A", ["Base", "Low Interest Rate"])
+    seeded_run_set = env.submit("A", ["Base"])
     env.execute(seeded_run_set)
     seeded_base = env.summary(seeded_run_set["by_scenario"]["Base"])["headline"]["value"]
-    seeded_low = env.summary(
-        seeded_run_set["by_scenario"]["Low Interest Rate"]
-    )["headline"]["value"]
     inforce_path = BACKEND.parent / "samples" / "spia" / "synthetic_spia_inforce.csv"
     mortality_path = BACKEND.parent / "samples" / "spia" / "synthetic_mortality_gompertz.csv"
     inforce_fields = [{"source_column": field, "target_field": field} for field in (
@@ -153,12 +150,11 @@ def test_uploaded_files_reproduce_the_spia_golden_reserves(env):
         f"/runs/{runs['Low Interest Rate (file)']}/aggregates",
         variables="reserve", month_from=0, month_to=0,
     ).json()["rows"]
-    # The file-only rebuild must be bit-identical to the correction-pass seed path in the same
-    # runtime. The published decimal renderings can differ by a few ULPs across libm versions.
+    # The file-only rebuild and the published correction-pass references are exact contracts.
     assert base_rows[0]["values"]["reserve"] == seeded_base
-    assert low_rows[0]["values"]["reserve"] == seeded_low
-    assert seeded_base == pytest.approx(4889731.244841259, rel=0, abs=5e-9)
-    assert seeded_low == pytest.approx(5541437.408305269, rel=0, abs=5e-9)
+    assert base["totals"]["expected_payment"]["value"] == 7419301.206836598
+    assert seeded_base == 4889731.244841259
+    assert low_rows[0]["values"]["reserve"] == 5541437.408305269
     assert base["headline"]["value"] == base_rows[0]["values"]["reserve"]
     assert low["headline"]["value"] == low_rows[0]["values"]["reserve"]
 

@@ -2,6 +2,7 @@
 
 import json
 import mimetypes
+import os
 import tempfile
 import uuid
 from collections import defaultdict
@@ -10,10 +11,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core import lifecycle
-from app.core.artifacts import get_artifact_store
+from app.core.artifacts import (
+    get_artifact_store,
+    verified_artifact_bytes,
+    verified_parquet_rows,
+)
 from app.core.audit import record_audit
 from app.core.execution.fingerprints import (
     DATA_MANAGER_INFORCE_FINGERPRINT_SCHEME,
@@ -21,10 +27,12 @@ from app.core.execution.fingerprints import (
     scenario_fingerprint, table_fingerprint,
 )
 from app.core.project_lifecycle import require_active_project
-from app.data.importers.base import detect_format, parse_file
+from app.config import settings
+from app.data.importers.base import ImportLimitError, detect_format, parse_file
 from app.db.models.assumption import AssumptionSet, AssumptionTable
 from app.db.models.data_manager import (
     ImportSession,
+    ImportSessionDataset,
     ImportSessionEvent,
     MappingProfile,
     RejectedRecord,
@@ -63,6 +71,7 @@ SCENARIO_FIELDS = {
 }
 VALID_OPERATIONS = {"set", "add", "subtract", "multiply", "percent_change"}
 TRANSFORMS = {None, "", "strip", "upper", "lower", "integer", "number", "date_iso"}
+DATA_MANAGER_ARTIFACT_SCHEMAS = frozenset({"data-manager-v1"})
 
 
 def _event(db: Session, row: ImportSession, user: Any, action: str,
@@ -99,7 +108,14 @@ def require_session_access(db: Session, user: Any, session_id: str, *, write: bo
     return row
 
 
-def serialize_session(row: ImportSession) -> dict[str, Any]:
+def serialize_session(row: ImportSession, db: Session | None = None) -> dict[str, Any]:
+    datasets = (
+        db.query(ImportSessionDataset)
+        .filter(ImportSessionDataset.import_session_id == row.id)
+        .order_by(ImportSessionDataset.id)
+        .all()
+        if db is not None else []
+    )
     return {
         "id": row.id, "project_id": row.project_id, "category": row.category,
         "name": row.name, "version_label": row.version_label,
@@ -113,6 +129,11 @@ def serialize_session(row: ImportSession) -> dict[str, Any]:
         "updated_by": row.updated_by, "committed_by": row.committed_by,
         "committed_at": iso(row.committed_at), "dataset_kind": row.dataset_kind,
         "dataset_id": row.dataset_id, "created_at": iso(row.created_at),
+        "datasets": [
+            {"kind": item.dataset_kind, "id": item.dataset_id}
+            for item in datasets
+        ],
+        "dataset_ids": [item.dataset_id for item in datasets],
         "updated_at": iso(row.updated_at),
     }
 
@@ -136,22 +157,32 @@ def create_session(db: Session, payload: dict[str, Any], user: Any) -> dict[str,
     _event(db, row, user, "opened", {"replaces_dataset_id": replaces})
     db.commit()
     db.refresh(row)
-    return serialize_session(row)
+    return serialize_session(row, db)
 
 
 def list_sessions(db: Session, project_id: str, category: str | None = None) -> list[dict[str, Any]]:
     query = db.query(ImportSession).filter(ImportSession.project_id == project_id)
     if category:
         query = query.filter(ImportSession.category == category)
-    return [serialize_session(row) for row in query.order_by(ImportSession.created_at.desc()).all()]
+    return [
+        serialize_session(row, db)
+        for row in query.order_by(ImportSession.created_at.desc()).all()
+    ]
 
 
 def _parse_bytes(filename: str, content: bytes) -> list[dict[str, Any]]:
     suffix = Path(filename).suffix
-    temporary = Path(tempfile.mkstemp(suffix=suffix)[1])
+    descriptor, path = tempfile.mkstemp(suffix=suffix)
+    os.close(descriptor)
+    temporary = Path(path)
     try:
         temporary.write_bytes(content)
-        return parse_file(str(temporary))
+        return parse_file(
+            str(temporary),
+            max_rows=settings.max_import_records,
+            max_columns=settings.max_import_columns,
+            max_xlsx_sheets=settings.max_import_xlsx_sheets,
+        )
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -186,16 +217,59 @@ def _detected_types(rows: list[dict[str, Any]], columns: list[str]) -> dict[str,
     return result
 
 
+def read_upload(stream) -> bytes:
+    """Read a spooled upload incrementally and stop before its memory budget."""
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := stream.read(1024 * 1024):
+        total += len(chunk)
+        if total > settings.max_import_upload_bytes:
+            raise ServiceError(
+                413,
+                "IMPORT_FILE_TOO_LARGE",
+                f"Upload exceeds the {settings.max_import_upload_bytes}-byte limit.",
+                {"max_bytes": settings.max_import_upload_bytes},
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def upload_file(db: Session, row: ImportSession, filename: str, content: bytes,
                 user: Any) -> dict[str, Any]:
     if row.status == "committed":
         raise conflict("A committed import session cannot accept another file.")
     before_status = row.status
+    if len(content) > settings.max_import_upload_bytes:
+        raise ServiceError(
+            413,
+            "IMPORT_FILE_TOO_LARGE",
+            f"Upload exceeds the {settings.max_import_upload_bytes}-byte limit.",
+            {"max_bytes": settings.max_import_upload_bytes},
+        )
     try:
         file_format = detect_format(filename)
-        rows = _parse_bytes(filename, content)
     except ValueError as error:
         raise ServiceError(400, "UNSUPPORTED_FILE_FORMAT", str(error)) from error
+    try:
+        rows = _parse_bytes(filename, content)
+    except ImportLimitError as error:
+        raise ServiceError(
+            413,
+            "IMPORT_LIMIT_EXCEEDED",
+            str(error),
+            {
+                "max_records": settings.max_import_records,
+                "max_columns": settings.max_import_columns,
+                "max_xlsx_sheets": settings.max_import_xlsx_sheets,
+            },
+        ) from error
+    except Exception as error:
+        raise ServiceError(
+            400,
+            "MALFORMED_IMPORT_FILE",
+            "The uploaded file could not be parsed.",
+            {"format": file_format, "reason": type(error).__name__},
+        ) from error
     columns = list(rows[0].keys()) if rows else []
     stored = get_artifact_store().write_bytes(row.id, "raw", filename, content)
     row.original_filename = Path(filename.replace("\\", "/")).name
@@ -217,7 +291,7 @@ def upload_file(db: Session, row: ImportSession, filename: str, content: bytes,
     }, before_status)
     db.commit()
     return {
-        **serialize_session(row), "file_id": row.id,
+        **serialize_session(row, db), "file_id": row.id,
         "preview": rows[:20],
     }
 
@@ -225,7 +299,14 @@ def upload_file(db: Session, row: ImportSession, filename: str, content: bytes,
 def _raw_rows(row: ImportSession) -> list[dict[str, Any]]:
     if not row.raw_storage_uri or not row.original_filename:
         raise conflict("Upload a file before this operation.")
-    return _parse_bytes(row.original_filename, get_artifact_store().read_bytes(row.raw_storage_uri))
+    store = get_artifact_store()
+    content = verified_artifact_bytes(
+        store,
+        row.raw_storage_uri,
+        row.raw_fingerprint,
+        expected_size=row.raw_size_bytes,
+    )
+    return _parse_bytes(row.original_filename, content)
 
 
 def preview(row: ImportSession, count: int) -> dict[str, Any]:
@@ -241,7 +322,14 @@ def raw_file(row: ImportSession) -> tuple[bytes, str, str]:
     if not row.raw_storage_uri or not row.original_filename:
         raise conflict("Upload a file before downloading it.")
     media_type = mimetypes.guess_type(row.original_filename)[0] or "application/octet-stream"
-    return get_artifact_store().read_bytes(row.raw_storage_uri), row.original_filename, media_type
+    store = get_artifact_store()
+    content = verified_artifact_bytes(
+        store,
+        row.raw_storage_uri,
+        row.raw_fingerprint,
+        expected_size=row.raw_size_bytes,
+    )
+    return content, row.original_filename, media_type
 
 
 def content_disposition(filename: str) -> str:
@@ -334,7 +422,7 @@ def set_mapping(db: Session, row: ImportSession, payload: dict[str, Any], user: 
         "profile_id": row.mapping_profile_id, "field_count": len(fields),
     }, before_status)
     db.commit()
-    return serialize_session(row)
+    return serialize_session(row, db)
 
 
 def _transform(value: Any, transform: str | None) -> Any:
@@ -472,11 +560,150 @@ def _table_options(row: ImportSession, rows: list[dict[str, Any]]) -> tuple[list
     return lookup_keys, value_column
 
 
-def _validate_table(row: ImportSession, rows: list[dict[str, Any]],
+def _model_context(
+    db: Session,
+    row: ImportSession,
+    issues: list[dict[str, Any]],
+    *,
+    required: bool,
+) -> tuple[list[ModelVariableDefinition], bool]:
+    options = row.options or {}
+    model_version_id = options.get("model_version_id")
+    if not model_version_id:
+        if required and not options.get("structural_only"):
+            issues.append(_issue(
+                "error",
+                "MODEL_CONTEXT_REQUIRED",
+                "Select a model version for execution-ready validation, or explicitly "
+                "request structural_only validation.",
+                column="model_version_id",
+            ))
+        elif required:
+            issues.append(_issue(
+                "warning",
+                "MODEL_COMPATIBILITY_NOT_RUN",
+                "Only structural validation ran; model compatibility was not checked.",
+                column="model_version_id",
+            ))
+        return [], False
+    if access.project_id_of(db, "model_version", model_version_id) != row.project_id:
+        issues.append(_issue(
+            "error",
+            "MODEL_VERSION_NOT_FOUND",
+            "The selected model version was not found in this project.",
+            column="model_version_id",
+            value=model_version_id,
+        ))
+        return [], False
+    return db.query(ModelVariableDefinition).filter(
+        ModelVariableDefinition.model_version_id == model_version_id
+    ).all(), True
+
+
+def _source_lookup_keys(source: dict[str, Any]) -> list[str]:
+    configured = source.get("key_map") or source.get("lookup_keys") or {}
+    if isinstance(configured, dict):
+        return list(configured)
+    return list(configured)
+
+
+def _validate_table(db: Session, row: ImportSession, rows: list[dict[str, Any]],
                     issues: list[dict[str, Any]]) -> None:
     keys, value_column = _table_options(row, rows)
+    definitions, context_valid = _model_context(
+        db, row, issues, required=False
+    )
+    value_kind = "number"
+    if context_valid:
+        expected_kind = (
+            "assumption" if row.category == "assumption_table" else "factor"
+        )
+        candidates = [
+            definition for definition in definitions
+            if definition.kind == expected_kind
+        ]
+        table_names = sorted({
+            str((definition.source or {}).get("table"))
+            for definition in candidates
+            if (definition.source or {}).get("table")
+        })
+        matching = [
+            definition for definition in candidates
+            if (definition.source or {}).get("table") == row.name
+        ]
+        if row.name not in table_names:
+            issues.append(_issue(
+                "error",
+                "MODEL_TABLE_IDENTITY_MISMATCH",
+                f"The model version does not require {expected_kind} table '{row.name}'.",
+                column="name",
+                value={"actual": row.name, "expected": table_names},
+            ))
+        elif matching:
+            expected_keys = sorted({
+                key
+                for definition in matching
+                for key in _source_lookup_keys(dict(definition.source or {}))
+            })
+            if sorted(keys) != expected_keys:
+                issues.append(_issue(
+                    "error",
+                    "MODEL_LOOKUP_KEYS_MISMATCH",
+                    "Lookup keys do not match the selected model version.",
+                    column="lookup_keys",
+                    value={"actual": sorted(keys), "expected": expected_keys},
+                ))
+            expected_columns = sorted({
+                str((definition.source or {}).get("value_column"))
+                for definition in matching
+                if (definition.source or {}).get("value_column")
+            })
+            if expected_columns and (
+                len(expected_columns) != 1 or value_column != expected_columns[0]
+            ):
+                issues.append(_issue(
+                    "error",
+                    "MODEL_VALUE_COLUMN_MISMATCH",
+                    "The value column does not match the selected model version.",
+                    column="value_column",
+                    value={"actual": value_column, "expected": expected_columns},
+                ))
+            expected_types = sorted({definition.data_type for definition in matching})
+            if len(expected_types) == 1:
+                value_kind = {
+                    "float": "number", "decimal": "number", "number": "number",
+                    "int": "integer", "integer": "integer", "string": "string",
+                }.get(expected_types[0], "number")
+            elif len(expected_types) > 1:
+                issues.append(_issue(
+                    "error",
+                    "MODEL_VALUE_TYPE_CONFLICT",
+                    "Model variables require incompatible value types for this table.",
+                    column="value_column",
+                    value=expected_types,
+                ))
+            declared_unit = (row.options or {}).get("value_unit")
+            expected_units = sorted({
+                definition.unit for definition in matching if definition.unit
+            })
+            if declared_unit and expected_units and declared_unit not in expected_units:
+                issues.append(_issue(
+                    "error",
+                    "MODEL_UNIT_MISMATCH",
+                    "The declared table unit does not match the selected model version.",
+                    column="value_unit",
+                    value={"actual": declared_unit, "expected": expected_units},
+                ))
+            elif expected_units and not declared_unit:
+                issues.append(_issue(
+                    "warning",
+                    "MODEL_UNIT_NOT_DECLARED",
+                    "Declare value_unit to complete the provisional model unit check.",
+                    column="value_unit",
+                    value={"expected": expected_units},
+                ))
     spec = {key: "string" for key in keys}
-    spec[value_column] = "number"
+    spec[value_column] = value_kind
     _required_and_types(rows, spec, issues)
     issues.extend(_duplicate_issues(rows, keys))
     probability = value_column.lower() in {"qx", "mortality_rate", "lapse_rate", "probability"}
@@ -496,16 +723,10 @@ def _validate_table(row: ImportSession, rows: list[dict[str, Any]],
 def _validate_scenario(db: Session, row: ImportSession, rows: list[dict[str, Any]],
                        issues: list[dict[str, Any]]) -> None:
     _required_and_types(rows, SCENARIO_FIELDS, issues)
-    model_version_id = (row.options or {}).get("model_version_id")
-    definitions: dict[str, ModelVariableDefinition] = {}
-    if model_version_id:
-        if access.project_id_of(db, "model_version", model_version_id) != row.project_id:
-            issues.append(_issue("error", "MODEL_VERSION_NOT_FOUND",
-                                 "The selected model version was not found in this project."))
-        else:
-            definitions = {item.variable_name: item for item in db.query(ModelVariableDefinition).filter(
-                ModelVariableDefinition.model_version_id == model_version_id
-            ).all()}
+    definition_rows, context_valid = _model_context(
+        db, row, issues, required=True
+    )
+    definitions = {item.variable_name: item for item in definition_rows}
     intervals: dict[str, list[tuple[int, int, int]]] = defaultdict(list)
     for number, item in enumerate(rows, start=1):
         operation = str(item.get("operation", ""))
@@ -524,7 +745,7 @@ def _validate_scenario(db: Session, row: ImportSession, rows: list[dict[str, Any
                                          f"Override overlaps row {prior_row}.", number,
                                          "target_variable", target))
             intervals[target].append((start, end, number))
-        if definitions:
+        if context_valid:
             definition = definitions.get(str(item.get("target_variable", "")))
             if definition is None:
                 issues.append(_issue("error", "SCENARIO_TARGET_UNKNOWN",
@@ -567,13 +788,30 @@ def validate_session(db: Session, row: ImportSession, user: Any) -> dict[str, An
     if row.category == "liability_inforce":
         _validate_inforce(row, mapped, issues)
     elif row.category in {"assumption_table", "factor_table"}:
-        _validate_table(row, mapped, issues)
+        _validate_table(db, row, mapped, issues)
     else:
         _validate_scenario(db, row, mapped, issues)
 
+    all_rejected_numbers = sorted({
+        issue["row_number"] for issue in issues
+        if issue["severity"] == "error" and issue["row_number"] is not None
+    })
+    retained_rejected_numbers = all_rejected_numbers[:settings.max_rejected_records]
+    if len(all_rejected_numbers) > len(retained_rejected_numbers):
+        issues.append(_issue(
+            "warning",
+            "REJECTED_RECORDS_TRUNCATED",
+            f"Only the first {settings.max_rejected_records} rejected records were retained.",
+            value={
+                "rejected_count": len(all_rejected_numbers),
+                "retained_count": len(retained_rejected_numbers),
+            },
+        ))
     errors = [issue for issue in issues if issue["severity"] == "error"]
     warnings = [issue for issue in issues if issue["severity"] == "warning"]
-    rejected_numbers = {issue["row_number"] for issue in errors if issue["row_number"] is not None}
+    rejected_numbers = {
+        issue["row_number"] for issue in errors if issue["row_number"] is not None
+    }
     accepted = _canonical_order(
         row.category,
         [item for number, item in enumerate(mapped, start=1) if number not in rejected_numbers],
@@ -589,6 +827,9 @@ def validate_session(db: Session, row: ImportSession, user: Any) -> dict[str, An
         import_session_id=row.id, status="invalid" if errors else "passed",
         error_count=len(errors), warning_count=len(warnings), accepted_count=len(accepted),
         rejected_count=len(rejected_numbers), canonical_storage_uri=canonical_uri,
+        canonical_checksum_sha256=canonical.checksum_sha256 if accepted else None,
+        canonical_row_count=canonical.row_count if accepted else None,
+        canonical_schema_version="data-manager-v1" if accepted else None,
         canonical_fingerprint=canonical_fingerprint, fingerprint_scheme=scheme,
         created_by=user.id, completed_at=now_utc(),
     )
@@ -600,16 +841,20 @@ def validate_session(db: Session, row: ImportSession, user: Any) -> dict[str, An
             message=issue["message"], row_number=issue["row_number"],
             column_name=issue["column_name"], value=issue["value"],
         ))
-    if rejected_numbers:
+    if retained_rejected_numbers:
         rejected_rows = [{
             "row_number": number, "raw_json": json.dumps(_raw_rows(row)[number - 1], default=str),
             "canonical_json": json.dumps(mapped[number - 1], default=str),
-        } for number in sorted(rejected_numbers)]
+        } for number in retained_rejected_numbers]
         artifact = get_artifact_store().write_rows(row.id, "rejected", rejected_rows)
-        for number in sorted(rejected_numbers):
+        for number in retained_rejected_numbers:
             reasons = [issue for issue in errors if issue["row_number"] == number]
             db.add(RejectedRecord(validation_run_id=validation.id, row_number=number,
-                                  storage_uri=artifact.uri, reasons=reasons))
+                                  storage_uri=artifact.uri,
+                                  checksum_sha256=artifact.checksum_sha256,
+                                  artifact_row_count=artifact.row_count,
+                                  artifact_schema_version="data-manager-v1",
+                                  reasons=reasons))
     row.status = "invalid" if errors else ("needs_review" if warnings else "validated")
     row.updated_by = user.id
     db.flush()
@@ -652,16 +897,28 @@ def require_validation_access(db: Session, user: Any, validation_id: str) -> Val
     return validation
 
 
-def rejected_records(db: Session, validation_id: str) -> list[dict[str, Any]]:
-    records = db.query(RejectedRecord).filter(
+def rejected_records(
+    db: Session, validation_id: str, *, limit: int, offset: int
+) -> tuple[int, list[dict[str, Any]]]:
+    query = db.query(RejectedRecord).filter(
         RejectedRecord.validation_run_id == validation_id
-    ).order_by(RejectedRecord.row_number).all()
+    )
+    total = query.count()
+    records = query.order_by(RejectedRecord.row_number).offset(offset).limit(limit).all()
     artifact_cache: dict[str, dict[int, dict[str, Any]]] = {}
     result = []
     for record in records:
         if record.storage_uri not in artifact_cache:
             artifact_cache[record.storage_uri] = {
-                int(item["row_number"]): item for item in get_artifact_store().read_rows(record.storage_uri)
+                int(item["row_number"]): item
+                for item in verified_parquet_rows(
+                    get_artifact_store(),
+                    record.storage_uri,
+                    record.checksum_sha256,
+                    record.artifact_row_count,
+                    record.artifact_schema_version,
+                    supported_schemas=DATA_MANAGER_ARTIFACT_SCHEMAS,
+                )
             }
         artifact = artifact_cache[record.storage_uri].get(record.row_number, {})
         result.append({
@@ -670,7 +927,7 @@ def rejected_records(db: Session, validation_id: str) -> list[dict[str, Any]]:
             "canonical_record": json.loads(artifact.get("canonical_json", "{}")),
             "reasons": list(record.reasons or []),
         })
-    return result
+    return total, result
 
 
 def _latest_validation(db: Session, row: ImportSession) -> ValidationRun:
@@ -708,6 +965,38 @@ def _version_metadata(predecessor: Any | None, session: ImportSession) -> dict[s
     }
 
 
+def _lock_predecessor(
+    db: Session,
+    kind: str,
+    dataset_id: str,
+    project_id: str,
+) -> Any:
+    model = DATASET_MODELS[kind]
+    predecessor = db.execute(
+        select(model).where(model.id == dataset_id).with_for_update()
+    ).scalar_one_or_none()
+    if (
+        predecessor is None
+        or _dataset_project(db, kind, predecessor) != project_id
+    ):
+        raise not_found(f"Dataset '{dataset_id}' not found.")
+    latest = db.query(func.max(model.version_number)).filter(
+        model.version_group_id == predecessor.version_group_id
+    ).scalar()
+    if latest != predecessor.version_number:
+        raise ServiceError(
+            409,
+            "STALE_DATASET_VERSION",
+            "A newer dataset version already exists; replace the latest version.",
+            {
+                "dataset_id": predecessor.id,
+                "version_number": predecessor.version_number,
+                "latest_version_number": latest,
+            },
+        )
+    return predecessor
+
+
 def _set(db: Session, model: type, project_id: str, name: str):
     row = db.query(model).filter(model.project_id == project_id, model.name == name).first()
     if row is None:
@@ -726,9 +1015,21 @@ def commit_session(db: Session, row: ImportSession, user: Any) -> dict[str, Any]
     validation = _latest_validation(db, row)
     if validation.status != "passed" or not validation.canonical_storage_uri:
         raise conflict("The latest validation did not produce a committable dataset.")
-    rows = get_artifact_store().read_rows(validation.canonical_storage_uri)
+    rows = verified_parquet_rows(
+        get_artifact_store(),
+        validation.canonical_storage_uri,
+        validation.canonical_checksum_sha256,
+        validation.canonical_row_count,
+        validation.canonical_schema_version,
+        supported_schemas=DATA_MANAGER_ARTIFACT_SCHEMAS,
+    )
     kind = CATEGORY_TO_KIND[row.category]
-    predecessor = _dataset(db, kind, row.replaces_dataset_id, row.project_id) if row.replaces_dataset_id else None
+    predecessor = (
+        _lock_predecessor(
+            db, kind, row.replaces_dataset_id, row.project_id
+        )
+        if row.replaces_dataset_id else None
+    )
     version = _version_metadata(predecessor, row)
     common = {
         **version, "status": lifecycle.NEEDS_REVIEW if validation.warning_count else lifecycle.VALIDATED,
@@ -792,6 +1093,14 @@ def commit_session(db: Session, row: ImportSession, user: Any) -> dict[str, Any]
     row.committed_at = now_utc()
     row.dataset_kind = kind
     row.dataset_id = dataset.id
+    db.add_all([
+        ImportSessionDataset(
+            import_session_id=row.id,
+            dataset_kind=kind,
+            dataset_id=item.id,
+        )
+        for item in datasets
+    ])
     db.flush()
     _event(db, row, user, "committed", {
         "dataset_kind": kind, "dataset_id": dataset.id,

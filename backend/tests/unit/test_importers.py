@@ -1,10 +1,13 @@
 import io
+import os
+import tempfile
 from types import SimpleNamespace
 
 import pytest
 from fastapi import UploadFile
 
 from app.api import imports
+from app.services import data_manager_service
 
 
 class RecordingSession:
@@ -21,6 +24,30 @@ class RecordingSession:
 
 def upload(name: str = "policies.csv", content: bytes = b"policy_id\nP1\n") -> UploadFile:
     return UploadFile(filename=name, file=io.BytesIO(content))
+
+
+def test_data_manager_closes_mkstemp_descriptor_before_reopening(monkeypatch):
+    observed: dict[str, object] = {}
+    real_mkstemp = tempfile.mkstemp
+
+    def tracked_mkstemp(*args, **kwargs):
+        descriptor, path = real_mkstemp(*args, **kwargs)
+        observed.update(descriptor=descriptor, path=path)
+        return descriptor, path
+
+    def parse_after_close(path, **_limits):
+        with pytest.raises(OSError):
+            os.fstat(observed["descriptor"])
+        assert path == observed["path"]
+        return [{"policy_id": "P1"}]
+
+    monkeypatch.setattr(data_manager_service.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(data_manager_service, "parse_file", parse_after_close)
+
+    assert data_manager_service._parse_bytes("policies.csv", b"policy_id\nP1\n") == [
+        {"policy_id": "P1"}
+    ]
+    assert not os.path.exists(observed["path"])
 
 
 def test_staged_upload_is_removed_after_success(tmp_path, monkeypatch):

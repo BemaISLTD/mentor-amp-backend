@@ -75,7 +75,8 @@ def _legacy_one_shot(db: Session, user: User, project_id: str, category: str,
     }, user)
     row = data_manager_service.require_session_access(db, user, session["id"], write=True)
     uploaded = data_manager_service.upload_file(
-        db, row, file.filename or "upload.csv", file.file.read(), user
+        db, row, file.filename or "upload.csv",
+        data_manager_service.read_upload(file.file), user,
     )
     columns = list(uploaded["columns"])
     fields = []
@@ -189,7 +190,10 @@ def upload_scenarios(
     """Deprecated one-shot wrapper over the Data Manager lifecycle."""
     access.require_project_access(db, user, project_id, write=True)
     require_active_project(db, project_id)
-    return _legacy_one_shot(db, user, project_id, "scenario", file)
+    return _legacy_one_shot(
+        db, user, project_id, "scenario", file,
+        options={"structural_only": True},
+    )
 
 
 def _file_columns(infile: InforceFile) -> list[str]:

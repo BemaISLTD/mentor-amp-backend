@@ -33,7 +33,7 @@ RAW_URL = os.environ.get("MENTORAMP_TEST_POSTGRES_URL")
 pytestmark = pytest.mark.skipif(
     not RAW_URL, reason="set MENTORAMP_TEST_POSTGRES_URL to a disposable PostgreSQL database"
 )
-HEAD, WP1_HEAD, MERGE = "e6a9c4d2f817", "b7e4d2a9c613", "a3c5e7f9b1d2"
+HEAD, WP1_HEAD, MERGE = "ab6d9e2f4013", "b7e4d2a9c613", "a3c5e7f9b1d2"
 M1_HEAD, DEV_HEAD = "4d8e2f6a1c90", "c48a2d7159be"
 BACKEND = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -176,6 +176,71 @@ def test_upgrade_from_m1_refuses_to_drop_unexported_legacy_rows(pg):
                          {"id": ids["done"]}).scalar() == 2
         assert c.execute(text("SELECT count(*) FROM trace_logs WHERE run_id = :id"),
                          {"id": ids["done"]}).scalar() == 1
+
+
+def test_verified_m1_bridge_preserves_results_traces_and_manifest(
+    pg, tmp_path, monkeypatch
+):
+    from app.core import artifacts
+    from app.core.artifacts import (
+        LocalParquetArtifactStore,
+        read_attempt_artifact_rows,
+    )
+    from app.services import results_service, run_query_service
+    from app.services.legacy_artifact_bridge import (
+        PRE_DROP_REVISION,
+        export_legacy_run_artifacts,
+    )
+
+    engine, config = pg
+    reset(engine)
+    command.upgrade(config, M1_HEAD)
+    ids = seed_legacy_m1_data(engine)
+    command.upgrade(config, PRE_DROP_REVISION)
+
+    store = LocalParquetArtifactStore(tmp_path / "legacy-artifacts")
+    report = export_legacy_run_artifacts(engine, store)
+    assert report.output_rows == 2
+    assert report.trace_rows == 1
+    assert report.artifacts == 2
+    assert report.run_ids == (ids["done"],)
+
+    with engine.connect() as c:
+        assert c.execute(text("SELECT count(*) FROM run_outputs")).scalar_one() == 0
+        assert c.execute(text("SELECT count(*) FROM trace_logs")).scalar_one() == 0
+        registered = c.execute(text(
+            "SELECT storage_uri, row_count, checksum_sha256 FROM run_artifacts "
+            "ORDER BY artifact_type"
+        )).mappings().all()
+    assert sorted(row["row_count"] for row in registered) == [1, 2]
+    for row in registered:
+        content = store.read_bytes(row["storage_uri"])
+        assert hashlib.sha256(content).hexdigest() == row["checksum_sha256"]
+        assert len(store.read_rows(row["storage_uri"])) == row["row_count"]
+
+    command.upgrade(config, "head")
+    assert current(engine) == [HEAD]
+    assert "run_outputs" not in inspect(engine).get_table_names()
+    assert "trace_logs" not in inspect(engine).get_table_names()
+
+    monkeypatch.setattr(artifacts, "get_artifact_store", lambda: store)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        result = results_service.result_rows(db, ids["done"])
+        traces = read_attempt_artifact_rows(db, ids["done"], "traces", 1)
+        manifest = run_query_service.get_manifest(db, ids["done"])
+        artifact_attempts = c = db.execute(text(
+            "SELECT DISTINCT attempt_number FROM run_artifacts"
+        )).scalars().all()
+    assert result["attempt_number"] == 1
+    assert result["total"] == 2
+    assert [row["month"] for row in result["rows"]] == [0, 1]
+    assert len(traces) == 1
+    assert traces[0]["policy_id"] == "P1"
+    assert traces[0]["projection_month"] == 1
+    assert manifest["legacy_run"] is True
+    assert manifest["final_manifest"]["attempt_number"] == 1
+    assert artifact_attempts == [1]
 
 
 def test_upgrade_from_the_dev_head_adds_m1_and_wp1(pg):
@@ -495,3 +560,271 @@ def test_retained_run_evidence_cannot_be_deleted_by_accident(pg):
         c.execute(text("DELETE FROM run_manifests WHERE run_id = :id"), {"id": run_id})
         c.execute(text("DELETE FROM run_packages WHERE id = :id"), {"id": package_id})
         c.execute(text("DELETE FROM runs WHERE id = :id"), {"id": run_id})
+
+
+def test_run_artifacts_and_audit_logs_are_immutable_retained_evidence(pg):
+    engine, config = pg
+    reset(engine)
+    command.upgrade(config, "head")
+    user_id, project_id, run_id, artifact_id = (
+        str(uuid.uuid4()) for _ in range(4)
+    )
+    with engine.begin() as c:
+        c.execute(text(
+            "INSERT INTO users "
+            "(id, email, full_name, password_hash, is_active, created_at, updated_at) "
+            "VALUES (:id, 'evidence@example.com', 'Evidence', 'x', true, now(), now())"
+        ), {"id": user_id})
+        c.execute(text(
+            "INSERT INTO projects (id, name, created_at, updated_at) "
+            "VALUES (:id, 'Evidence', now(), now())"
+        ), {"id": project_id})
+        c.execute(text(
+            "INSERT INTO runs (id, project_id, status, created_at) "
+            "VALUES (:id, :project, 'pending', now())"
+        ), {"id": run_id, "project": project_id})
+        c.execute(text(
+            "INSERT INTO run_artifacts "
+            "(id, run_id, attempt_number, artifact_type, storage_uri, storage_backend, "
+            "file_format, schema_version, row_count, checksum_sha256, created_at) "
+            "VALUES (:id, :run, 1, 'outputs', :uri, 'local', 'parquet', 'm1-v1', "
+            "1, :checksum, now())"
+        ), {
+            "id": artifact_id,
+            "run": run_id,
+            "uri": f"local://{run_id}/outputs/evidence.parquet",
+            "checksum": "a" * 64,
+        })
+        c.execute(text(
+            "INSERT INTO audit_logs "
+            "(actor_user_id, action, entity_type, entity_id, created_at) "
+            "VALUES (:actor, 'created', 'run', :run, now())"
+        ), {"actor": user_id, "run": run_id})
+
+    for statement, message in (
+        ("UPDATE run_artifacts SET row_count = 2 WHERE id = :id", "immutable"),
+        ("DELETE FROM run_artifacts WHERE id = :id", "retained run evidence"),
+    ):
+        with pytest.raises(DBAPIError, match=message):
+            with engine.begin() as c:
+                c.execute(text(statement), {"id": artifact_id})
+    for statement in (
+        "UPDATE audit_logs SET action = 'changed'",
+        "DELETE FROM audit_logs",
+    ):
+        with pytest.raises(DBAPIError, match="append-only"):
+            with engine.begin() as c:
+                c.execute(text(statement))
+    with pytest.raises(DBAPIError, match="foreign key|violates"):
+        with engine.begin() as c:
+            c.execute(text("DELETE FROM runs WHERE id = :id"), {"id": run_id})
+    with pytest.raises(DBAPIError, match="foreign key|violates"):
+        with engine.begin() as c:
+            c.execute(text("DELETE FROM users WHERE id = :id"), {"id": user_id})
+
+
+def test_concurrent_replacements_create_one_next_dataset_version(
+    pg, tmp_path, monkeypatch
+):
+    from app.core.artifacts import LocalParquetArtifactStore
+    from app.db.models.data_manager import ImportSession
+    from app.db.models.user import User
+    from app.services.common import ServiceError
+    from app.services.data_manager_service import commit_session
+
+    engine, config = pg
+    reset(engine)
+    command.upgrade(config, "head")
+    store = LocalParquetArtifactStore(tmp_path / "dataset-artifacts")
+    monkeypatch.setattr(settings, "artifact_storage_path", store.root)
+    canonical_rows = [{
+        "policy_id": "P-1",
+        "product_type": "SPIA",
+        "issue_date": "2024-01-01",
+        "issue_age": 65,
+        "gender": "F",
+        "premium": 100000.0,
+        "monthly_payment": 700.0,
+    }]
+    stored = store.write_rows("concurrent-import", "canonical", canonical_rows)
+    user_id, project_id, predecessor_id, group_id = (
+        str(uuid.uuid4()) for _ in range(4)
+    )
+    sessions = [str(uuid.uuid4()), str(uuid.uuid4())]
+    validations = [str(uuid.uuid4()), str(uuid.uuid4())]
+    with engine.begin() as c:
+        c.execute(text(
+            "INSERT INTO users "
+            "(id, email, full_name, password_hash, is_active, created_at, updated_at) "
+            "VALUES (:id, 'versions@example.com', 'Versions', 'x', true, now(), now())"
+        ), {"id": user_id})
+        c.execute(text(
+            "INSERT INTO projects (id, name, created_at, updated_at) "
+            "VALUES (:id, 'Versions', now(), now())"
+        ), {"id": project_id})
+        c.execute(text(
+            "INSERT INTO inforce_files "
+            "(id, project_id, filename, file_type, row_count, uploaded_at, status, "
+            "version_number, version_group_id, committed_by, committed_at) "
+            "VALUES (:id, :project, 'v1.csv', 'csv', 1, now(), 'validated', "
+            "1, :group_id, :user_id, now())"
+        ), {
+            "id": predecessor_id,
+            "project": project_id,
+            "group_id": group_id,
+            "user_id": user_id,
+        })
+        for session_id, validation_id in zip(sessions, validations, strict=True):
+            c.execute(text(
+                "INSERT INTO import_sessions "
+                "(id, project_id, category, name, replaces_dataset_id, status, options, "
+                "file_format, raw_fingerprint, row_count, columns, detected_types, "
+                "mapping_fields, created_by, updated_by, created_at, updated_at) "
+                "VALUES (:id, :project, 'liability_inforce', 'Replacement', :replaces, "
+                "'validated', CAST('{}' AS json), 'csv', :raw, 1, CAST('[]' AS json), "
+                "CAST('{}' AS json), CAST('[]' AS json), :user_id, :user_id, now(), now())"
+            ), {
+                "id": session_id,
+                "project": project_id,
+                "replaces": predecessor_id,
+                "raw": "b" * 64,
+                "user_id": user_id,
+            })
+            c.execute(text(
+                "INSERT INTO validation_runs "
+                "(id, import_session_id, status, error_count, warning_count, "
+                "accepted_count, rejected_count, canonical_storage_uri, "
+                "canonical_checksum_sha256, canonical_row_count, "
+                "canonical_schema_version, canonical_fingerprint, fingerprint_scheme, "
+                "created_by, created_at, completed_at) "
+                "VALUES (:id, :session, 'passed', 0, 0, 1, 0, :uri, :checksum, 1, "
+                "'data-manager-v1', :fingerprint, 'inforce-v3', :user_id, now(), now())"
+            ), {
+                "id": validation_id,
+                "session": session_id,
+                "uri": stored.uri,
+                "checksum": stored.checksum_sha256,
+                "fingerprint": "c" * 64,
+                "user_id": user_id,
+            })
+
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def worker(session_id: str) -> None:
+        with Session() as db:
+            row = db.get(ImportSession, session_id)
+            user = db.get(User, user_id)
+            barrier.wait()
+            try:
+                commit_session(db, row, user)
+                outcomes.append("created")
+            except ServiceError as error:
+                db.rollback()
+                outcomes.append(error.code)
+
+    threads = [threading.Thread(target=worker, args=(session_id,)) for session_id in sessions]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["STALE_DATASET_VERSION", "created"]
+    with engine.connect() as c:
+        version_rows = c.execute(text(
+            "SELECT id, version_number FROM inforce_files "
+            "WHERE version_group_id = :group_id ORDER BY version_number"
+        ), {"group_id": group_id}).all()
+    assert [row.version_number for row in version_rows] == [1, 2]
+    committed_id = version_rows[-1].id
+    for statement in (
+        "UPDATE inforce_files SET filename = 'mutated.csv' WHERE id = :id",
+        "DELETE FROM inforce_files WHERE id = :id",
+        "UPDATE inforce_records SET data = CAST('{}' AS json) WHERE file_id = :id",
+        "DELETE FROM inforce_records WHERE file_id = :id",
+    ):
+        with pytest.raises(DBAPIError, match="committed content is immutable"):
+            with engine.begin() as c:
+                c.execute(text(statement), {"id": committed_id})
+    with engine.begin() as c:
+        c.execute(text(
+            "UPDATE inforce_files SET status = 'needs_review' WHERE id = :id"
+        ), {"id": committed_id})
+
+
+def test_concurrent_retry_calls_return_one_successor(pg, monkeypatch):
+    from app.db.models.user import User
+    from app.services import run_control_service, run_package_verification
+
+    engine, config = pg
+    reset(engine)
+    command.upgrade(config, "head")
+    user_id, project_id, source_id, package_id = (
+        str(uuid.uuid4()) for _ in range(4)
+    )
+    with engine.begin() as c:
+        c.execute(text(
+            "INSERT INTO users "
+            "(id, email, full_name, password_hash, is_active, created_at, updated_at) "
+            "VALUES (:id, 'retry@example.com', 'Retry', 'x', true, now(), now())"
+        ), {"id": user_id})
+        c.execute(text(
+            "INSERT INTO projects (id, name, created_at, updated_at) "
+            "VALUES (:id, 'Retry concurrency', now(), now())"
+        ), {"id": project_id})
+        c.execute(text(
+            "INSERT INTO runs "
+            "(id, project_id, name, status, triggered_by, run_package_fingerprint, "
+            "progress_total, progress_done, error_count, warning_count, "
+            "attempt_count, illustrative, created_at) "
+            "VALUES (:id, :project, 'Failed source', 'failed', :user, :fingerprint, "
+            "0, 0, 1, 0, 1, false, now())"
+        ), {
+            "id": source_id, "project": project_id, "user": user_id,
+            "fingerprint": "a" * 64,
+        })
+        c.execute(text(
+            "INSERT INTO run_packages "
+            "(id, run_id, project_id, schema_version, fingerprint_algorithm, "
+            "fingerprint, package, created_by, created_at) "
+            "VALUES (:id, :run, :project, 'v1', 'sha256', :fingerprint, "
+            "CAST(:package AS json), :user, now())"
+        ), {
+            "id": package_id, "run": source_id, "project": project_id,
+            "fingerprint": "a" * 64, "user": user_id,
+            "package": json.dumps({
+                "identity": {
+                    "package_id": package_id,
+                    "frozen_for_run_id": source_id,
+                    "run_set_id": None,
+                },
+                "configuration": {},
+            }),
+        })
+
+    monkeypatch.setattr(run_package_verification, "verify_build", lambda _configuration: None)
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
+    barrier = threading.Barrier(2)
+    successor_ids: list[str] = []
+
+    def worker() -> None:
+        with Session() as db:
+            user = db.get(User, user_id)
+            barrier.wait()
+            successor_ids.append(
+                run_control_service.retry_run(db, source_id, user)["id"]
+            )
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(successor_ids) == 2
+    assert len(set(successor_ids)) == 1
+    with engine.connect() as c:
+        assert c.execute(text(
+            "SELECT count(*) FROM runs WHERE retried_from_run_id = :source"
+        ), {"source": source_id}).scalar_one() == 1

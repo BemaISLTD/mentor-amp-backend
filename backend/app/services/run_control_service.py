@@ -95,6 +95,9 @@ def retry_run(db: Session, run_id: str, user: Any) -> dict[str, Any]:
             f"Run '{source.id}' cannot be retried from status '{source.status}'.",
             {"status": source.status},
         )
+    existing = db.query(Run).filter(Run.retried_from_run_id == source.id).first()
+    if existing is not None:
+        return run_query_service.run_view(db, existing)
     package = db.query(RunPackage).filter(RunPackage.run_id == source.id).first()
     if package is None:
         db.rollback()

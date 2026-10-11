@@ -3,11 +3,12 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, event, select
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core import lifecycle
 from app.db.database import Base
+from app.db.immutability import ImmutableRecordError, protect_after_commit
 from app.db.types import BigIntegerPK
 
 
@@ -15,6 +16,12 @@ class InforceFile(Base):
     """Metadata for each uploaded inforce file."""
 
     __tablename__ = "inforce_files"
+    __table_args__ = (
+        UniqueConstraint(
+            "version_group_id", "version_number",
+            name="uq_inforce_files_version_group_number",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
@@ -79,3 +86,30 @@ class InforceRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+
+
+GOVERNANCE_COLUMNS = frozenset({
+    "status", "approved_by", "approved_at", "rejected_by", "rejected_at",
+    "review_reason",
+})
+protect_after_commit(InforceFile, mutable_columns=GOVERNANCE_COLUMNS)
+
+
+def _protect_committed_record(connection, target: InforceRecord) -> None:
+    committed_at = connection.execute(
+        select(InforceFile.committed_at).where(InforceFile.id == target.file_id)
+    ).scalar_one_or_none()
+    if committed_at is not None:
+        raise ImmutableRecordError(
+            "InforceRecord committed content is immutable."
+        )
+
+
+@event.listens_for(InforceRecord, "before_update")
+def _protect_record_update(mapper, connection, target) -> None:  # noqa: ARG001
+    _protect_committed_record(connection, target)
+
+
+@event.listens_for(InforceRecord, "before_delete")
+def _protect_record_delete(mapper, connection, target) -> None:  # noqa: ARG001
+    _protect_committed_record(connection, target)

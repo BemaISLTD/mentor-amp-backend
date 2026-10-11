@@ -132,8 +132,7 @@ def fail_on_call(monkeypatch, number: int) -> None:
 def test_failure_after_committed_batches_leaves_no_visible_results(env, monkeypatch):
     submitted = env.submit("A", ["Base"])
     run_id = submitted["by_scenario"]["Base"]
-    # Batches are committed every 5 policies: policies 1-10 are already in artifacts
-    # when policy 12 fails.
+    # The final in-memory batch is retained as noncanonical evidence when policy 12 fails.
     fail_on_call(monkeypatch, 12)
     env.execute(submitted)
 
@@ -231,6 +230,12 @@ def test_success_runs_have_complete_results(env):
     assert export.status_code == 200 and export.headers["x-mentoramp-complete"] == "true"
     comparison = env.get("/comparisons", baseline_run_id=base, current_run_id=low)
     assert comparison.status_code == 200 and comparison.json()["complete"] is True
+    with env.Session() as db:
+        artifacts = db.query(RunArtifact).filter(
+            RunArtifact.run_id == base
+        ).all()
+    assert sum(item.artifact_type == "outputs" for item in artifacts) == 1
+    assert sum(item.artifact_type == "traces" for item in artifacts) == 1
 
 
 def test_partial_success_results_require_an_explicit_opt_in(env, monkeypatch):

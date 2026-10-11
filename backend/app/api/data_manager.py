@@ -66,14 +66,16 @@ def list_import_sessions(project_id: str, user: ImportReader,
 @router.get("/import-sessions/{session_id}")
 def get_import_session(session_id: str, user: ImportReader, db: Session = Depends(get_db)):
     row = service.require_session_access(db, user, session_id)
-    return service.serialize_session(row)
+    return service.serialize_session(row, db)
 
 
 @router.post("/import-sessions/{session_id}/files")
 def upload_import_file(session_id: str, user: ImportWriter, file: UploadFile = File(...),
                        db: Session = Depends(get_db)):
     row = service.require_session_access(db, user, session_id, write=True)
-    return service.upload_file(db, row, file.filename or "upload.csv", file.file.read(), user)
+    return service.upload_file(
+        db, row, file.filename or "upload.csv", service.read_upload(file.file), user
+    )
 
 
 @router.get("/import-sessions/{session_id}/preview")
@@ -142,9 +144,23 @@ def get_validation_issues(validation_id: str, user: ImportReader, db: Session = 
 
 
 @router.get("/validation-runs/{validation_id}/rejected-records")
-def get_rejected_records(validation_id: str, user: ImportReader, db: Session = Depends(get_db)):
+def get_rejected_records(
+    validation_id: str,
+    user: ImportReader,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
     service.require_validation_access(db, user, validation_id)
-    return {"rejected_records": service.rejected_records(db, validation_id)}
+    total, records = service.rejected_records(
+        db, validation_id, limit=limit, offset=offset
+    )
+    return {
+        "rejected_records": records,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 def _review(db: Session, kind: DatasetKind, dataset_id: str, payload: ReviewRequest,

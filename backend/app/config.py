@@ -56,6 +56,13 @@ class Settings(BaseSettings):
 
     # Upper bound on policies whose calculation trace is stored for one run (frozen per package).
     max_traced_policies: int = 25
+    max_import_upload_bytes: int = 25 * 1024 * 1024
+    max_import_records: int = 250_000
+    max_import_columns: int = 500
+    max_import_xlsx_sheets: int = 10
+    max_rejected_records: int = 10_000
+    run_artifact_target_rows: int = 100_000
+    run_heartbeat_every_policies: int = 5
 
     @model_validator(mode="after")
     def reject_unsafe_configuration(self):

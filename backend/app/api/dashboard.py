@@ -18,6 +18,7 @@ from app.db.models.run import Run
 from app.db.models.user import User
 from app.models.dashboard import (
     DashboardStatsResponse,
+    CurrencyNamedValue,
     NamedCount,
     NamedValue,
     ProductValue,
@@ -63,16 +64,14 @@ def get_dashboard_stats(
             AssetPosition.deleted_at.is_(None),
         ).all()
 
-    assets_by_class: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+    assets_by_class: dict[tuple[str, str], Decimal] = defaultdict(lambda: Decimal("0"))
     currency_totals: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
-    values_by_product: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
-    total_market_value = Decimal("0")
+    values_by_product: dict[tuple[str, str], Decimal] = defaultdict(lambda: Decimal("0"))
     for position in positions:
         value = Decimal(position.market_value)
-        total_market_value += value
-        assets_by_class[position.asset_class] += value
+        assets_by_class[(position.asset_class, position.currency)] += value
         currency_totals[position.currency] += value
-        values_by_product[position.product_id] += value
+        values_by_product[(position.product_id, position.currency)] += value
 
     products_by_id = {product.id: product for product in products}
     product_mix = [
@@ -81,12 +80,13 @@ def get_dashboard_stats(
             code=products_by_id[product_id].code,
             name=products_by_id[product_id].name,
             product_type=products_by_id[product_id].product_type,
+            currency=currency,
             market_value=value,
         )
-        for product_id, value in values_by_product.items()
+        for (product_id, currency), value in values_by_product.items()
         if product_id in products_by_id
     ]
-    product_mix.sort(key=lambda item: (-item.market_value, item.code))
+    product_mix.sort(key=lambda item: (item.currency, -item.market_value, item.code))
 
     runs = db.query(Run).filter(Run.project_id == project_id).all()
     runs_by_status: dict[str, int] = defaultdict(int)
@@ -111,10 +111,9 @@ def get_dashboard_stats(
             for name, count in sorted(products_by_status.items())
         ],
         asset_as_of_date=selected_date,
-        total_market_value=total_market_value,
         assets_by_class=[
-            NamedValue(name=name, value=value)
-            for name, value in sorted(assets_by_class.items())
+            CurrencyNamedValue(name=name, currency=currency, value=value)
+            for (name, currency), value in sorted(assets_by_class.items())
         ],
         product_mix=product_mix,
         currency_totals=[

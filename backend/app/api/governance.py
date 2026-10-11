@@ -13,7 +13,8 @@ from app.db.models.governance import DerivedDataset, Report
 from app.db.models.user import User
 from app.services import governance_service
 
-router = APIRouter(tags=["actuarial governance"])
+router = APIRouter(tags=["experimental actuarial governance"])
+run_steps_router = APIRouter(tags=["run steps"])
 ProjectReader = Annotated[User, Depends(authorize_path("project", "project_id", "projects:read"))]
 ProjectWriter = Annotated[
     User, Depends(authorize_path("project", "project_id", "registries:write", write=True))
@@ -284,7 +285,7 @@ def archive_dataset(dataset_id: str, user: Annotated[User, Depends(authorize_pat
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.get("/runs/{run_id}/steps")
+@run_steps_router.get("/runs/{run_id}/steps")
 def get_run_steps(run_id: str, user: RunReader, db: Session = Depends(get_db)):
     del user
     return {"steps": governance_service.run_steps(db, run_id)}

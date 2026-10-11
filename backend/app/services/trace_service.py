@@ -24,7 +24,13 @@ from app.services.run_query_service import run_configuration
 MAX_DEPTH = 10
 
 
-def _accepted(db: Session, run: Run):
+def _accepted(
+    db: Session,
+    run: Run,
+    *,
+    policy_id: str | None = None,
+    months: list[int] | None = None,
+):
     return [
         SimpleNamespace(
             **{key: value for key, value in row.items() if not key.endswith("_json")},
@@ -32,7 +38,13 @@ def _accepted(db: Session, run: Run):
             output_value=json.loads(row["output_value_json"]),
             lookup_keys=json.loads(row["lookup_keys_json"]),
         )
-        for row in read_attempt_artifact_rows(db, run.id, "traces", run.accepted_attempt_number)
+        for row in read_attempt_artifact_rows(
+            db,
+            run.id,
+            "traces",
+            run.accepted_attempt_number,
+            filters={"policy_id": policy_id, "projection_month": months},
+        )
         if row.get("attempt_number") == run.accepted_attempt_number
     ]
 
@@ -189,10 +201,12 @@ def trace_tree(
 ) -> dict[str, Any]:
     run = result_run(db, run_id, include_partial)
     depth = max(0, min(depth, MAX_DEPTH))
-    rows = [
-        row for row in _accepted(db, run)
-        if row.policy_id == policy_id and row.projection_month in (month, month + 1, max(month, 1))
-    ]
+    rows = _accepted(
+        db,
+        run,
+        policy_id=policy_id,
+        months=list({month, month + 1, max(month, 1)}),
+    )
     if not rows:
         traced = _traced_policy_ids(db, run)
         if policy_id not in traced:
@@ -224,10 +238,12 @@ def dependents(
     db: Session, run_id: str, policy_id: str, month: int, variable: str, include_partial: bool = False,
 ) -> dict[str, Any]:
     run = result_run(db, run_id, include_partial)
-    rows = [
-        row for row in _accepted(db, run)
-        if row.policy_id == policy_id and row.projection_month in (month - 1, month, month + 1)
-    ]
+    rows = _accepted(
+        db,
+        run,
+        policy_id=policy_id,
+        months=[month - 1, month, month + 1],
+    )
     if not rows:
         raise ServiceError(
             404, "NOT_FOUND",

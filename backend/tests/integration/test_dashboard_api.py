@@ -78,7 +78,7 @@ def dashboard_client():
                 as_of_date=date(2026, 9, 30),
                 asset_class="equity",
                 market_value=Decimal("500"),
-                currency="USD",
+                currency="EUR",
             ),
             Run(project_id=project.id, status="success"),
             Run(project_id=project.id, status="failed"),
@@ -124,11 +124,20 @@ def test_dashboard_uses_latest_asset_snapshot(dashboard_client):
     assert body["product_count"] == 2
     assert body["active_product_count"] == 1
     assert body["asset_as_of_date"] == "2026-09-30"
-    assert float(body["total_market_value"]) == 1500.0
+    assert "total_market_value" not in body
+    assert body["currency_totals"] == [
+        {"name": "EUR", "value": "500.0000"},
+        {"name": "USD", "value": "1000.0000"},
+    ]
     assert body["run_count"] == 2
     assert body["inforce_file_count"] == 1
     assert body["policy_record_count"] == 250
-    assert [item["code"] for item in body["product_mix"]] == ["FIA", "RILA"]
+    assert {(item["code"], item["currency"]) for item in body["product_mix"]} == {
+        ("FIA", "USD"), ("RILA", "EUR"),
+    }
+    assert {(item["name"], item["currency"]) for item in body["assets_by_class"]} == {
+        ("fixed_income", "USD"), ("equity", "EUR"),
+    }
 
 
 def test_dashboard_supports_historical_asset_date(dashboard_client):
@@ -138,7 +147,9 @@ def test_dashboard_supports_historical_asset_date(dashboard_client):
     )
 
     assert response.status_code == 200
-    assert float(response.json()["total_market_value"]) == 900.0
+    body = response.json()
+    assert "total_market_value" not in body
+    assert body["currency_totals"] == [{"name": "USD", "value": "900.0000"}]
 
 
 def test_dashboard_rejects_unknown_project(dashboard_client):

@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.database import Base
+from app.db.immutability import forbid_deletes, forbid_updates
 
 JSON_VALUE = JSON().with_variant(JSONB(), "postgresql")
 AUDIT_ID = BigInteger().with_variant(Integer, "sqlite")
@@ -22,7 +23,7 @@ class AuditLog(Base):
 
     id: Mapped[int] = mapped_column(AUDIT_ID, primary_key=True, autoincrement=True)
     actor_user_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+        String(36), ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
     )
     action: Mapped[str] = mapped_column(String(100), nullable=False)
     entity_type: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -41,3 +42,7 @@ class AuditLog(Base):
         default=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
+
+
+forbid_updates(AuditLog)
+forbid_deletes(AuditLog)

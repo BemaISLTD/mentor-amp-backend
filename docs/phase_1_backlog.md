@@ -12,13 +12,13 @@ it is considered complete.
 
 | Area | Verified state | Status |
 | --- | --- | --- |
-| Tests | Original `test_*.py` modules were empty placeholders | **Current evidence:** 259 tests pass and 12 are skipped when opt-in PostgreSQL tests have no database URL; all 11 PostgreSQL migration/concurrency tests pass separately |
+| Tests | Original test modules were empty placeholders | **Correction-pass evidence:** all 268 application tests pass (16 opt-in skips without PostgreSQL); all 15 PostgreSQL migration/concurrency tests pass separately |
 | Seed data | No seed script existed | Complete for illustrative SPIA demo; broader product and workflow seed remains open |
 | Authentication/RBAC | No auth dependency or user/RBAC models existed | **Complete:** JWT and the administrator, actuary, model developer, reviewer, and read-only permission matrix are enforced |
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
 | Error contract | Default FastAPI `detail` responses were used | **Complete:** standardized error envelope added |
 | Projects | POST and GET only | **Complete:** permission-protected PATCH and audited archival added; hard deletion is not exposed |
-| Run APIs | `runs.py`, `results.py`, and `trace.py` were empty | **Complete for local execution:** consolidated run-set, result, comparison, and trace APIs are canonical at `/v1`; older backlog run routes are deprecated under `/v1/legacy-runs` and administrator-only |
+| Run APIs | Run, result, and trace modules were empty | **Complete for local execution:** consolidated run-set, result, comparison, and trace APIs are canonical at /v1; conflicting legacy run routes are removed |
 | Data Manager | Imports were disconnected one-shot validators | **Complete:** governed upload, browser preview, mapping, validation, immutable version commit, peer approval, comparison, rejected records, and import history cover inforce, assumptions, factors, and scenarios |
 | Run controls | Runs could not be cancelled or retried | **Complete:** pending/running cancellation and frozen-configuration retry are exposed through the canonical run API |
 | Large outputs | Runner previously wrote outputs and traces to PostgreSQL | **Complete for local execution:** Parquet artifacts replace the removed legacy tables; production object storage remains open |
@@ -31,10 +31,12 @@ it is considered complete.
   - Build coverage for database connectivity, migrations, model constraints,
     validation, authentication/authorization, API behavior, engine behavior,
     and golden policies.
-  - Current evidence: the clean Docker suite returned `259 passed, 12 skipped`
-    when the opt-in PostgreSQL URL was absent; all 11 PostgreSQL
-    migration/concurrency tests passed separately on a disposable PostgreSQL 15
-    database.
+  - Current reliable named-container evidence: 268 passed, 16 skipped, exit
+    code 0. Exact 600-month, 24-month, payment-total, and trace references are
+    asserted without tolerances.
+  - All 15 PostgreSQL migration/concurrency tests pass with exit code 0 on a
+    disposable PostgreSQL 15 database. The shared Neon database was not migrated
+    or seeded.
 - **[IMPROVE] Database Seeding Scripts — IN PROGRESS**
   - `scripts/seed_demo.py` idempotently creates synthetic SPIA users, project,
     inputs, scenarios, model, and a validated projection set. Broader product
@@ -81,6 +83,8 @@ it is considered complete.
 - **[BUILD] Dashboard Contract — COMPLETE**
   - `GET /v1/dashboard/stats` returns project-scoped product, latest or
     requested asset snapshot, run, and in-force file statistics.
+  - Asset-class and product totals retain their currency. No invalid
+    cross-currency total is returned without a versioned FX basis.
 - **[CONDITIONAL] `/imports` to `/files` Adapter — DEFERRED**
   - Implement only after the frontend architecture is finalized.
 - **[CONDITIONAL] `/formulas` to `/tables` Adapter — DEFERRED**
@@ -96,26 +100,28 @@ it is considered complete.
     mutations.
 - **[IMPROVE] Actor Audit Fields — COMPLETE**
   - Projects, products, asset positions, variables, formulas, model versions,
-    model-variable definitions, Projection Sets, rollforward metadata, reports,
-    and derived datasets record mutation actors and transactional before/after
-    audit history through their mutation APIs.
+    model-variable definitions, and Projection Sets record mutation actors and
+    transactional before/after audit history through their public mutation APIs.
+  - Rollforward/report/derived-dataset metadata remains internal experimental
+    scaffolding and is not a completed public capability.
   - Formula `created_by` predates the actor migration; existing rows remain
     nullable/unchanged.
 - **[IMPROVE] Soft Deletes — COMPLETE FOR GOVERNED DELETE APIS**
   - Project archival and its retention contract are complete. Archived projects
     reject project, import, catalog, asset, mapping, and run mutations while
     retaining historical data.
-  - Variable, formula, model-version, rollforward-template, report, and
-    derived-dataset delete APIs retain governed rows with deletion actor and
-    timestamp. Normal reads and authorization resolvers exclude archived rows.
+  - Variable, formula, and model-version delete APIs retain governed rows with
+    deletion actor and timestamp. Normal reads and authorization resolvers
+    exclude archived rows.
 - **[BUILD] Products and Assets — COMPLETE**
   - Build `products`, `asset_positions`, and `product_mappings`.
-- **[BUILD] Actuarial Workflows — COMPLETE**
-  - Versioned, publishable rollforward templates persist ordered steps; jobs copy
-    the published definition and expose governed lifecycle transitions.
-- **[BUILD] Reporting Metadata — COMPLETE**
-  - Versioned report definitions and derived-dataset lineage/schema/artifact
-    metadata are persisted. Large bodies remain in analytical storage by URI.
+- **[BUILD] Actuarial Workflows — DEFERRED**
+  - Rollforward template/job metadata is internal experimental scaffolding.
+    Public capability requires the actual actuarial workflow and evidence.
+- **[BUILD] Reporting and Derived Datasets — DEFERRED**
+  - Metadata scaffolding is internal/experimental. Public reporting and derived
+    datasets require generation, artifact integrity, and behavioral acceptance
+    tests.
 - **[BUILD] Execution Metadata — COMPLETE**
   - Runs persist verification, calculation, and finalization steps with status,
     progress, metrics, and failure details; the run-step API exposes them.
@@ -129,12 +135,14 @@ it is considered complete.
     rejected rows, actors, raw/canonical fingerprints, and import events remain
     queryable. Legacy `/v1/imports/*` writes are deprecated one-shot wrappers over
     the same lifecycle.
-- **[BUILD] Model Versioning — COMPLETE**
+- **[BUILD] Model Versioning — COMPLETE FOR VERSIONING; APPROVAL DEFERRED**
   - Whole-model versions track parent, sequence, configuration, change summary,
     actor, publication, and archival metadata; child formula groups, formulas,
     dependencies, variable definitions, and published outputs clone from a parent.
-  - Published model versions are immutable and use the existing runnable
-    `approved` lifecycle state.
+  - Public self-publishing to approved is removed until an independent model
+    approval workflow is designed. Existing published/approved model versions
+    and their attached formulas are immutable; semantic changes require a new
+    version.
 
 ## 4. Actuarial Execution and Large Data
 
@@ -169,9 +177,18 @@ it is considered complete.
   - Failed, cancelled, and partial-success runs can create a new linked run from
     the exact frozen configuration. Build-identity mismatches and successful-run
     retries are refused.
+  - Retry is idempotent per source run. Row locking plus a database uniqueness
+    constraint ensures repeated and concurrent requests return one successor.
 - **[BUILD] Reconciliation Service — COMPLETE**
   - Compare prior/current output datasets and return reserve bridges and exact
     variance components.
+
+- **[IMPROVE] Artifact Integrity and Reconciliation — COMPLETE FOR LOCAL STORAGE**
+  - Reads verify checksum, row count, schema, run ID, and attempt identity before
+    returning data.
+  - A dry-run-by-default operator command finds only old unregistered local
+    files; deletion requires an exact database confirmation and never removes a
+    registered historical artifact.
 
 ## Implementation Order
 
@@ -187,8 +204,8 @@ it is considered complete.
    complete; S3 remains deferred.
 5. Run, status, result, and trace APIs. **Complete for local execution.**
    Cancel/retry and reconciliation are complete; durable workers remain open.
-6. Product, asset, and dashboard domains. **Complete.** Workflow, reporting,
-   and record-viewer domains remain open.
+6. Product, asset, and dashboard domains. **Complete.** Rollforward workflow,
+   reporting/derived datasets, and record-viewer domains remain open.
 7. Conditional `/files` and `/tables` adapters after frontend confirmation.
 
 ## Completion Requirements for Every Item
@@ -227,10 +244,15 @@ Before an item moves to complete, record:
 - Data Manager migration: `backend/app/db/migrations/versions/f3b8d6a1e240_data_manager_lifecycle.py`
 - Data Manager tests: `backend/tests/integration/test_data_manager.py`,
   `backend/tests/integration/test_data_manager_rebuild.py`
+- Frontend WP2 contract: `docs/wp2_frontend_api_contract.md`
 - Run controls: `backend/app/services/run_control_service.py`,
   `backend/app/api/execution.py`
 - Run-control migration: `backend/app/db/migrations/versions/e6a9c4d2f817_run_cancel_retry.py`
 - Run-control tests: `backend/tests/integration/test_run_control.py`
+- Artifact reconciliation: `backend/app/services/artifact_reconciliation.py`,
+  `backend/scripts/reconcile_orphan_artifacts.py`
+- Legacy artifact bridge: `backend/app/services/legacy_artifact_bridge.py`,
+  `backend/scripts/migrate_legacy_run_artifacts.py`
 - Attempt-scoped artifact migration: `backend/app/db/migrations/versions/f9d3e5a7b012_attempt_scoped_artifacts.py`
 - Registry actor migration: `backend/app/db/migrations/versions/c6e1a4b9d203_registry_actor_fields.py`
 - M1 end-to-end tests: `backend/tests/integration/test_m1_end_to_end.py`

@@ -15,6 +15,9 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.db.models.run_artifact import RunArtifact
 from app.models.schemas import ProjectionContext, ProjectionSummary, VariableResolutionResult
+from app.services.common import ServiceError
+
+RUN_ARTIFACT_SCHEMAS = frozenset({"v1", "m1-v1"})
 
 
 @dataclass(frozen=True)
@@ -83,22 +86,19 @@ class LocalParquetArtifactStore:
         )
 
     def read_bytes(self, uri: str) -> bytes:
+        return self.path_for_uri(uri).read_bytes()
+
+    def path_for_uri(self, uri: str) -> Path:
         prefix = "local://"
         if not uri.startswith(prefix):
             raise ValueError(f"Unsupported local artifact URI: {uri}")
         path = (self.root / uri.removeprefix(prefix)).resolve()
         if path != self.root and self.root not in path.parents:
             raise ValueError("Artifact URI escapes the configured storage root.")
-        return path.read_bytes()
+        return path
 
     def read_rows(self, uri: str) -> list[dict[str, Any]]:
-        prefix = "local://"
-        if not uri.startswith(prefix):
-            raise ValueError(f"Unsupported local artifact URI: {uri}")
-        path = (self.root / uri.removeprefix(prefix)).resolve()
-        if path != self.root and self.root not in path.parents:
-            raise ValueError("Artifact URI escapes the configured storage root.")
-        return pl.read_parquet(path).to_dicts()
+        return pl.read_parquet(self.path_for_uri(uri)).to_dicts()
 
 
 def get_artifact_store() -> LocalParquetArtifactStore:
@@ -107,6 +107,124 @@ def get_artifact_store() -> LocalParquetArtifactStore:
             f"Unsupported artifact storage backend: {settings.artifact_storage_backend}"
         )
     return LocalParquetArtifactStore(settings.artifact_storage_path)
+
+
+def _artifact_error(code: str, message: str, uri: str) -> ServiceError:
+    return ServiceError(409, code, message, {"storage_uri": uri})
+
+
+def verified_artifact_bytes(
+    store: LocalParquetArtifactStore,
+    uri: str,
+    checksum_sha256: str | None,
+    *,
+    expected_size: int | None = None,
+) -> bytes:
+    """Read bytes only when retained metadata proves their identity."""
+    try:
+        path = store.path_for_uri(uri)
+        size = path.stat().st_size
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+    except FileNotFoundError as error:
+        raise _artifact_error(
+            "ARTIFACT_MISSING", "The registered artifact file is missing.", uri
+        ) from error
+    if not checksum_sha256 or digest.hexdigest() != checksum_sha256:
+        raise _artifact_error(
+            "ARTIFACT_CHECKSUM_MISMATCH",
+            "The artifact checksum does not match its registered evidence.",
+            uri,
+        )
+    if expected_size is not None and size != expected_size:
+        raise _artifact_error(
+            "ARTIFACT_ROW_COUNT_MISMATCH",
+            "The artifact size does not match its registered evidence.",
+            uri,
+        )
+    return path.read_bytes()
+
+
+def verified_parquet_rows(
+    store: LocalParquetArtifactStore,
+    uri: str,
+    checksum_sha256: str | None,
+    row_count: int | None,
+    schema_version: str | None,
+    *,
+    supported_schemas: frozenset[str],
+    expected_run_id: str | None = None,
+    expected_attempt_number: int | None = None,
+    filters: dict[str, Any] | None = None,
+    ranges: dict[str, tuple[int | None, int | None]] | None = None,
+) -> list[dict[str, Any]]:
+    try:
+        path = store.path_for_uri(uri)
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+    except FileNotFoundError as error:
+        raise _artifact_error(
+            "ARTIFACT_MISSING", "The registered artifact file is missing.", uri
+        ) from error
+    if not checksum_sha256 or digest.hexdigest() != checksum_sha256:
+        raise _artifact_error(
+            "ARTIFACT_CHECKSUM_MISMATCH",
+            "The artifact checksum does not match its registered evidence.",
+            uri,
+        )
+    if schema_version not in supported_schemas:
+        raise _artifact_error(
+            "ARTIFACT_SCHEMA_UNSUPPORTED",
+            f"Artifact schema '{schema_version}' is not supported.",
+            uri,
+        )
+    try:
+        base = pl.scan_parquet(path)
+        actual_count = base.select(pl.len()).collect().item()
+        if row_count is None or actual_count != row_count:
+            raise _artifact_error(
+                "ARTIFACT_ROW_COUNT_MISMATCH",
+                "The artifact row count does not match its registered evidence.",
+                uri,
+            )
+        identity = None
+        if expected_run_id is not None:
+            identity = pl.col("run_id") != expected_run_id
+        if expected_attempt_number is not None:
+            mismatch = pl.col("attempt_number") != expected_attempt_number
+            identity = mismatch if identity is None else identity | mismatch
+        if identity is not None and base.filter(identity).limit(1).collect().height:
+            raise _artifact_error(
+                "ARTIFACT_IDENTITY_MISMATCH",
+                "Artifact rows do not match the registered run attempt.",
+                uri,
+            )
+        query = base
+        for column, value in (filters or {}).items():
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple, set, frozenset)):
+                query = query.filter(pl.col(column).is_in(list(value)))
+            else:
+                query = query.filter(pl.col(column) == value)
+        for column, bounds in (ranges or {}).items():
+            lower, upper = bounds
+            if lower is not None:
+                query = query.filter(pl.col(column) >= lower)
+            if upper is not None:
+                query = query.filter(pl.col(column) <= upper)
+        rows = query.collect().to_dicts()
+    except ServiceError:
+        raise
+    except Exception as error:
+        raise _artifact_error(
+            "ARTIFACT_UNREADABLE", "The registered Parquet artifact cannot be read.", uri
+        ) from error
+    return rows
 
 
 def read_artifact_rows(
@@ -131,7 +249,15 @@ def read_artifact_rows(
             raise ValueError(
                 f"Artifact backend '{artifact.storage_backend}' is not configured."
             )
-        rows.extend(configured_store.read_rows(artifact.storage_uri))
+        rows.extend(verified_parquet_rows(
+            configured_store,
+            artifact.storage_uri,
+            artifact.checksum_sha256,
+            artifact.row_count,
+            artifact.schema_version,
+            supported_schemas=RUN_ARTIFACT_SCHEMAS,
+            expected_run_id=run_id,
+        ))
     return rows
 
 
@@ -141,6 +267,9 @@ def read_attempt_artifact_rows(
     artifact_type: str,
     attempt_number: int | None,
     store: LocalParquetArtifactStore | None = None,
+    *,
+    filters: dict[str, Any] | None = None,
+    ranges: dict[str, tuple[int | None, int | None]] | None = None,
 ) -> list[dict[str, Any]]:
     """Read only an accepted attempt; None means no analytical results are visible."""
     if attempt_number is None:
@@ -160,7 +289,18 @@ def read_attempt_artifact_rows(
     for artifact in artifacts:
         if artifact.storage_backend != configured_store.backend_name:
             raise ValueError(f"Artifact backend '{artifact.storage_backend}' is not configured.")
-        rows.extend(configured_store.read_rows(artifact.storage_uri))
+        rows.extend(verified_parquet_rows(
+            configured_store,
+            artifact.storage_uri,
+            artifact.checksum_sha256,
+            artifact.row_count,
+            artifact.schema_version,
+            supported_schemas=RUN_ARTIFACT_SCHEMAS,
+            expected_run_id=run_id,
+            expected_attempt_number=attempt_number,
+            filters=filters,
+            ranges=ranges,
+        ))
     return rows
 
 

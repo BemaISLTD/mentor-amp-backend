@@ -17,6 +17,9 @@ from app.api.dependencies import get_current_user
 from app.config import settings
 from app.db.database import Base, get_db
 from app.db.models.audit_log import AuditLog
+from app.db.models.data_manager import ImportSession, ValidationRun
+from app.db.models.inforce import InforceFile, InforceRecord
+from app.db.immutability import ImmutableRecordError
 from app.db.models.model_variable import ModelVariableDefinition
 from app.db.models.modeling import Model, ModelVersion
 from app.db.models.project import Project
@@ -24,6 +27,7 @@ from app.db.models.project_member import ProjectMember
 from app.db.models.user import User
 from app.db.models.variable import VariableRegistry
 from app.main import app
+from app.core.artifacts import LocalParquetArtifactStore
 
 
 def principal(user_id: str, role: str = "admin", permissions: tuple[str, ...] = (
@@ -91,6 +95,91 @@ def run_flow(client, project_id: str, category: str, name: str, csv: str,
     committed = client.post(f"/v1/import-sessions/{session_id}/commit")
     assert committed.status_code == 201, committed.text
     return session_id, validated.json(), committed.json()
+
+
+def test_raw_and_canonical_artifact_tampering_is_rejected(data_manager):
+    client, db, project, _current, _creator, _reviewer = data_manager
+    csv = (
+        "policy_id,product_type,issue_date,issue_age,gender,premium,monthly_payment\n"
+        "P-1,SPIA,2024-01-01,65,F,100000,700\n"
+    )
+    mapping = [
+        {"source_column": field, "target_field": field}
+        for field in (
+            "policy_id", "product_type", "issue_date", "issue_age", "gender",
+            "premium", "monthly_payment",
+        )
+    ]
+    opened = client.post("/v1/import-sessions", json={
+        "project_id": project.id,
+        "category": "liability_inforce",
+        "name": "Integrity check",
+        "options": {},
+    })
+    session_id = opened.json()["id"]
+    uploaded = client.post(
+        f"/v1/import-sessions/{session_id}/files",
+        files={"file": ("integrity.csv", csv.encode(), "text/csv")},
+    )
+    assert uploaded.status_code == 200
+    session = db.get(ImportSession, session_id)
+    store = LocalParquetArtifactStore(settings.artifact_storage_path)
+    raw_path = store.path_for_uri(session.raw_storage_uri)
+    original = raw_path.read_bytes()
+    raw_path.write_bytes(original + b"tampered")
+    preview = client.get(f"/v1/import-sessions/{session_id}/preview")
+    assert preview.status_code == 409
+    assert preview.json()["error"]["code"] == "ARTIFACT_CHECKSUM_MISMATCH"
+
+    raw_path.write_bytes(original)
+    mapped = client.put(
+        f"/v1/import-sessions/{session_id}/mapping", json={"fields": mapping}
+    )
+    assert mapped.status_code == 200
+    validated = client.post(f"/v1/import-sessions/{session_id}/validate")
+    assert validated.status_code == 201
+    assert validated.json()["error_count"] == 0
+    validation = db.get(ValidationRun, validated.json()["id"])
+    store.path_for_uri(validation.canonical_storage_uri).write_bytes(b"replaced")
+    committed = client.post(f"/v1/import-sessions/{session_id}/commit")
+    assert committed.status_code == 409
+    assert committed.json()["error"]["code"] == "ARTIFACT_CHECKSUM_MISMATCH"
+
+
+def test_committed_dataset_content_is_orm_immutable(data_manager):
+    client, db, project, _current, _creator, _reviewer = data_manager
+    csv = (
+        "policy_id,product_type,issue_date,issue_age,gender,premium,monthly_payment\n"
+        "P-1,SPIA,2024-01-01,65,F,100000,700\n"
+    )
+    mapping = [
+        {"source_column": field, "target_field": field}
+        for field in (
+            "policy_id", "product_type", "issue_date", "issue_age", "gender",
+            "premium", "monthly_payment",
+        )
+    ]
+    _session_id, _validation, committed = run_flow(
+        client, project.id, "liability_inforce", "Immutable", csv, mapping
+    )
+    dataset = db.get(InforceFile, committed["id"])
+    dataset.filename = "mutated.csv"
+    with pytest.raises(ImmutableRecordError):
+        db.commit()
+    db.rollback()
+
+    record = db.query(InforceRecord).filter(
+        InforceRecord.file_id == committed["id"]
+    ).one()
+    record.data = {**record.data, "premium": 1}
+    with pytest.raises(ImmutableRecordError):
+        db.commit()
+    db.rollback()
+
+    dataset = db.get(InforceFile, committed["id"])
+    dataset.status = "needs_review"
+    db.commit()
+    assert dataset.status == "needs_review"
 
 
 def test_inforce_mapping_version_approval_and_comparison(data_manager):
@@ -184,7 +273,7 @@ def test_inforce_mapping_version_approval_and_comparison(data_manager):
             "scenario_name", "target_variable", "operation", "value",
             "applies_from_period", "applies_to_period",
         )],
-        {}, "scenario",
+        {"structural_only": True}, "scenario",
     ),
 ])
 def test_each_non_inforce_category_is_persisted(data_manager, category, name, csv, mapping,
@@ -225,9 +314,13 @@ def test_validation_keeps_issues_and_rejected_records(data_manager):
         "DUPLICATE_KEY", "TYPE_MISMATCH", "INVALID_GENDER", "MISSING_VALUE",
         "EFFECTIVE_DATE_INVALID",
     }
-    rejected = client.get(
-        f"/v1/validation-runs/{body['id']}/rejected-records"
-    ).json()["rejected_records"]
+    rejected_response = client.get(
+        f"/v1/validation-runs/{body['id']}/rejected-records",
+        params={"limit": 1, "offset": 0},
+    ).json()
+    assert rejected_response["total"] == 1
+    assert rejected_response["limit"] == 1
+    rejected = rejected_response["rejected_records"]
     assert rejected[0]["raw_record"]["policy_id"] == "DUP"
     refused = client.post(f"/v1/import-sessions/{opened['id']}/commit")
     assert refused.status_code == 409
@@ -382,6 +475,147 @@ def test_scenario_validation_enforces_model_variable_governance(data_manager):
     }
 
 
+def test_table_validation_enforces_selected_model_contract(data_manager):
+    client, db, project, _current, creator, _reviewer = data_manager
+    model = Model(
+        project_id=project.id, name="SPIA tables", product_code="SPIA",
+        created_by=creator.id,
+    )
+    db.add(model)
+    db.flush()
+    version = ModelVersion(
+        model_id=model.id, version_label="v1", basis="best_estimate"
+    )
+    variable = VariableRegistry(
+        name="mortality_qx_contract", data_type="number",
+        source_type="assumption",
+    )
+    db.add_all([version, variable])
+    db.flush()
+    db.add(ModelVariableDefinition(
+        model_version_id=version.id,
+        variable_name=variable.name,
+        kind="assumption",
+        data_type="number",
+        unit="rate",
+        source={
+            "type": "assumption",
+            "table": "Mortality",
+            "value_column": "qx",
+            "key_map": {"age": "attained_age", "gender": "gender"},
+        },
+        allow_scenario_override=False,
+    ))
+    db.commit()
+
+    opened = client.post("/v1/import-sessions", json={
+        "project_id": project.id,
+        "category": "assumption_table",
+        "name": "Mortality",
+        "options": {
+            "model_version_id": version.id,
+            "lookup_keys": ["age"],
+            "value_column": "wrong_value",
+            "value_unit": "USD",
+        },
+    }).json()
+    content = b"age,wrong_value\n65,0.01\n"
+    assert client.post(
+        f"/v1/import-sessions/{opened['id']}/files",
+        files={"file": ("mortality.csv", content)},
+    ).status_code == 200
+    mapping = [
+        {"source_column": key, "target_field": key}
+        for key in ("age", "wrong_value")
+    ]
+    assert client.put(
+        f"/v1/import-sessions/{opened['id']}/mapping",
+        json={"fields": mapping},
+    ).status_code == 200
+    validation = client.post(
+        f"/v1/import-sessions/{opened['id']}/validate"
+    ).json()
+    codes = {
+        item["code"] for item in client.get(
+            f"/v1/validation-runs/{validation['id']}/issues"
+        ).json()["issues"]
+    }
+    assert codes >= {
+        "MODEL_LOOKUP_KEYS_MISMATCH",
+        "MODEL_VALUE_COLUMN_MISMATCH",
+        "MODEL_UNIT_MISMATCH",
+    }
+
+    invalid = client.post("/v1/import-sessions", json={
+        "project_id": project.id,
+        "category": "assumption_table",
+        "name": "Mortality",
+        "options": {
+            "model_version_id": "00000000-0000-0000-0000-000000000000",
+            "lookup_keys": ["age"],
+            "value_column": "wrong_value",
+        },
+    }).json()
+    assert client.post(
+        f"/v1/import-sessions/{invalid['id']}/files",
+        files={"file": ("mortality.csv", content)},
+    ).status_code == 200
+    assert client.put(
+        f"/v1/import-sessions/{invalid['id']}/mapping",
+        json={"fields": mapping},
+    ).status_code == 200
+    invalid_validation = client.post(
+        f"/v1/import-sessions/{invalid['id']}/validate"
+    ).json()
+    invalid_codes = {
+        item["code"] for item in client.get(
+            f"/v1/validation-runs/{invalid_validation['id']}/issues"
+        ).json()["issues"]
+    }
+    assert "MODEL_VERSION_NOT_FOUND" in invalid_codes
+
+
+def test_execution_ready_scenario_requires_model_context(data_manager):
+    client, _db, project, _current, _creator, _reviewer = data_manager
+    opened = client.post("/v1/import-sessions", json={
+        "project_id": project.id,
+        "category": "scenario",
+        "name": "No model",
+    }).json()
+    csv = (
+        "scenario_name,target_variable,operation,value,"
+        "applies_from_period,applies_to_period\n"
+        "Stress,rate,set,0.03,0,1200\n"
+    )
+    assert client.post(
+        f"/v1/import-sessions/{opened['id']}/files",
+        files={"file": ("stress.csv", csv)},
+    ).status_code == 200
+    fields = [
+        {"source_column": key, "target_field": key}
+        for key in (
+            "scenario_name", "target_variable", "operation", "value",
+            "applies_from_period", "applies_to_period",
+        )
+    ]
+    assert client.put(
+        f"/v1/import-sessions/{opened['id']}/mapping",
+        json={"fields": fields},
+    ).status_code == 200
+    validation = client.post(
+        f"/v1/import-sessions/{opened['id']}/validate"
+    ).json()
+    codes = {
+        item["code"] for item in client.get(
+            f"/v1/validation-runs/{validation['id']}/issues"
+        ).json()["issues"]
+    }
+    assert "MODEL_CONTEXT_REQUIRED" in codes
+    assert client.post(
+        f"/v1/import-sessions/{opened['id']}/commit"
+    ).status_code == 409
+
+
 def test_required_columns_table_ranges_and_unsupported_files_are_refused(data_manager):
     client, _db, project, _current, _creator, _reviewer = data_manager
     opened = client.post("/v1/import-sessions", json={
@@ -425,6 +659,50 @@ def test_required_columns_table_ranges_and_unsupported_files_are_refused(data_ma
     response = client.post(f"/v1/import-sessions/{unsupported['id']}/files",
                            files={"file": ("input.pdf", b"not a dataset")})
     assert response.status_code == 400
+    legacy_excel = client.post(
+        f"/v1/import-sessions/{unsupported['id']}/files",
+        files={"file": ("legacy.xls", b"not modern xlsx")},
+    )
+    assert legacy_excel.status_code == 400
+    assert legacy_excel.json()["error"]["code"] == "UNSUPPORTED_FILE_FORMAT"
+
+
+def test_import_resource_limits_and_malformed_errors_are_stable(
+    data_manager, monkeypatch
+):
+    client, _db, project, _current, _creator, _reviewer = data_manager
+
+    def session(name: str) -> str:
+        return client.post("/v1/import-sessions", json={
+            "project_id": project.id,
+            "category": "assumption_table",
+            "name": name,
+        }).json()["id"]
+
+    monkeypatch.setattr(settings, "max_import_upload_bytes", 12)
+    too_large = client.post(
+        f"/v1/import-sessions/{session('large')}/files",
+        files={"file": ("large.csv", b"column\nmore-than-twelve\n")},
+    )
+    assert too_large.status_code == 413
+    assert too_large.json()["error"]["code"] == "IMPORT_FILE_TOO_LARGE"
+
+    monkeypatch.setattr(settings, "max_import_upload_bytes", 1024)
+    monkeypatch.setattr(settings, "max_import_records", 1)
+    too_many = client.post(
+        f"/v1/import-sessions/{session('rows')}/files",
+        files={"file": ("rows.csv", b"value\n1\n2\n")},
+    )
+    assert too_many.status_code == 413
+    assert too_many.json()["error"]["code"] == "IMPORT_LIMIT_EXCEEDED"
+
+    monkeypatch.setattr(settings, "max_import_records", 100)
+    malformed = client.post(
+        f"/v1/import-sessions/{session('malformed')}/files",
+        files={"file": ("bad.csv", b"name\n\xff\xfe\n")},
+    )
+    assert malformed.status_code == 400
+    assert malformed.json()["error"]["code"] == "MALFORMED_IMPORT_FILE"
 
 
 def test_viewer_cannot_write_and_archived_project_rejects_import(data_manager):
@@ -473,6 +751,15 @@ def test_legacy_uploads_are_governed_one_shot_wrappers_and_store_every_category(
     )
     assert scenarios.status_code == 201, scenarios.text
     assert len(scenarios.json()["dataset_ids"]) == 2
+    session = client.get(
+        f"/v1/import-sessions/{scenarios.json()['import_session_id']}"
+    )
+    assert session.status_code == 200
+    assert session.json()["dataset_ids"] == scenarios.json()["dataset_ids"]
+    assert session.json()["datasets"] == [
+        {"kind": "scenario", "id": dataset_id}
+        for dataset_id in scenarios.json()["dataset_ids"]
+    ]
 
     empty = client.post(
         "/v1/imports/inforce", params={"project_id": project.id},

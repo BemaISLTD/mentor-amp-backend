@@ -31,6 +31,7 @@ from app.db.models.governance import (  # noqa: F401
 )
 from app.db.models.data_manager import (  # noqa: F401
     ImportSession,
+    ImportSessionDataset,
     ImportSessionEvent,
     MappingProfile,
     RejectedRecord,

@@ -263,6 +263,7 @@ def test_trace_follows_the_formula_to_the_table_row(env, ids):
     trace = get(client, f"/runs/{ids['base']}/trace", policy_id="SPIA-0001", month=12,
                 variable="pv_expected_payment", depth=5)
     root = trace["root"]
+    assert root["value"] == 1533.2093195295497
     assert root["kind"] == "formula"
     assert [c["variable"] for c in root["children"]] == ["discount_factor", "expected_payment"]
     expected_payment = next(c for c in root["children"] if c["variable"] == "expected_payment")

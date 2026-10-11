@@ -7,21 +7,20 @@ from app.api.audit_logs import router as audit_logs_router
 from app.api.assets import router as assets_router
 from app.api.dashboard import router as dashboard_router
 from app.api.data_manager import router as data_manager_router
-from app.api.dependencies import get_current_user, require_permissions, require_roles
+from app.api.dependencies import get_current_user, require_permissions
 from app.api.errors import register_exception_handlers
 from app.api.execution import router as execution_router
 from app.api.formulas import router as formulas_router
-from app.api.governance import router as governance_router
+from app.api.governance import (
+    router as experimental_governance_router,
+    run_steps_router,
+)
 from app.api.imports import router as imports_router
 from app.api.inputs import router as inputs_router
 from app.api.modeling import router as modeling_router
 from app.api.projection_sets import router as projection_sets_router
 from app.api.projects import router as projects_router
 from app.api.products import router as products_router
-from app.api.reconciliation import router as reconciliation_router
-from app.api.results import router as legacy_results_router
-from app.api.runs import router as legacy_runs_router
-from app.api.trace import router as legacy_trace_router
 from app.api.scenarios import router as scenarios_router
 from app.api.system import router as system_router
 from app.api.users import router as users_router
@@ -81,17 +80,6 @@ app.include_router(
     dependencies=[Depends(require_permissions("registries:read"))],
 )
 app.include_router(
-    reconciliation_router,
-    prefix=API_PREFIX,
-    dependencies=[Depends(require_permissions("runs:read")), Depends(require_roles("admin"))],
-)
-for legacy_router in (legacy_runs_router, legacy_results_router, legacy_trace_router):
-    app.include_router(
-        legacy_router,
-        prefix=API_PREFIX,
-        dependencies=[Depends(require_permissions("runs:read")), Depends(require_roles("admin"))],
-    )
-app.include_router(
     products_router,
     prefix=API_PREFIX,
     dependencies=[Depends(require_permissions("registries:read"))],
@@ -114,7 +102,14 @@ app.include_router(scenarios_router, prefix=API_PREFIX)
 app.include_router(projection_sets_router, prefix=API_PREFIX)
 app.include_router(execution_router, prefix=API_PREFIX)
 app.include_router(analysis_router, prefix=API_PREFIX)
-app.include_router(governance_router, prefix=API_PREFIX)
+app.include_router(run_steps_router, prefix=API_PREFIX)
+# Metadata-only future capabilities are intentionally unavailable under /v1 and omitted
+# from OpenAPI until their actuarial execution/reporting behavior is implemented.
+app.include_router(
+    experimental_governance_router,
+    prefix="/internal/experimental",
+    include_in_schema=False,
+)
 app.include_router(data_manager_router, prefix=API_PREFIX)
 
 

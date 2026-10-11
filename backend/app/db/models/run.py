@@ -83,5 +83,6 @@ class Run(Base):
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     retried_from_run_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("runs.id", ondelete="RESTRICT"), nullable=True, index=True
+        String(36), ForeignKey("runs.id", ondelete="RESTRICT"),
+        nullable=True, index=True, unique=True,
     )

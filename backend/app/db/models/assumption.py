@@ -3,11 +3,12 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core import lifecycle
 from app.db.database import Base
+from app.db.immutability import protect_after_commit
 
 
 class AssumptionSet(Base):
@@ -32,6 +33,12 @@ class AssumptionTable(Base):
     """A single assumption table (rows of lookup data)."""
 
     __tablename__ = "assumption_tables"
+    __table_args__ = (
+        UniqueConstraint(
+            "version_group_id", "version_number",
+            name="uq_assumption_tables_version_group_number",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
@@ -79,3 +86,12 @@ class AssumptionTable(Base):
     )
     rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     review_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+protect_after_commit(
+    AssumptionTable,
+    mutable_columns=frozenset({
+        "status", "approved_by", "approved_at", "rejected_by", "rejected_at",
+        "review_reason",
+    }),
+)

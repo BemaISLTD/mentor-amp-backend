@@ -77,8 +77,28 @@ def is_complete(run: Run) -> bool:
     return run.status == run_state.SUCCESS
 
 
-def _accepted_rows(db: Session, run: Run) -> list[dict[str, Any]]:
-    rows = read_attempt_artifact_rows(db, run.id, "outputs", run.accepted_attempt_number)
+def _accepted_rows(
+    db: Session,
+    run: Run,
+    *,
+    policy_id: str | None = None,
+    variable_names: str | list[str] | None = None,
+    month: int | None = None,
+    month_from: int | None = None,
+    month_to: int | None = None,
+) -> list[dict[str, Any]]:
+    rows = read_attempt_artifact_rows(
+        db,
+        run.id,
+        "outputs",
+        run.accepted_attempt_number,
+        filters={
+            "policy_id": policy_id,
+            "variable_name": variable_names,
+            "projection_month": month,
+        },
+        ranges={"projection_month": (month_from, month_to)},
+    )
     return [
         {**row, "value": json.loads(row["value_json"])}
         for row in rows if row.get("attempt_number") == run.accepted_attempt_number
@@ -172,17 +192,15 @@ def result_rows(
 ) -> dict[str, Any]:
     run = result_run(db, run_id, include_partial)
     config = run_configuration(db, run)
-    rows = _accepted_rows(db, run)
-    if policy_id:
-        rows = [row for row in rows if row["policy_id"] == policy_id]
-    if variable:
-        rows = [row for row in rows if row["variable_name"] == variable]
-    if month is not None:
-        rows = [row for row in rows if row["projection_month"] == month]
-    if month_from is not None:
-        rows = [row for row in rows if row["projection_month"] >= month_from]
-    if month_to is not None:
-        rows = [row for row in rows if row["projection_month"] <= month_to]
+    rows = _accepted_rows(
+        db,
+        run,
+        policy_id=policy_id,
+        variable_names=variable,
+        month=month,
+        month_from=month_from,
+        month_to=month_to,
+    )
     total = len(rows)
     rows = sorted(rows, key=lambda row: (row["policy_id"], row["projection_month"], row["variable_name"]))
     rows = rows[offset:offset + limit]
@@ -219,7 +237,9 @@ def result_rows(
 def _monthly_sums(db: Session, run: Run, names: list[str], policy_id: str | None) -> dict[str, dict[int, float]]:
     # Decimal accumulation is deterministic across Parquet partition/read ordering.
     totals: dict[str, dict[int, Decimal]] = {name: {} for name in names}
-    for row in _accepted_rows(db, run):
+    for row in _accepted_rows(
+        db, run, policy_id=policy_id, variable_names=names
+    ):
         name = row["variable_name"]
         if name not in totals or (policy_id and row["policy_id"] != policy_id):
             continue

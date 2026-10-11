@@ -27,7 +27,7 @@ Results are readable only when ``evidence_consistent`` holds (see ``results_serv
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from sqlalchemy import select
@@ -171,6 +171,34 @@ def record_intended_outcome(db: Session, outcome: TerminalOutcome) -> None:
     db.commit()
 
 
+def _cancelled_outcome(run: Run, outcome: TerminalOutcome) -> TerminalOutcome:
+    """Make an accepted cancellation authoritative inside the terminal transaction."""
+    summary = dict(outcome.summary or {})
+    summary.update({
+        "status": run_state.CANCELLED,
+        "complete": False,
+        "headline": None,
+        "totals": {},
+    })
+    requested_at = run.cancel_requested_at
+    return replace(
+        outcome,
+        status=run_state.CANCELLED,
+        completed_at=requested_at.isoformat() if requested_at else outcome.completed_at,
+        cleanup_status="retained_noncanonical",
+        summary=summary,
+        event_step="cancelled",
+        event_message="Run cancelled before its terminal outcome was committed.",
+        event_level="warning",
+        event_data={
+            **(outcome.event_data or {}),
+            "status": run_state.CANCELLED,
+            "attempt_number": outcome.attempt_number,
+            "cancel_requested_by": run.cancel_requested_by,
+        },
+    )
+
+
 def finalize_attempt(db: Session, outcome: TerminalOutcome) -> FinalizationResult:
     run = db.execute(select(Run).where(Run.id == outcome.run_id).with_for_update()).scalar_one()
     attempt = db.get(RunAttempt, outcome.attempt_id)
@@ -190,6 +218,11 @@ def finalize_attempt(db: Session, outcome: TerminalOutcome) -> FinalizationResul
             details,
         )
 
+    if run.cancel_requested_at is not None and outcome.status != run_state.CANCELLED:
+        outcome = _cancelled_outcome(run, outcome)
+        # Recovery must replay the outcome that actually won under the run lock.
+        attempt.intended_outcome = outcome.as_dict()
+
     from datetime import datetime  # local: only needed when a finalization is applied
 
     completed_at = datetime.fromisoformat(outcome.completed_at)
@@ -202,6 +235,8 @@ def finalize_attempt(db: Session, outcome: TerminalOutcome) -> FinalizationResul
         run.summary = outcome.summary
     if outcome.status in run_state.RESULT_STATUSES:
         run.accepted_attempt_number = attempt.attempt_number
+    else:
+        run.accepted_attempt_number = None
     attempt.output_row_count = outcome.output_row_count
     attempt.trace_row_count = outcome.trace_row_count
     attempt.cleanup_status = outcome.cleanup_status

@@ -9,7 +9,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.database import Base
-from app.db.immutability import forbid_updates
+from app.db.immutability import forbid_deletes, forbid_updates
 
 JSON_VALUE = JSON().with_variant(JSONB(), "postgresql")
 
@@ -53,7 +53,7 @@ class RunArtifact(Base):
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )
     run_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False
+        String(36), ForeignKey("runs.id", ondelete="RESTRICT"), nullable=False
     )
     attempt_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     artifact_type: Mapped[str] = mapped_column(String(30), nullable=False)
@@ -69,3 +69,7 @@ class RunArtifact(Base):
         default=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
+
+
+forbid_updates(RunArtifact)
+forbid_deletes(RunArtifact)

@@ -101,7 +101,7 @@ def test_lists_only_contain_accessible_projects(env):
     assert b_formula not in {formula["id"] for formula in formulas}
 
 
-def test_deprecated_legacy_run_routes_are_admin_only(env):
+def test_legacy_run_control_plane_is_not_mounted(env):
     run_id = env.projects["B"]["runs"]["Base"]
     for path in (
         f"/legacy-runs/{run_id}",
@@ -110,7 +110,7 @@ def test_deprecated_legacy_run_routes_are_admin_only(env):
         f"/legacy-runs/{run_id}/reports/reconciliation?baseline_run_id={run_id}",
     ):
         response = env.client.get(f"/v1{path}", headers=env.viewer_a["headers"])
-        assert response.status_code == 403, (path, response.status_code, response.text)
+        assert response.status_code == 404, (path, response.status_code, response.text)
 
 
 def test_backlog_project_data_is_scoped_to_membership(env):

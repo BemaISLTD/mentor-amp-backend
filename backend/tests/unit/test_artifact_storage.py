@@ -2,15 +2,21 @@
 
 from pathlib import Path
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core import artifacts
-from app.core.artifacts import LocalParquetArtifactStore, RunArtifactBuffer
+from app.core.artifacts import (
+    LocalParquetArtifactStore,
+    RunArtifactBuffer,
+    read_attempt_artifact_rows,
+)
 from app.core.output import storage as output_storage
 from app.core.projection_engine import runner
 from app.core.variable_registry.resolver import _prior_period_lookup
 from app.db.database import Base
+from app.db.immutability import ImmutableRecordError
 from app.core.formula_engine.formulas import (
     FORMULA_REGISTRY,
     RegisteredFormulaFunction,
@@ -19,6 +25,8 @@ from app.core.formula_engine.formulas import (
 from app.db.models.run import Run
 from app.db.models.run_artifact import RunArtifact
 from app.models.schemas import FormulaDefinition, ProjectionContext, ProjectionRunDefinition
+from app.services.common import ServiceError
+from app.services import artifact_reconciliation
 
 
 def test_output_buffer_writes_parquet_and_reads_results(tmp_path, monkeypatch):
@@ -74,6 +82,128 @@ def test_local_store_rejects_path_traversal(tmp_path):
         assert "escapes" in str(exc)
     else:
         raise AssertionError("Path traversal should be rejected.")
+
+
+def test_orphan_reconciliation_never_deletes_registered_evidence(tmp_path, monkeypatch):
+    store = LocalParquetArtifactStore(tmp_path)
+    retained = store.write_rows("retained", "outputs", [{"value": 1}])
+    orphan = store.write_rows("orphan", "outputs", [{"value": 2}])
+    monkeypatch.setattr(
+        artifact_reconciliation,
+        "registered_local_uris",
+        lambda _db: {retained.uri},
+    )
+    future = max(
+        store.path_for_uri(retained.uri).stat().st_mtime,
+        store.path_for_uri(orphan.uri).stat().st_mtime,
+    ) + 10
+
+    dry_run = artifact_reconciliation.reconcile_local_artifacts(
+        object(), store=store, now=future, min_age_seconds=0
+    )
+    assert dry_run.orphan_uris == (orphan.uri,)
+    assert dry_run.deleted_uris == ()
+    assert store.path_for_uri(orphan.uri).exists()
+
+    deleted = artifact_reconciliation.reconcile_local_artifacts(
+        object(), store=store, delete=True, now=future, min_age_seconds=0
+    )
+    assert deleted.deleted_uris == (orphan.uri,)
+    assert store.path_for_uri(retained.uri).exists()
+    assert not store.path_for_uri(orphan.uri).exists()
+
+
+def test_registered_artifact_checksum_is_enforced(tmp_path, monkeypatch):
+    engine = create_engine("sqlite://")
+    RunArtifact.__table__.create(engine)
+    db = sessionmaker(bind=engine)()
+    store = LocalParquetArtifactStore(tmp_path)
+    monkeypatch.setattr(artifacts, "get_artifact_store", lambda: store)
+    buffer = RunArtifactBuffer("run-tampered", store=store)
+    buffer.add_output("P001", "base", 1, "reserve", 100.5)
+    artifact = buffer.flush_policy(db, "P001")[0]
+    db.commit()
+
+    store.path_for_uri(artifact.storage_uri).write_bytes(b"replaced")
+    with pytest.raises(ServiceError) as raised:
+        output_storage.get_run_results(db, "run-tampered")
+    assert raised.value.code == "ARTIFACT_CHECKSUM_MISMATCH"
+
+    db.close()
+    engine.dispose()
+
+
+def test_selected_attempt_query_uses_filtered_verified_scan(tmp_path):
+    engine = create_engine("sqlite://")
+    RunArtifact.__table__.create(engine)
+    db = sessionmaker(bind=engine)()
+    store = LocalParquetArtifactStore(tmp_path)
+    rows = [
+        {
+            "run_id": "run-filtered",
+            "attempt_number": 1,
+            "policy_id": f"P{number:04d}",
+            "scenario_id": "base",
+            "projection_month": 1,
+            "variable_name": "reserve",
+            "value_json": str(number),
+            "product": "SPIA",
+        }
+        for number in range(1000)
+    ]
+    stored = store.write_rows("run-filtered", "outputs", rows)
+    db.add(RunArtifact(
+        run_id="run-filtered",
+        attempt_number=1,
+        artifact_type="outputs",
+        storage_uri=stored.uri,
+        storage_backend="local",
+        file_format="parquet",
+        schema_version="m1-v1",
+        row_count=stored.row_count,
+        checksum_sha256=stored.checksum_sha256,
+        partition={"attempt_number": 1},
+    ))
+    db.commit()
+
+    selected = read_attempt_artifact_rows(
+        db,
+        "run-filtered",
+        "outputs",
+        1,
+        store,
+        filters={"policy_id": "P0500"},
+    )
+    assert len(selected) == 1
+    assert selected[0]["policy_id"] == "P0500"
+
+    db.close()
+    engine.dispose()
+
+
+def test_run_artifact_orm_refuses_update_and_delete(tmp_path):
+    engine = create_engine("sqlite://")
+    RunArtifact.__table__.create(engine)
+    db = sessionmaker(bind=engine)()
+    store = LocalParquetArtifactStore(tmp_path)
+    buffer = RunArtifactBuffer("run-retained", store=store)
+    artifact = buffer.flush_policy(db, "P001")
+    assert artifact == []
+    buffer.add_output("P001", "base", 1, "reserve", 1.0)
+    row = buffer.flush_policy(db, "P001")[0]
+    db.commit()
+
+    row.row_count = 2
+    with pytest.raises(ImmutableRecordError):
+        db.commit()
+    db.rollback()
+    db.delete(row)
+    with pytest.raises(ImmutableRecordError):
+        db.flush()
+
+    db.rollback()
+    db.close()
+    engine.dispose()
 
 
 def test_prior_period_fallback_reads_parquet_artifact(tmp_path, monkeypatch):

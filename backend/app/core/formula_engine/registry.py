@@ -7,7 +7,9 @@ from sqlalchemy.orm import Session
 from app.core.audit import record_audit
 from app.db.models.formula import FormulaRegistry as FormulaModel
 from app.db.models.formula_dependency import FormulaDependency
+from app.db.models.modeling import ModelVersion
 from app.models.schemas import FormulaDefinition
+from app.services.common import ServiceError
 
 
 def _state(model: FormulaModel) -> dict:
@@ -48,6 +50,19 @@ def _model_to_definition(model: FormulaModel) -> FormulaDefinition:
         version=model.version or "v1",
         status=model.status or "draft",
     )
+
+
+def _require_mutable_model_version(db: Session, model: FormulaModel) -> None:
+    if not model.model_version_id:
+        return
+    version = db.get(ModelVersion, model.model_version_id)
+    if version and (version.status in {"published", "approved"} or version.published_at is not None):
+        raise ServiceError(
+            409,
+            "MODEL_VERSION_IMMUTABLE",
+            "Formulas on a published or approved model version are immutable; create a new version.",
+            {"model_version_id": version.id, "status": version.status},
+        )
 
 
 def register(db: Session, formula: FormulaDefinition, actor_user_id: str) -> FormulaDefinition:
@@ -111,6 +126,7 @@ def update(db: Session, formula_id: str, updates: dict, actor_user_id: str) -> F
     ).first()
     if model is None:
         return None
+    _require_mutable_model_version(db, model)
     before = _state(model)
     allowed = {"name", "output_variable", "function_ref", "category",
                "product_applicability", "basis_applicability", "status"}
@@ -135,6 +151,7 @@ def delete(db: Session, formula_id: str, actor_user_id: str) -> bool:
     ).first()
     if model is None:
         return False
+    _require_mutable_model_version(db, model)
     before = _state(model)
     model.deleted_at = datetime.now(timezone.utc)
     model.deleted_by = actor_user_id

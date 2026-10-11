@@ -62,6 +62,27 @@ class ImportSession(Base):
     )
 
 
+class ImportSessionDataset(Base):
+    __tablename__ = "import_session_datasets"
+    __table_args__ = (
+        UniqueConstraint(
+            "import_session_id", "dataset_kind", "dataset_id",
+            name="uq_import_session_dataset",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntegerPK, primary_key=True, autoincrement=True)
+    import_session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("import_sessions.id", ondelete="RESTRICT"),
+        nullable=False, index=True,
+    )
+    dataset_kind: Mapped[str] = mapped_column(String(30), nullable=False)
+    dataset_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+
 class MappingProfile(Base):
     __tablename__ = "mapping_profiles"
     __table_args__ = (
@@ -99,6 +120,9 @@ class ValidationRun(Base):
     accepted_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     rejected_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     canonical_storage_uri: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    canonical_checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    canonical_row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    canonical_schema_version: Mapped[str | None] = mapped_column(String(30), nullable=True)
     canonical_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     fingerprint_scheme: Mapped[str | None] = mapped_column(String(30), nullable=True)
     created_by: Mapped[str | None] = mapped_column(
@@ -136,6 +160,9 @@ class RejectedRecord(Base):
     )
     row_number: Mapped[int] = mapped_column(Integer, nullable=False)
     storage_uri: Mapped[str] = mapped_column(String(1000), nullable=False)
+    checksum_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    artifact_row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    artifact_schema_version: Mapped[str | None] = mapped_column(String(30), nullable=True)
     reasons: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 

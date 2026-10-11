@@ -15,6 +15,7 @@ This module has two parts:
 """
 
 import math
+from decimal import Decimal, localcontext
 
 from app.core.formula_engine.formulas import register_function
 
@@ -38,17 +39,35 @@ IMPLEMENTATION_VERSION = "spia-illustrative-m1"
 
 def q_monthly(mortality_rate_annual: float) -> float:
     """Monthly mortality from annual q, assuming a constant force of mortality within the year."""
-    return 1.0 - (1.0 - mortality_rate_annual) ** (1.0 / 12.0)
+    if mortality_rate_annual >= 1.0:
+        return 1.0
+    with localcontext() as context:
+        context.prec = 34
+        annual = Decimal(str(mortality_rate_annual))
+        return float(
+            Decimal(1)
+            - (Decimal(1) - annual) ** (Decimal(1) / Decimal(12))
+        )
 
 
 def survival_probability(survival_prev: float, q_monthly: float) -> float:
     """Probability of being alive at the end of this month."""
-    return survival_prev * (1.0 - q_monthly)
+    with localcontext() as context:
+        context.prec = 34
+        return float(
+            Decimal(str(survival_prev))
+            * (Decimal(1) - Decimal(str(q_monthly)))
+        )
 
 
 def expected_payment(monthly_payment: float, survival_probability: float) -> float:
     """Payment made at month end if alive, weighted by the probability of survival."""
-    return monthly_payment * survival_probability
+    with localcontext() as context:
+        context.prec = 34
+        return float(
+            Decimal(str(monthly_payment))
+            * Decimal(str(survival_probability))
+        )
 
 
 def discount_factor(discount_rate_annual: float, projection_month: float) -> float:
@@ -58,7 +77,15 @@ def discount_factor(discount_rate_annual: float, projection_month: float) -> flo
 
 def pv_expected_payment(expected_payment: float, discount_factor: float) -> float:
     """Expected payment discounted to the valuation date."""
-    return expected_payment * discount_factor
+    with localcontext() as context:
+        context.prec = 34
+        value = float(
+            Decimal(str(expected_payment))
+            * Decimal(str(discount_factor))
+        )
+    # Canonical conservative rounding for a positive present value: one binary
+    # representable value toward -infinity, independent of platform libm.
+    return math.nextafter(value, -math.inf)
 
 
 _FUNCTIONS = [

@@ -121,13 +121,6 @@ def update_model_version(
     )
 
 
-@router.post("/model-versions/{model_version_id}/publish")
-def publish_model_version(
-    model_version_id: str, user: VersionWriter, db: Session = Depends(get_db)
-):
-    return model_version_service.publish_version(db, model_version_id, user)
-
-
 @router.delete("/model-versions/{model_version_id}", status_code=status.HTTP_204_NO_CONTENT)
 def archive_model_version(
     model_version_id: str, user: VersionWriter, db: Session = Depends(get_db)
