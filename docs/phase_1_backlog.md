@@ -12,7 +12,7 @@ it is considered complete.
 
 | Area | Verified state | Status |
 | --- | --- | --- |
-| Tests | Original test modules were empty placeholders | **Correction-pass evidence:** all 268 application tests pass (16 opt-in skips without PostgreSQL); all 15 PostgreSQL migration/concurrency tests pass separately |
+| Tests | Original test modules were empty placeholders | **Correction-pass evidence:** all 268 application tests pass (19 opt-in skips without PostgreSQL); all 18 PostgreSQL migration/concurrency/terminal-run tests pass separately; all 269 native Windows tests pass (18 PostgreSQL skips) |
 | Seed data | No seed script existed | Complete for illustrative SPIA demo; broader product and workflow seed remains open |
 | Authentication/RBAC | No auth dependency or user/RBAC models existed | **Complete:** JWT and the administrator, actuary, model developer, reviewer, and read-only permission matrix are enforced |
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
@@ -31,12 +31,15 @@ it is considered complete.
   - Build coverage for database connectivity, migrations, model constraints,
     validation, authentication/authorization, API behavior, engine behavior,
     and golden policies.
-  - Current reliable named-container evidence: 268 passed, 16 skipped, exit
+  - Current reliable named-container evidence: 268 passed, 19 skipped, exit
     code 0. Exact 600-month, 24-month, payment-total, and trace references are
     asserted without tolerances.
-  - All 15 PostgreSQL migration/concurrency tests pass with exit code 0 on a
-    disposable PostgreSQL 15 database. The shared Neon database was not migrated
-    or seeded.
+  - All 18 PostgreSQL migration/concurrency/terminal-run tests pass with exit
+    code 0 on a disposable PostgreSQL 15 database. Running cancellation,
+    all-policy failure, and post-write execution failure each reach a terminal
+    state and can be retried.
+  - The native Windows suite passes 269 tests with 18 PostgreSQL-only skips.
+    The shared Neon database was not migrated or seeded.
 - **[IMPROVE] Database Seeding Scripts — IN PROGRESS**
   - `scripts/seed_demo.py` idempotently creates synthetic SPIA users, project,
     inputs, scenarios, model, and a validated projection set. Broader product

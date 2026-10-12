@@ -33,7 +33,7 @@ RAW_URL = os.environ.get("MENTORAMP_TEST_POSTGRES_URL")
 pytestmark = pytest.mark.skipif(
     not RAW_URL, reason="set MENTORAMP_TEST_POSTGRES_URL to a disposable PostgreSQL database"
 )
-HEAD, WP1_HEAD, MERGE = "ab6d9e2f4013", "b7e4d2a9c613", "a3c5e7f9b1d2"
+HEAD, WP1_HEAD, MERGE = "d4f7a9c2e681", "b7e4d2a9c613", "a3c5e7f9b1d2"
 M1_HEAD, DEV_HEAD = "4d8e2f6a1c90", "c48a2d7159be"
 BACKEND = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -94,6 +94,11 @@ def test_empty_database_upgrades_downgrades_and_upgrades_again(pg):
     assert {"created_by", "updated_by"} <= {column["name"] for column in columns}
     assert "updated_by" in {column["name"] for column in inspect(engine).get_columns("formula_registry")}
     assert "model_variable_definitions" in tables
+    cleanup_status = next(
+        column for column in inspect(engine).get_columns("run_attempts")
+        if column["name"] == "cleanup_status"
+    )
+    assert cleanup_status["type"].length == 32
     command.downgrade(config, "f8c2d4e6a901")
     assert set(current(engine)) == {"f8c2d4e6a901", "c9e2a4b6d8f1"}
     command.upgrade(config, "head")
@@ -828,3 +833,186 @@ def test_concurrent_retry_calls_return_one_successor(pg, monkeypatch):
         assert c.execute(text(
             "SELECT count(*) FROM runs WHERE retried_from_run_id = :source"
         ), {"source": source_id}).scalar_one() == 1
+
+
+# =============================================================================
+# PostgreSQL terminal run outcomes
+# =============================================================================
+
+def _prepared_postgres_run(pg, tmp_path, monkeypatch):
+    from app.core import artifacts
+    from app.core.artifacts import LocalParquetArtifactStore
+    from app.services import (
+        projection_set_service,
+        run_execution_service,
+        run_submission_service,
+    )
+    from tests.integration.wp1_support import load_seed_module
+
+    engine, config = pg
+    reset(engine)
+    command.upgrade(config, "head")
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
+    store = LocalParquetArtifactStore(tmp_path / "run-artifacts")
+    monkeypatch.setattr(artifacts, "get_artifact_store", lambda: store)
+    monkeypatch.setattr(run_execution_service, "get_artifact_store", lambda: store)
+    monkeypatch.setattr(run_execution_service, "SessionLocal", Session)
+
+    with Session() as db:
+        seeded = load_seed_module().seed(db, project_name=f"PG terminal {uuid.uuid4()}")
+        projection_set = seeded["projection_set"]
+        projection_set.horizon_months = 2
+        db.commit()
+        validation = projection_set_service.validate(db, projection_set.id)
+        assert validation["status"] == "validated", validation
+        base = next(
+            scenario for scenario in seeded["scenarios"]
+            if scenario.scenario_name == "Base"
+        )
+        submitted = run_submission_service.submit_run_set(
+            db,
+            {
+                "project_id": seeded["project"].id,
+                "name": "PostgreSQL terminal behavior",
+                "projection_set_ids": [projection_set.id],
+                "scenario_ids": [base.id],
+            },
+            seeded["user"],
+        )
+        run_id = submitted["runs"][0]["id"]
+        user_id = seeded["user"].id
+    return Session, store, submitted["run_set"]["id"], run_id, user_id
+
+
+def _assert_terminal_run_can_retry(
+    Session, run_id: str, user_id: str, expected_status: str
+) -> str:
+    from app.db.models.run import Run
+    from app.db.models.run_package import RunAttempt
+    from app.db.models.user import User
+    from app.services import run_control_service, run_execution_service
+
+    with Session() as db:
+        source = db.get(Run, run_id)
+        attempt = db.query(RunAttempt).filter_by(run_id=run_id).one()
+        assert source.status == expected_status
+        assert source.accepted_attempt_number is None
+        assert attempt.status == expected_status
+        assert attempt.cleanup_status == "retained_noncanonical"
+        retry = run_control_service.retry_run(db, run_id, db.get(User, user_id))
+        retry_id = retry["id"]
+
+    assert run_execution_service.execute_run_by_id(retry_id) is None
+    with Session() as db:
+        retried = db.get(Run, retry_id)
+        assert retried.status == "success"
+        assert retried.retried_from_run_id == run_id
+        assert retried.accepted_attempt_number == 1
+    return retry_id
+
+
+def test_running_cancel_reaches_terminal_state_and_can_retry_on_postgres(
+    pg, tmp_path, monkeypatch
+):
+    from app.db.models.run_artifact import RunArtifact
+    from app.db.models.user import User
+    from app.services import run_control_service, run_execution_service
+
+    Session, _store, run_set_id, run_id, user_id = _prepared_postgres_run(
+        pg, tmp_path, monkeypatch
+    )
+    real_run_policy = run_execution_service.run_policy
+    calls = 0
+    worker_paused = threading.Event()
+    release_worker = threading.Event()
+
+    def cancel_during_execution(data, policy, functions):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            worker_paused.set()
+            assert release_worker.wait(timeout=15)
+        return real_run_policy(data, policy, functions)
+
+    # Commit progress after policy one, then pause policy two before calculation.
+    # The controller therefore observes a genuinely running worker without sharing
+    # its transaction or waiting on a lock held by its own call stack.
+    monkeypatch.setattr(settings, "run_heartbeat_every_policies", 1)
+    monkeypatch.setattr(
+        run_execution_service, "run_policy", cancel_during_execution
+    )
+    worker = threading.Thread(
+        target=run_execution_service.execute_run_set, args=(run_set_id,)
+    )
+    worker.start()
+    assert worker_paused.wait(timeout=15)
+    with Session() as control_db:
+        response = run_control_service.cancel_run(
+            control_db, run_id, control_db.get(User, user_id)
+        )
+        assert response["status"] == "running"
+        assert response["cancel_requested_at"] is not None
+    release_worker.set()
+    worker.join(timeout=30)
+    assert not worker.is_alive()
+    monkeypatch.setattr(run_execution_service, "run_policy", real_run_policy)
+
+    with Session() as db:
+        assert db.query(RunArtifact).filter_by(run_id=run_id).count() > 0
+    _assert_terminal_run_can_retry(Session, run_id, user_id, "cancelled")
+
+
+def test_all_policy_failures_reach_terminal_state_and_can_retry_on_postgres(
+    pg, tmp_path, monkeypatch
+):
+    from app.core.projection_engine.engine import EngineError, PolicyResult
+    from app.services import run_execution_service
+
+    Session, _store, run_set_id, run_id, user_id = _prepared_postgres_run(
+        pg, tmp_path, monkeypatch
+    )
+    real_run_policy = run_execution_service.run_policy
+
+    def fail_policy(_data, policy, _functions):
+        return PolicyResult(
+            policy_id=policy.policy_id,
+            error=EngineError(
+                "lookup_failed", "forced PostgreSQL policy failure", "qx", 1
+            ),
+        )
+
+    monkeypatch.setattr(run_execution_service, "run_policy", fail_policy)
+    run_execution_service.execute_run_set(run_set_id)
+    monkeypatch.setattr(run_execution_service, "run_policy", real_run_policy)
+    _assert_terminal_run_can_retry(Session, run_id, user_id, "failed")
+
+
+def test_execution_error_after_written_results_can_retry_on_postgres(
+    pg, tmp_path, monkeypatch
+):
+    from app.db.models.run_artifact import RunArtifact
+    from app.services import run_execution_service
+
+    Session, _store, run_set_id, run_id, user_id = _prepared_postgres_run(
+        pg, tmp_path, monkeypatch
+    )
+    real_run_policy = run_execution_service.run_policy
+    calls = 0
+
+    def fail_after_first_policy(data, policy, functions):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("forced error after committed result evidence")
+        return real_run_policy(data, policy, functions)
+
+    monkeypatch.setattr(settings, "run_artifact_target_rows", 1)
+    monkeypatch.setattr(
+        run_execution_service, "run_policy", fail_after_first_policy
+    )
+    run_execution_service.execute_run_set(run_set_id)
+    monkeypatch.setattr(run_execution_service, "run_policy", real_run_policy)
+
+    with Session() as db:
+        assert db.query(RunArtifact).filter_by(run_id=run_id).count() > 0
+    _assert_terminal_run_can_retry(Session, run_id, user_id, "failed")

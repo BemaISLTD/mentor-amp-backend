@@ -51,13 +51,15 @@ owner when the private repository PR is created or updated.
 Before convergence, backlog and correction work had separate history. The
 joined graph has one head:
 
-    ... -> f3b8d6a1e240 -> e6a9c4d2f817 -> ab6d9e2f4013
+    ... -> e6a9c4d2f817 -> ab6d9e2f4013 -> d4f7a9c2e681
 
-Alembic head: ab6d9e2f4013.
+Alembic head: d4f7a9c2e681.
 
-The final revision adds the verified legacy bridge gate, Data Manager evidence
+The legacy-bridge revision adds the verified bridge gate, Data Manager evidence
 columns and association table, version uniqueness, retry uniqueness, retained
 RunArtifact foreign key, audit retention, and PostgreSQL immutability triggers.
+The forward revision d4f7a9c2e681 widens run_attempts.cleanup_status to 32
+characters so retained_noncanonical terminal outcomes commit on PostgreSQL.
 
 ## 5. M1 legacy-result migration evidence
 
@@ -169,30 +171,41 @@ database constraint.
 - docs/wp2_frontend_api_contract.md — authoritative frontend contract.
 - docs/wp2_correction_handoff.md — this evidence report.
 
+- backend/app/db/migrations/versions/d4f7a9c2e681_widen_attempt_cleanup_status.py - PostgreSQL terminal-outcome correction.
+
 The excluded local files docs/build/02_BACKEND_FRONTEND_CONTRACT.md and
 docs/delivery_acceptance_report.md remain untracked and are not part of this
 handoff.
 
 ## 11. SQLite test results
 
-Named container mentor_amp_corrections_full_2:
+Named container mentor_amp_cleanup_status_full:
 
 - 268 passed
 - 0 failed
-- 16 skipped because PostgreSQL is opt-in in this run
+- 19 skipped because PostgreSQL is opt-in in this run
 - 1 Starlette dependency deprecation warning
-- duration 122.36 seconds
+- duration 179.72 seconds
+- exit code 0
+
+Native Windows Python 3.13:
+
+- 269 passed
+- 0 failed
+- 18 skipped because PostgreSQL is opt-in in this run
+- duration 129.25 seconds
 - exit code 0
 
 ## 12. PostgreSQL test results
 
-Named container mentor_amp_corrections_pg_1 against disposable PostgreSQL 15:
+Named container mentor_amp_cleanup_status_pg_full against disposable PostgreSQL 15:
 
-- 15 passed
+- 18 passed
 - 0 failed
 - 0 skipped
-- 28 SQLAlchemy deprecation warnings from an older RBAC migration
-- duration 120.16 seconds
+- 34 SQLAlchemy deprecation warnings from an older RBAC migration
+- 1 Starlette dependency deprecation warning
+- duration 141.86 seconds
 - exit code 0
 
 ## 13. Migration path results

@@ -10,7 +10,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 
 BACKEND = Path(__file__).resolve().parents[2]
-HEAD = "ab6d9e2f4013"
+HEAD = "d4f7a9c2e681"
 WP1 = "b7e4d2a9c613"
 MERGE = "a3c5e7f9b1d2"
 
@@ -37,7 +37,8 @@ def test_the_merge_joins_the_m1_and_dev_histories():
     assert script().get_revision("c9e2a4b6d8f1").down_revision == WP1
     assert script().get_revision("f3b8d6a1e240").down_revision == "d8b4e1c7a205"
     assert script().get_revision("e6a9c4d2f817").down_revision == "f3b8d6a1e240"
-    assert script().get_revision(HEAD).down_revision == "e6a9c4d2f817"
+    assert script().get_revision("ab6d9e2f4013").down_revision == "e6a9c4d2f817"
+    assert script().get_revision(HEAD).down_revision == "ab6d9e2f4013"
 
 
 def test_both_branch_heads_and_their_ancestors_are_upgraded_by_head():
@@ -48,6 +49,6 @@ def test_both_branch_heads_and_their_ancestors_are_upgraded_by_head():
         "7c3f19ad0e82", "91b4e26d7fa0", "c48a2d7159be",                  # dev (Noah)
         MERGE, WP1, "c9e2a4b6d8f1", "a7f4c2d9e180", "f8c2d4e6a901",
         "f9d3e5a7b012", "c6e1a4b9d203", "e4a1c2b9d0f3", "d8b4e1c7a205",
-        "f3b8d6a1e240", "e6a9c4d2f817", HEAD,
+        "f3b8d6a1e240", "e6a9c4d2f817", "ab6d9e2f4013", HEAD,
     } <= ancestors
     assert len(script().get_bases()) == 1

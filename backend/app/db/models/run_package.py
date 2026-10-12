@@ -93,7 +93,7 @@ class RunAttempt(Base):
     output_row_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     trace_row_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # not_needed | deleted | failed — what happened to the rows of a failed attempt.
-    cleanup_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    cleanup_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     executed_build: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     metrics: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     # The terminal outcome the worker computed, recorded BEFORE the terminal transaction so that

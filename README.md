@@ -27,8 +27,12 @@ Each submitted run package also records a digest of the actual backend code,
 including bind-mounted local changes. Build from a Git checkout; run submission
 is refused when neither a commit nor a code digest is available.
 
+The image build reads the real repository metadata from `.git` to embed the
+source revision. A linked Git worktree stores `.git` as a pointer file rather
+than a directory, so this Docker build must be run from a normal clone.
+
 This will automatically:
-1. Start the PostgreSQL database on port `5432`.
+1. Start the PostgreSQL database on host port `5433` (container port `5432`).
 2. Run all required Alembic database migrations.
 3. Start the FastAPI application on port `8001`.
 4. Mount the local `/backend` folder so changes to the code will hot-reload automatically.
