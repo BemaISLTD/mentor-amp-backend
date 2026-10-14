@@ -6,11 +6,12 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.dependency_engine.graph import topological_sort
+from app.core.artifacts import RunArtifactBuffer
 from app.core.formula_engine.formulas import FORMULA_FUNCTIONS
 from app.core.projection_engine.context import build_context
 from app.core.projection_engine.loop import load_formulas, load_policies
-from app.core.output.aggregate import compute_summary
 from app.core.output.storage import save_output, update_run_status
+from app.core.run_manifest import create_run_manifest
 from app.core.variable_registry.resolver import resolve
 from app.db.models.run import Run
 from app.models.schemas import (
@@ -38,6 +39,11 @@ def run_projection(
         )
         db.add(run)
         db.flush()
+        create_run_manifest(db, run_def)
+    elif existing.status != "pending":
+        raise ValueError(f"Run '{run_def.id}' has already been started.")
+
+    artifact_buffer = RunArtifactBuffer(run_def.id)
 
     update_run_status(db, run_def.id, "running")
     db.commit()
@@ -94,7 +100,18 @@ def run_projection(
                     try:
                         resolved_inputs: dict[str, Any] = {}
                         for dep in formula.dependencies:
-                            resolution = resolve(dep, context, db, trace_logger=None)
+                            trace_callback = (
+                                artifact_buffer.add_trace
+                                if run_def.debug_mode
+                                else trace_logger
+                            )
+                            resolution = resolve(
+                                dep,
+                                context,
+                                db,
+                                trace_logger=trace_callback,
+                                output_buffer=artifact_buffer,
+                            )
                             if resolution.error_message:
                                 raise ValueError(f"Cannot resolve '{dep}': {resolution.error_message}")
                             resolved_inputs[dep] = resolution.value
@@ -105,7 +122,16 @@ def run_projection(
 
                         value = func(**resolved_inputs)
 
-                        save_output(db, run_def.id, policy_id, scenario_id, month, var_name, value, product=context.product)
+                        save_output(
+                            artifact_buffer,
+                            run_def.id,
+                            policy_id,
+                            scenario_id,
+                            month,
+                            var_name,
+                            value,
+                            product=context.product,
+                        )
 
                         all_results.append(CalculationResult(
                             run_id=run_def.id, variable_id=var_name, policy_id=policy_id,
@@ -124,6 +150,7 @@ def run_projection(
                             period=month, scenario_id=scenario_id, value=None, status="error", error=error,
                         ))
 
+        artifact_buffer.flush_policy(db, policy_id)
         db.commit()
 
     if error_count == 0:
@@ -136,7 +163,7 @@ def run_projection(
     update_run_status(db, run_def.id, status)
     db.commit()
 
-    summary = compute_summary(db, run_def.id, error_count=error_count)
+    summary = artifact_buffer.summary(error_count=error_count)
 
     return ProjectionResultSet(
         run_id=run_def.id,

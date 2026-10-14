@@ -1,4 +1,4 @@
-﻿from sqlalchemy import create_engine
+from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.config import settings
@@ -20,7 +20,7 @@ def _database_url() -> str:
 # Synchronous engine — appropriate for Phase 1
 engine = create_engine(
     _database_url(),
-    echo=settings.debug,          # prints SQL queries when DEBUG=true
+    echo=settings.sql_echo,       # prints SQL queries when SQL_ECHO=true
     pool_pre_ping=True,           # verifies connections before use (good for Neon)
 )
 

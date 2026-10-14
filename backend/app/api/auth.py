@@ -7,6 +7,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
+from app.core.audit import record_audit
 from app.core.security import create_access_token, hash_password, verify_password
 from app.db.database import get_db
 from app.db.models.user import Permission, Role, User
@@ -19,9 +20,57 @@ BUILTIN_PERMISSIONS = {
     "projects:write": "Create and modify projects.",
     "registries:read": "View actuarial registries.",
     "registries:write": "Modify actuarial registries.",
+    "imports:read": "View imported actuarial data.",
     "imports:write": "Upload actuarial data files.",
+    "imports:approve": "Approve or reject actuarial dataset versions.",
+    "runs:read": "View projection runs and results.",
     "runs:execute": "Start projection runs.",
 }
+
+BUILTIN_ROLES = {
+    "admin": {
+        "description": "Full platform access.",
+        "permissions": set(BUILTIN_PERMISSIONS),
+    },
+    "actuary": {
+        "description": "Actuarial data, model, and execution access.",
+        "permissions": set(BUILTIN_PERMISSIONS) - {"projects:write"},
+    },
+    "model_developer": {
+        "description": "Model configuration, data import, and test execution access.",
+        "permissions": {
+            "projects:read",
+            "registries:read",
+            "registries:write",
+            "imports:read",
+            "imports:write",
+            "runs:read",
+            "runs:execute",
+        },
+    },
+    "reviewer": {
+        "description": "Read-only review access to models, data, runs, and results.",
+        "permissions": {
+            "projects:read",
+            "registries:read",
+            "imports:read",
+            "imports:approve",
+            "runs:read",
+        },
+    },
+    "read_only": {
+        "description": "Read-only access to projects and published actuarial information.",
+        "permissions": {
+            "projects:read",
+            "registries:read",
+            "imports:read",
+            "runs:read",
+        },
+    },
+}
+
+# Peer approval is intentionally unavailable to model developers. Actuaries and
+# administrators retain it through their full permission sets.
 
 
 def _user_response(user: User) -> UserResponse:
@@ -44,22 +93,17 @@ def initialize_builtin_roles(db: Session) -> dict[str, Role]:
             permissions[name] = permission
 
     roles = {role.name: role for role in db.query(Role).all()}
-    if "admin" not in roles:
-        roles["admin"] = Role(name="admin", description="Full platform access.")
-        db.add(roles["admin"])
-    if "actuary" not in roles:
-        roles["actuary"] = Role(
-            name="actuary", description="Actuarial data and execution access."
-        )
-        db.add(roles["actuary"])
+    for name, definition in BUILTIN_ROLES.items():
+        if name not in roles:
+            roles[name] = Role(name=name, description=definition["description"])
+            db.add(roles[name])
 
     db.flush()
-    roles["admin"].permissions = list(permissions.values())
-    roles["actuary"].permissions = [
-        permission
-        for name, permission in permissions.items()
-        if name != "projects:write"
-    ]
+    for role_name, definition in BUILTIN_ROLES.items():
+        roles[role_name].description = definition["description"]
+        roles[role_name].permissions = [
+            permissions[name] for name in sorted(definition["permissions"])
+        ]
     return roles
 
 
@@ -84,6 +128,21 @@ def bootstrap_admin(payload: BootstrapAdminCreate, db: Session = Depends(get_db)
         roles=[roles["admin"]],
     )
     db.add(user)
+    db.flush()
+    record_audit(
+        db,
+        actor_user_id=user.id,
+        action="user.created",
+        entity_type="user",
+        entity_id=user.id,
+        after_state={
+            "email": user.email,
+            "full_name": user.full_name,
+            "is_active": user.is_active,
+            "roles": ["admin"],
+        },
+        context={"source": "bootstrap"},
+    )
     db.commit()
     db.refresh(user)
     return _user_response(user)

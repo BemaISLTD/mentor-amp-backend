@@ -33,7 +33,7 @@ def register_variable(variable: VariableDefinition) -> VariableDefinition:
 def resolve_variable(name: str, context: ProjectionContext) -> VariableResolutionResult:
     db: Session = SessionLocal()
     try:
-        return _resolve(name, context, db, trace_logger=lambda ctx, res: log_resolution(ctx, res, db))
+        return _resolve(name, context, db)
     finally:
         db.close()
 

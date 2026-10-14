@@ -1,9 +1,35 @@
 """CRUD operations for the Variable Registry — backed by PostgreSQL."""
 
+from datetime import datetime, timezone
+
 from sqlalchemy.orm import Session
 
+from app.core.audit import record_audit
 from app.db.models.variable import VariableRegistry as VariableModel
 from app.models.schemas import VariableDefinition
+
+
+def _state(model: VariableModel) -> dict:
+    return {
+        "name": model.name,
+        "display_name": model.display_name,
+        "description": model.description,
+        "data_type": model.data_type,
+        "source_type": model.source_type,
+        "source_table": model.source_table,
+        "source": model.source,
+        "lookup_keys": model.lookup_keys,
+        "default_value": model.default_value,
+        "required": model.required,
+        "product_applicability": model.product_applicability,
+        "basis_applicability": model.basis_applicability,
+        "version": model.version,
+        "unit": model.unit,
+        "created_by": model.created_by,
+        "updated_by": model.updated_by,
+        "deleted_by": model.deleted_by,
+        "deleted_at": model.deleted_at.isoformat() if model.deleted_at else None,
+    }
 
 
 def _model_to_definition(model: VariableModel) -> VariableDefinition:
@@ -33,7 +59,7 @@ def _model_to_definition(model: VariableModel) -> VariableDefinition:
     )
 
 
-def register(db: Session, variable: VariableDefinition) -> VariableDefinition:
+def register(db: Session, variable: VariableDefinition, actor_user_id: str) -> VariableDefinition:
     """Create a new variable in the registry."""
     source = variable.source or {}
     source_type = variable.kind
@@ -57,29 +83,40 @@ def register(db: Session, variable: VariableDefinition) -> VariableDefinition:
         default_value=default_value,
         product_applicability=variable.product_applicability,
         basis_applicability=variable.basis_applicability,
+        created_by=actor_user_id,
+        updated_by=actor_user_id,
     )
     db.add(model)
+    db.flush()
+    record_audit(
+        db, actor_user_id=actor_user_id, action="variable.created",
+        entity_type="variable", entity_id=model.id, after_state=_state(model),
+    )
     db.commit()
     db.refresh(model)
     return _model_to_definition(model)
 
 
 def get_by_name(db: Session, name: str) -> VariableDefinition | None:
-    model = db.query(VariableModel).filter(VariableModel.name == name).first()
+    model = db.query(VariableModel).filter(
+        VariableModel.name == name, VariableModel.deleted_at.is_(None)
+    ).first()
     if model is None:
         return None
     return _model_to_definition(model)
 
 
 def get_by_id(db: Session, variable_id: str) -> VariableDefinition | None:
-    model = db.query(VariableModel).filter(VariableModel.id == variable_id).first()
+    model = db.query(VariableModel).filter(
+        VariableModel.id == variable_id, VariableModel.deleted_at.is_(None)
+    ).first()
     if model is None:
         return None
     return _model_to_definition(model)
 
 
 def list_all(db: Session, product: str | None = None, kind: str | None = None) -> list[VariableDefinition]:
-    query = db.query(VariableModel)
+    query = db.query(VariableModel).filter(VariableModel.deleted_at.is_(None))
     if kind:
         query = query.filter(VariableModel.source_type == kind)
     if product:
@@ -87,24 +124,45 @@ def list_all(db: Session, product: str | None = None, kind: str | None = None) -
     return [_model_to_definition(m) for m in query.order_by(VariableModel.name).all()]
 
 
-def update(db: Session, name: str, updates: dict) -> VariableDefinition | None:
-    model = db.query(VariableModel).filter(VariableModel.name == name).first()
+def update(db: Session, name: str, updates: dict, actor_user_id: str) -> VariableDefinition | None:
+    model = db.query(VariableModel).filter(
+        VariableModel.name == name, VariableModel.deleted_at.is_(None)
+    ).first()
     if model is None:
         return None
+    before = _state(model)
     allowed = {"display_name", "description", "data_type", "source_type", "source_table",
                "lookup_keys", "required", "default_value", "product_applicability", "basis_applicability"}
     for key, value in updates.items():
         if key in allowed:
             setattr(model, key, value)
+    model.updated_by = actor_user_id
+    db.flush()
+    record_audit(
+        db, actor_user_id=actor_user_id, action="variable.updated",
+        entity_type="variable", entity_id=model.id,
+        before_state=before, after_state=_state(model),
+    )
     db.commit()
     db.refresh(model)
     return _model_to_definition(model)
 
 
-def delete(db: Session, name: str) -> bool:
-    model = db.query(VariableModel).filter(VariableModel.name == name).first()
+def delete(db: Session, name: str, actor_user_id: str) -> bool:
+    model = db.query(VariableModel).filter(
+        VariableModel.name == name, VariableModel.deleted_at.is_(None)
+    ).first()
     if model is None:
         return False
-    db.delete(model)
+    before = _state(model)
+    model.deleted_at = datetime.now(timezone.utc)
+    model.deleted_by = actor_user_id
+    model.updated_by = actor_user_id
+    db.flush()
+    record_audit(
+        db, actor_user_id=actor_user_id, action="variable.deleted",
+        entity_type="variable", entity_id=model.id, before_state=before,
+        after_state=_state(model), context={"deletion": "soft"},
+    )
     db.commit()
     return True

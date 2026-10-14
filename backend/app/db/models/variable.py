@@ -3,11 +3,11 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, JSON, String, Text
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy import Boolean, DateTime, ForeignKey, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.database import Base
+from app.db.types import StringArray
 
 
 class VariableRegistry(Base):
@@ -29,9 +29,19 @@ class VariableRegistry(Base):
     lookup_keys: Mapped[list] = mapped_column(JSON, default=list)
     default_value: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     required: Mapped[bool] = mapped_column(Boolean, default=True)
-    product_applicability: Mapped[list] = mapped_column(ARRAY(String), default=list)
-    basis_applicability: Mapped[list] = mapped_column(ARRAY(String), default=list)
+    product_applicability: Mapped[list] = mapped_column(StringArray, default=list)
+    basis_applicability: Mapped[list] = mapped_column(StringArray, default=list)
     version: Mapped[str] = mapped_column(String(20), default="v1")
+    created_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    updated_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    deleted_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -40,3 +50,7 @@ class VariableRegistry(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
+
+    # --- M1: unit and the full resolution rule (see contract §F.3) ---
+    unit: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    source: Mapped[dict | None] = mapped_column(JSON, nullable=True)

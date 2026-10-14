@@ -1,35 +1,62 @@
 """Base importer — format detection, parsing, validation, and storage."""
 
 import os
+import polars as pl
 from pathlib import Path
 from typing import Any, Callable
 
-from app.data.importers.tsv_importer import parse_tsv
-from app.data.importers.csv_importer import parse_csv
-from app.data.importers.excel_importer import parse_excel
+class ImportLimitError(ValueError):
+    """The file is valid tabular data but exceeds the synchronous import budget."""
+
+
+from app.data.importers.tsv_importer import parse_tsv  # noqa: E402
+from app.data.importers.csv_importer import parse_csv  # noqa: E402
+from app.data.importers.excel_importer import parse_excel  # noqa: E402
 
 
 def detect_format(filename: str) -> str:
-    """Detect file format from extension. Returns 'tsv', 'csv', or 'xlsx'."""
+    """Detect an accepted tabular format from its extension."""
     ext = Path(filename).suffix.lower()
     if ext in (".tsv", ".tab"):
         return "tsv"
     elif ext == ".csv":
         return "csv"
-    elif ext in (".xlsx", ".xls"):
+    elif ext == ".xlsx":
         return "xlsx"
-    raise ValueError(f"Unsupported file format: {ext}. Supported: .tsv, .csv, .xlsx")
+    elif ext == ".parquet":
+        return "parquet"
+    raise ValueError(f"Unsupported file format: {ext}. Supported: .tsv, .csv, .xlsx, .parquet")
 
 
-def parse_file(file_path: str) -> list[dict]:
+def parse_file(
+    file_path: str,
+    *,
+    max_rows: int | None = None,
+    max_columns: int | None = None,
+    max_xlsx_sheets: int | None = None,
+) -> list[dict]:
     """Parse a file into a list of row dicts, auto-detecting format."""
     fmt = detect_format(file_path)
-    parsers: dict[str, Callable[[str], list[dict]]] = {
-        "tsv": parse_tsv,
-        "csv": parse_csv,
-        "xlsx": parse_excel,
-    }
-    return parsers[fmt](file_path)
+    if fmt == "csv":
+        return parse_csv(file_path, max_rows=max_rows, max_columns=max_columns)
+    if fmt == "tsv":
+        return parse_tsv(file_path, max_rows=max_rows, max_columns=max_columns)
+    if fmt == "xlsx":
+        return parse_excel(
+            file_path,
+            max_rows=max_rows,
+            max_columns=max_columns,
+            max_sheets=max_xlsx_sheets,
+        )
+    frame = pl.scan_parquet(file_path)
+    if max_rows is not None:
+        frame = frame.limit(max_rows + 1)
+    rows = frame.collect().to_dicts()
+    if max_rows is not None and len(rows) > max_rows:
+        raise ImportLimitError(f"Record count exceeds limit {max_rows}.")
+    if max_columns is not None and rows and len(rows[0]) > max_columns:
+        raise ImportLimitError(f"Column count exceeds limit {max_columns}.")
+    return rows
 
 
 def preview_file(file_path: str, max_rows: int = 20) -> dict[str, Any]:
