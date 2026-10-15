@@ -1,0 +1,266 @@
+{
+  "fixture_schema": "mentoramp.reference_fixture/v1",
+  "source": {
+    "provider": "lifelib Developers",
+    "release": "v0.17.2",
+    "commit": "b706d8bbab530cc9ef94e06600e9c9d1468d8cb1",
+    "model": "SPIA_US_S",
+    "model_point": "IA-MENTORAMP-ANCHOR",
+    "generated_on": "2026-10-14"
+  },
+  "input": {
+    "form": "life_only",
+    "joint": false,
+    "primary_age": 65,
+    "primary_sex": "M",
+    "annual_income": 6000.0,
+    "frequency": 12,
+    "timing": "arrears",
+    "cola_rate": 0.0,
+    "rating_factor": 1.0,
+    "annuity_year": 2026,
+    "mortality_basis": "table"
+  },
+  "assumptions": [
+    {
+      "age": 65,
+      "gender": "M",
+      "base_mortality_rate": 0.006704,
+      "mortality_improvement_rate": 0.01
+    },
+    {
+      "age": 66,
+      "gender": "M",
+      "base_mortality_rate": 0.007417,
+      "mortality_improvement_rate": 0.01
+    },
+    {
+      "age": 62,
+      "gender": "F",
+      "base_mortality_rate": 0.003335,
+      "mortality_improvement_rate": 0.01
+    },
+    {
+      "age": 63,
+      "gender": "F",
+      "base_mortality_rate": 0.003684,
+      "mortality_improvement_rate": 0.01
+    }
+  ],
+  "surrender_charge_schedule": [
+    {"policy_year": 2, "surrender_charge_rate": 0.08},
+    {"policy_year": 3, "surrender_charge_rate": 0.07},
+    {"policy_year": 4, "surrender_charge_rate": 0.06},
+    {"policy_year": 5, "surrender_charge_rate": 0.05},
+    {"policy_year": 6, "surrender_charge_rate": 0.04},
+    {"policy_year": 7, "surrender_charge_rate": 0.03},
+    {"policy_year": 8, "surrender_charge_rate": 0.02},
+    {"policy_year": 9, "surrender_charge_rate": 0.01},
+    {"policy_year": 10, "surrender_charge_rate": 0.0}
+  ],
+  "shipped_commutation_sensitivity": {
+    "provenance": "LifeLib SPIA_US_S model point 9 with isolated development override commute_util_base=0.10; illustrative sensitivity, not the shipped base assumption",
+    "model_point": 9,
+    "utilization_rate": 0.1,
+    "rows": [
+      {"month": 12, "eligible": 0.0, "commuted_value": 52406.228871419145, "commutation_amount": 0.0, "commutation_fraction": 0.0, "surrender_charge_rate": 0.08, "commutation_payment": 0.0, "annuity_payment": 500.0, "liability_cash_flow": 505.0},
+      {"month": 13, "eligible": 1.0, "commuted_value": 52062.793227710536, "commutation_amount": 5206.279322771054, "commutation_fraction": 0.0, "surrender_charge_rate": 0.08, "surrender_charge": 416.5023458216843, "commutation_payment": 4789.77697694937, "annuity_payment": 515.0, "liability_cash_flow": 5309.90197694937},
+      {"month": 14, "eligible": 0.0, "commuted_value": 46546.409938565244, "commutation_amount": 0.0, "commutation_fraction": 0.1, "annuity_payment": 463.5, "liability_cash_flow": 468.625},
+      {"month": 24, "eligible": 0.0, "commuted_value": 43388.98230736239, "commutation_amount": 0.0, "commutation_fraction": 0.1, "annuity_payment": 463.5, "liability_cash_flow": 468.625},
+      {"month": 25, "eligible": 1.0, "commuted_value": 43053.62154485113, "commutation_amount": 0.0, "commutation_fraction": 0.1, "surrender_charge_rate": 0.07, "annuity_payment": 477.405, "liability_cash_flow": 482.658125},
+      {"month": 26, "eligible": 0.0, "commuted_value": 42717.16289847024, "commutation_amount": 0.0, "commutation_fraction": 0.1},
+      {"month": 120, "commuted_value": 0.0, "commutation_fraction": 0.1, "annuity_payment": 587.1479327231602, "liability_cash_flow": 593.3922475728986},
+      {"month": 121, "commuted_value": 0.0, "commutation_fraction": 0.1, "annuity_payment": 638.6627581782122, "liability_cash_flow": 645.0335581934323}
+    ]
+  },
+  "tolerance": {
+    "relative": 1e-12,
+    "absolute": 1e-12
+  },
+  "rows": [
+    {"month": 1, "survival_probability": 0.999472363658361, "annuity_payment": 499.7361818291805},
+    {"month": 2, "survival_probability": 0.998945005716831, "annuity_payment": 499.4725028584155},
+    {"month": 3, "survival_probability": 0.998417926028516, "annuity_payment": 499.20896301425796},
+    {"month": 4, "survival_probability": 0.9978911244465996, "annuity_payment": 498.94556222329976},
+    {"month": 5, "survival_probability": 0.9973646008243425, "annuity_payment": 498.6823004121713},
+    {"month": 6, "survival_probability": 0.9968383550150833, "annuity_payment": 498.4191775075417},
+    {"month": 7, "survival_probability": 0.9963123868722378, "annuity_payment": 498.1561934361189},
+    {"month": 8, "survival_probability": 0.9957866962492989, "annuity_payment": 497.8933481246495},
+    {"month": 9, "survival_probability": 0.9952612829998372, "annuity_payment": 497.63064149991857},
+    {"month": 10, "survival_probability": 0.9947361469775002, "annuity_payment": 497.3680734887501},
+    {"month": 11, "survival_probability": 0.994211288036013, "annuity_payment": 497.1056440180065},
+    {"month": 12, "survival_probability": 0.9936867060291775, "annuity_payment": 496.8433530145888},
+    {"month": 13, "survival_probability": 0.9931122800802353, "annuity_payment": 496.55614004011767},
+    {"month": 14, "survival_probability": 0.9925381861928663, "annuity_payment": 496.26909309643315},
+    {"month": 15, "survival_probability": 0.9919644241751137, "annuity_payment": 495.98221208755683},
+    {"month": 16, "survival_probability": 0.9913909938351319, "annuity_payment": 495.69549691756595},
+    {"month": 17, "survival_probability": 0.9908178949811861, "annuity_payment": 495.40894749059305},
+    {"month": 18, "survival_probability": 0.9902451274216524, "annuity_payment": 495.12256371082617},
+    {"month": 19, "survival_probability": 0.9896726909650174, "annuity_payment": 494.8363454825087},
+    {"month": 20, "survival_probability": 0.9891005854198789, "annuity_payment": 494.55029270993947},
+    {"month": 21, "survival_probability": 0.9885288105949449, "annuity_payment": 494.2644052974725},
+    {"month": 22, "survival_probability": 0.9879573662990342, "annuity_payment": 493.9786831495171},
+    {"month": 23, "survival_probability": 0.987386252341076, "annuity_payment": 493.693126170538},
+    {"month": 24, "survival_probability": 0.9868154685301102, "annuity_payment": 493.40773426505507}
+  ],
+  "full_projection_diagnostics": {
+    "projection_months": 660,
+    "total_annuity_payment": 149966.83089267855,
+    "ending_survival_probability": 3.195196447684427e-09,
+    "upstream_lives_rollforward_check": true,
+    "upstream_payment_factor_check": true
+  },
+  "shipped_advance_cola_case": {
+    "model_point": 10,
+    "policy_id": "IA-000010",
+    "input": {
+      "form": "life_only",
+      "joint": false,
+      "primary_age": 65,
+      "primary_sex": "M",
+      "annual_income": 6000.0,
+      "frequency": 12,
+      "timing": "advance",
+      "cola_rate": 0.03,
+      "mortality_basis": "scenario",
+      "death_month_zero_based": 13
+    },
+    "rows": [
+      {"month": 1, "survival_start": 1.0, "survival_end": 1.0, "annual_income_current": 6000.0, "annuity_payment": 500.0},
+      {"month": 2, "survival_start": 1.0, "survival_end": 1.0, "annual_income_current": 6000.0, "annuity_payment": 500.0},
+      {"month": 3, "survival_start": 1.0, "survival_end": 1.0, "annual_income_current": 6000.0, "annuity_payment": 500.0},
+      {"month": 4, "survival_start": 1.0, "survival_end": 1.0, "annual_income_current": 6000.0, "annuity_payment": 500.0},
+      {"month": 5, "survival_start": 1.0, "survival_end": 1.0, "annual_income_current": 6000.0, "annuity_payment": 500.0},
+      {"month": 6, "survival_start": 1.0, "survival_end": 1.0, "annual_income_current": 6000.0, "annuity_payment": 500.0},
+      {"month": 7, "survival_start": 1.0, "survival_end": 1.0, "annual_income_current": 6000.0, "annuity_payment": 500.0},
+      {"month": 8, "survival_start": 1.0, "survival_end": 1.0, "annual_income_current": 6000.0, "annuity_payment": 500.0},
+      {"month": 9, "survival_start": 1.0, "survival_end": 1.0, "annual_income_current": 6000.0, "annuity_payment": 500.0},
+      {"month": 10, "survival_start": 1.0, "survival_end": 1.0, "annual_income_current": 6000.0, "annuity_payment": 500.0},
+      {"month": 11, "survival_start": 1.0, "survival_end": 1.0, "annual_income_current": 6000.0, "annuity_payment": 500.0},
+      {"month": 12, "survival_start": 1.0, "survival_end": 1.0, "annual_income_current": 6000.0, "annuity_payment": 500.0},
+      {"month": 13, "survival_start": 1.0, "survival_end": 1.0, "annual_income_current": 6180.0, "annuity_payment": 515.0},
+      {"month": 14, "survival_start": 1.0, "survival_end": 0.0, "annual_income_current": 6180.0, "annuity_payment": 515.0},
+      {"month": 15, "survival_start": 0.0, "survival_end": 0.0, "annual_income_current": 6180.0, "annuity_payment": 0.0},
+      {"month": 16, "survival_start": 0.0, "survival_end": 0.0, "annual_income_current": 6180.0, "annuity_payment": 0.0}
+    ]
+  },
+  "shipped_joint_table_case": {
+    "model_point": 8,
+    "policy_id": "IA-000008",
+    "input": {
+      "form": "life_only",
+      "joint": true,
+      "primary_age": 65,
+      "primary_sex": "M",
+      "joint_age": 62,
+      "joint_sex": "F",
+      "annual_income": 6000.0,
+      "frequency": 12,
+      "timing": "arrears",
+      "cola_rate": 0.03,
+      "survivor_percentage": 0.6666666667,
+      "reduction_trigger": "either",
+      "mortality_basis": "table"
+    },
+    "rows": [
+      {"month": 1, "survival_probability": 0.999472363658361, "joint_survival_probability": 0.9997379026959461, "last_survivor_probability": 0.9999998617079374, "payment_factor_life": 0.9997367093541079, "annuity_payment": 499.8683546770539},
+      {"month": 2, "survival_probability": 0.998945005716831, "joint_survival_probability": 0.999475874086889, "last_survivor_probability": 0.999999447050158, "payment_factor_life": 0.9994734422846786, "annuity_payment": 499.7367211423393},
+      {"month": 3, "survival_probability": 0.998417926028516, "joint_survival_probability": 0.9992139141548239, "last_survivor_probability": 0.9999987563540451, "payment_factor_life": 0.9992101988458739, "annuity_payment": 499.605099422937},
+      {"month": 4, "survival_probability": 0.9978911244465996, "joint_survival_probability": 0.9989520228817507, "last_survivor_probability": 0.9999977899466747, "payment_factor_life": 0.99894697909178, "annuity_payment": 499.47348954589},
+      {"month": 5, "survival_probability": 0.9973646008243425, "joint_survival_probability": 0.9986902002496741, "last_survivor_probability": 0.9999965481548178, "payment_factor_life": 0.9986837830764094, "annuity_payment": 499.34189153820466},
+      {"month": 6, "survival_probability": 0.9968383550150833, "joint_survival_probability": 0.9984284462406037, "last_survivor_probability": 0.9999950313049382, "payment_factor_life": 0.9984206108536992, "annuity_payment": 499.2103054268496},
+      {"month": 7, "survival_probability": 0.9963123868722378, "joint_survival_probability": 0.9981667608365533, "last_survivor_probability": 0.9999932397231945, "payment_factor_life": 0.9981574624775121, "annuity_payment": 499.07873123875606},
+      {"month": 8, "survival_probability": 0.9957866962492989, "joint_survival_probability": 0.9979051440195418, "last_survivor_probability": 0.9999911737354404, "payment_factor_life": 0.9978943380016367, "annuity_payment": 498.94716900081835},
+      {"month": 9, "survival_probability": 0.9952612829998372, "joint_survival_probability": 0.9976435957715927, "last_survivor_probability": 0.9999888336672236, "payment_factor_life": 0.9976312374797869, "annuity_payment": 498.81561873989347},
+      {"month": 10, "survival_probability": 0.9947361469775002, "joint_survival_probability": 0.9973821160747343, "last_survivor_probability": 0.9999862198437874, "payment_factor_life": 0.9973681609656024, "annuity_payment": 498.6840804828012},
+      {"month": 11, "survival_probability": 0.994211288036013, "joint_survival_probability": 0.9971207049109995, "last_survivor_probability": 0.9999833325900703, "payment_factor_life": 0.9971051085126487, "annuity_payment": 498.55255425632436},
+      {"month": 12, "survival_probability": 0.9936867060291775, "joint_survival_probability": 0.996859362262426, "last_survivor_probability": 0.9999801722307069, "payment_factor_life": 0.9968420801744173, "annuity_payment": 498.42104008720867},
+      {"month": 13, "survival_probability": 0.9931122800802353, "joint_survival_probability": 0.9965735939326704, "last_survivor_probability": 0.9999763998746769, "payment_factor_life": 0.9965540912962031, "annuity_payment": 513.2253570175446},
+      {"month": 14, "survival_probability": 0.9925381861928663, "joint_survival_probability": 0.9962879075237367, "last_survivor_probability": 0.9999723010571071, "payment_factor_life": 0.9962661315916073, "annuity_payment": 513.0770577696777},
+      {"month": 15, "survival_probability": 0.9919644241751137, "joint_survival_probability": 0.9960023030121409, "last_survivor_probability": 0.9999678762027291, "payment_factor_life": 0.9959782011303935, "annuity_payment": 512.9287735821526},
+      {"month": 16, "survival_probability": 0.9913909938351319, "joint_survival_probability": 0.9957167803744054, "last_survivor_probability": 0.9999631257358379, "payment_factor_life": 0.995690299982219, "annuity_payment": 512.7805044908428},
+      {"month": 17, "survival_probability": 0.9908178949811861, "joint_survival_probability": 0.9954313395870596, "last_survivor_probability": 0.9999580500802929, "payment_factor_life": 0.995402428216635, "annuity_payment": 512.632250531567},
+      {"month": 18, "survival_probability": 0.9902451274216524, "joint_survival_probability": 0.9951459806266396, "last_survivor_probability": 0.99995264965952, "payment_factor_life": 0.9951145859030878, "annuity_payment": 512.4840117400902},
+      {"month": 19, "survival_probability": 0.9896726909650174, "joint_survival_probability": 0.9948607034696881, "last_survivor_probability": 0.9999469248965092, "payment_factor_life": 0.9948267731109169, "annuity_payment": 512.3357881521222},
+      {"month": 20, "survival_probability": 0.9891005854198789, "joint_survival_probability": 0.9945755080927547, "last_survivor_probability": 0.9999408762138164, "payment_factor_life": 0.9945389899093569, "annuity_payment": 512.1875798033187},
+      {"month": 21, "survival_probability": 0.9885288105949449, "joint_survival_probability": 0.9942903944723956, "last_survivor_probability": 0.9999345040335647, "payment_factor_life": 0.9942512363675368, "annuity_payment": 512.0393867292814},
+      {"month": 22, "survival_probability": 0.9879573662990342, "joint_survival_probability": 0.9940053625851738, "last_survivor_probability": 0.999927808777443, "payment_factor_life": 0.99396351255448, "annuity_payment": 511.8912089655572},
+      {"month": 23, "survival_probability": 0.987386252341076, "joint_survival_probability": 0.993720412407659, "last_survivor_probability": 0.9999207908667082, "payment_factor_life": 0.9936758185391056, "annuity_payment": 511.7430465476394},
+      {"month": 24, "survival_probability": 0.9868154685301102, "joint_survival_probability": 0.9934355439164274, "last_survivor_probability": 0.9999134507221834, "payment_factor_life": 0.9933881543902262, "annuity_payment": 511.5948995109665}
+    ]
+  },
+  "shipped_joint_trigger_cases": [
+    {"model_point": 1, "reduction_trigger": "either", "primary_survival": 1.0, "joint_survival": 0.0, "payment_factor_life": 0.6666666667},
+    {"model_point": 2, "reduction_trigger": "primary", "primary_survival": 1.0, "joint_survival": 0.0, "payment_factor_life": 1.0},
+    {"model_point": 3, "reduction_trigger": "either", "primary_survival": 0.0, "joint_survival": 1.0, "payment_factor_life": 0.6666666667},
+    {"model_point": 4, "reduction_trigger": "primary", "primary_survival": 0.0, "joint_survival": 1.0, "payment_factor_life": 0.6666666667}
+  ],
+  "shipped_benefit_form_cases": {
+    "life_certain_survivor": {
+      "model_point": 5,
+      "certain_months": 120,
+      "survivor_percentage": 0.6666666667,
+      "rows": [
+        {"month": 120, "life_factor": 0.6666666667, "certain_floor": 1.0, "payment_factor": 1.0},
+        {"month": 121, "life_factor": 0.6666666667, "certain_floor": 0.0, "payment_factor": 0.6666666667}
+      ]
+    },
+    "life_certain_both_dead": {
+      "model_point": 13,
+      "certain_months": 120,
+      "rows": [
+        {"month": 120, "life_factor": 0.0, "certain_floor": 1.0, "payment_factor": 1.0},
+        {"month": 121, "life_factor": 0.0, "certain_floor": 0.0, "payment_factor": 0.0}
+      ]
+    },
+    "cash_refund_arrears": {
+      "model_point": 6,
+      "month": 14,
+      "premium": 100000.0,
+      "cumulative_scheduled_prev": 6515.0,
+      "cumulative_scheduled_payment": 7030.0,
+      "last_death_probability": 1.0,
+      "annuity_payment": 0.0,
+      "refund_claim": 93485.0
+    },
+    "cash_refund_advance": {
+      "model_point": 11,
+      "month": 14,
+      "premium": 100000.0,
+      "cumulative_scheduled_prev": 6515.0,
+      "cumulative_scheduled_payment": 7030.0,
+      "last_death_probability": 1.0,
+      "annuity_payment": 515.0,
+      "refund_claim": 92970.0
+    },
+    "installment_refund": {
+      "model_point": 7,
+      "premium": 100000.0,
+      "scheduled_installment": 500.0,
+      "rows": [
+        {"month": 200, "cumulative_scheduled_prev": 99500.0, "certain_floor": 1.0},
+        {"month": 201, "cumulative_scheduled_prev": 100000.0, "certain_floor": 0.0}
+      ]
+    },
+    "certain_only": {
+      "model_point": 15,
+      "certain_months": 120,
+      "scheduled_installment": 652.3865919146225,
+      "rows": [
+        {"month": 120, "certain_floor": 1.0, "annuity_payment": 652.3865919146225},
+        {"month": 121, "certain_floor": 0.0, "annuity_payment": 0.0}
+      ]
+    }
+  },
+  "shipped_expense_cases": [
+    {"model_point": 1, "benefit_form": "life_only", "projection_month": 1, "certain_floor": 0.0, "last_survivor_probability": 1.0, "expense_inflation_factor": 1.0, "obligation_factor": 1.0, "annuity_payment": 500.0, "refund_claim": 0.0, "maintenance_expense": 5.0, "liability_cash_flow": 505.0, "net_cash_flow": -505.0},
+    {"model_point": 1, "benefit_form": "life_only", "projection_month": 13, "certain_floor": 0.0, "last_survivor_probability": 1.0, "expense_inflation_factor": 1.025, "obligation_factor": 1.0, "annuity_payment": 515.0, "refund_claim": 0.0, "maintenance_expense": 5.125, "liability_cash_flow": 520.125, "net_cash_flow": -520.125},
+    {"model_point": 1, "benefit_form": "life_only", "projection_month": 14, "certain_floor": 0.0, "last_survivor_probability": 1.0, "expense_inflation_factor": 1.025, "obligation_factor": 1.0, "annuity_payment": 343.33333335049997, "refund_claim": 0.0, "maintenance_expense": 5.125, "liability_cash_flow": 348.45833335049997, "net_cash_flow": -348.45833335049997},
+    {"model_point": 13, "benefit_form": "life_certain", "projection_month": 120, "certain_floor": 1.0, "last_survivor_probability": 0.0, "expense_inflation_factor": 1.2488629699476652, "obligation_factor": 1.0, "annuity_payment": 652.3865919146225, "refund_claim": 0.0, "maintenance_expense": 6.244314849738326, "liability_cash_flow": 658.6309067643608, "net_cash_flow": -658.6309067643608},
+    {"model_point": 13, "benefit_form": "life_certain", "projection_month": 121, "certain_floor": 0.0, "last_survivor_probability": 0.0, "expense_inflation_factor": 1.2800845441963566, "obligation_factor": 0.0, "annuity_payment": 0.0, "refund_claim": 0.0, "maintenance_expense": 0.0, "liability_cash_flow": 0.0, "net_cash_flow": -0.0},
+    {"model_point": 15, "benefit_form": "certain_only", "projection_month": 120, "certain_floor": 1.0, "last_survivor_probability": 0.9055837599820359, "expense_inflation_factor": 1.2488629699476652, "obligation_factor": 1.0, "annuity_payment": 652.3865919146225, "refund_claim": 0.0, "maintenance_expense": 6.244314849738326, "liability_cash_flow": 658.6309067643608, "net_cash_flow": -658.6309067643608},
+    {"model_point": 15, "benefit_form": "certain_only", "projection_month": 121, "certain_floor": 0.0, "last_survivor_probability": 0.9043822727577072, "expense_inflation_factor": 1.2800845441963566, "obligation_factor": 0.0, "annuity_payment": 0.0, "refund_claim": 0.0, "maintenance_expense": 0.0, "liability_cash_flow": 0.0, "net_cash_flow": -0.0}
+  ],
+  "comparison_scope": ["survival_probability", "annuity_payment"],
+  "excluded_from_comparison": ["discount_factor", "pv_annuity_payment", "pv_refund_claim", "pv_maintenance_expense", "pv_liability_cash_flow", "reserve"]
+}

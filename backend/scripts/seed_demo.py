@@ -76,8 +76,8 @@ def upsert_project(db, user, name: str = PROJECT_NAME) -> Project:
     return project
 
 
-def upsert_model(db, project, user) -> tuple[Model, ModelVersion, FormulaGroup]:
-    definition = spia.MODEL
+def upsert_model(db, project, user, product=spia) -> tuple[Model, ModelVersion, FormulaGroup]:
+    definition = product.MODEL
     model = db.query(Model).filter(Model.project_id == project.id, Model.name == definition["name"]).first()
     if model is None:
         model = Model(project_id=project.id, name=definition["name"], status=lifecycle.DRAFT)
@@ -98,6 +98,8 @@ def upsert_model(db, project, user) -> tuple[Model, ModelVersion, FormulaGroup]:
         db.add(version)
     for field in ("block_name", "profile_name", "basis", "methodology", "notes"):
         setattr(version, field, version_def[field])
+    if "configuration" in version_def:
+        version.configuration = dict(version_def["configuration"] or {})
     version.is_current = True
     version.illustrative = True
     db.flush()
@@ -118,9 +120,9 @@ def upsert_model(db, project, user) -> tuple[Model, ModelVersion, FormulaGroup]:
     return model, version, group
 
 
-def upsert_variables(db) -> None:
+def upsert_variables(db, product=spia) -> None:
     """The global SEMANTIC catalog entries (identity only; never used to resolve values)."""
-    for item in spia.VARIABLES:
+    for item in product.VARIABLES:
         row = db.query(VariableRegistry).filter(VariableRegistry.name == item["name"]).first()
         if row is None:
             row = VariableRegistry(name=item["name"])
@@ -136,19 +138,19 @@ def upsert_variables(db) -> None:
         row.required = item.get("required", True)
         default = item.get("default_value")
         row.default_value = {"value": default} if default is not None else None
-        row.product_applicability = [spia.PRODUCT_CODE]
+        row.product_applicability = [product.PRODUCT_CODE]
         row.basis_applicability = []
         row.version = "v1"
     db.flush()
 
 
-def upsert_definitions(db, version) -> None:
+def upsert_definitions(db, version, product=spia) -> None:
     """This model version's own variable definitions (the only source of resolution).
 
     Scenario overrides are allowed only where the model explicitly permits them (in the SPIA
     illustrative model: the discount rate, which the Low Interest Rate scenario overrides).
     """
-    for item in spia.VARIABLES:
+    for item in product.VARIABLES:
         row = (
             db.query(ModelVariableDefinition)
             .filter(ModelVariableDefinition.model_version_id == version.id,
@@ -178,8 +180,8 @@ def upsert_definitions(db, version) -> None:
     db.flush()
 
 
-def upsert_formulas(db, version, group) -> None:
-    for item in spia.FORMULAS:
+def upsert_formulas(db, version, group, product=spia) -> None:
+    for item in product.FORMULAS:
         meta = FORMULA_METADATA[item["function_ref"]]
         row = (
             db.query(FormulaRegistry)
@@ -192,8 +194,8 @@ def upsert_formulas(db, version, group) -> None:
             db.add(row)
         row.name = item["name"]
         row.function_ref = item["function_ref"]
-        row.category = spia.PRODUCT_CODE
-        row.product_applicability = [spia.PRODUCT_CODE]
+        row.category = product.PRODUCT_CODE
+        row.product_applicability = [product.PRODUCT_CODE]
         row.basis_applicability = [version.basis]
         row.version = "v1"
         # Validated only if its implementation is registered (checked, not assumed).
@@ -214,8 +216,8 @@ def upsert_formulas(db, version, group) -> None:
     db.flush()
 
 
-def upsert_published_outputs(db, version) -> None:
-    for order, item in enumerate(spia.PUBLISHED_OUTPUTS):
+def upsert_published_outputs(db, version, product=spia) -> None:
+    for order, item in enumerate(product.PUBLISHED_OUTPUTS):
         row = (
             db.query(ModelPublishedOutput)
             .filter(ModelPublishedOutput.model_version_id == version.id,

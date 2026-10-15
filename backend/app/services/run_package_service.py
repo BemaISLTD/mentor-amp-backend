@@ -537,6 +537,9 @@ def collect(
             "block_name": version.block_name,
             "profile_name": version.profile_name,
             "illustrative": bool(version.illustrative),
+            # Immutable model-specific provenance and calculation settings. This is part
+            # of the executable configuration fingerprint, not mutable governance state.
+            "configuration": dict(version.configuration or {}),
         },
         "valuation_date": iso(projection_set.valuation_date),
         "horizon_months": projection_set.horizon_months,
