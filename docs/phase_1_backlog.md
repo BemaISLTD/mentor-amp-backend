@@ -186,6 +186,28 @@ it is considered complete.
   - Compare prior/current output datasets and return reserve bridges and exact
     variance components.
 
+- **[BUILD] Native Actuarial Reference Model — COMPLETE THROUGH OPTIONAL SPIA COMMUTATION**
+  - A MentorAmp-owned SPIA model covers single and joint lives, all five core
+    payout forms, payment schedules, COLA, survivor reductions, refund claims,
+    obligation-weighted maintenance expenses, component cash flows, discounting,
+    an illustrative prospective reserve, and strict opt-in commutation of
+    remaining certain payments.
+  - LifeLib `v0.17.2` at commit
+    `b706d8bbab530cc9ef94e06600e9c9d1468d8cb1` is an external development
+    benchmark only. It is not vendored, installed in the application image, or
+    executed during a MentorAmp run.
+  - Governed Data Manager imports, independent approval, frozen run packages,
+    canonical Parquet execution, exact selected-output reconciliation, and a
+    checksummed file-only rebuild pass on SQLite and disposable PostgreSQL.
+  - The surrender-charge factor table follows the same governed lifecycle and
+    is frozen into the package and reconstructed from canonical Parquet.
+  - Commutation is disabled by default. Its utilization, discount, minimum and
+    eligibility assumptions are illustrative/unverified, best-estimate only,
+    and explicitly barred from statutory CARVM use.
+  - Existing in-force records preserve opening cumulative installments and prior
+    commutation reductions; unknown jurisdiction eligibility fails closed.
+  - The model and results remain illustrative and not actuarially approved.
+
 - **[IMPROVE] Artifact Integrity and Reconciliation — COMPLETE FOR LOCAL STORAGE**
   - Reads verify checksum, row count, schema, run ID, and attempt identity before
     returning data.
@@ -259,6 +281,10 @@ Before an item moves to complete, record:
 - Attempt-scoped artifact migration: `backend/app/db/migrations/versions/f9d3e5a7b012_attempt_scoped_artifacts.py`
 - Registry actor migration: `backend/app/db/migrations/versions/c6e1a4b9d203_registry_actor_fields.py`
 - M1 end-to-end tests: `backend/tests/integration/test_m1_end_to_end.py`
+- SPIA reference workflow and file rebuild:
+  `backend/tests/integration/test_spia_reference_workflow.py`
+- SPIA reference methodology and evidence: `docs/spia_reference_gap_assessment.md`,
+  `docs/actuarial_reference_model_plan.md`
 - PostgreSQL migration/concurrency tests: `backend/tests/postgres/test_wp1_migrations_postgres.py`
 - Products/assets migration: `backend/app/db/migrations/versions/c48a2d7159be_add_products_and_assets.py`
 - Products/assets tests: `backend/tests/integration/test_products_api.py`

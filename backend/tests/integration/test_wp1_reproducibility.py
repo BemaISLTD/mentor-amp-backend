@@ -24,7 +24,7 @@ from app.db.models.formula import FormulaRegistry
 from app.db.models.formula_dependency import FormulaDependency
 from app.db.models.inforce import InforceRecord
 from app.db.models.model_variable import ModelVariableDefinition
-from app.db.models.modeling import ModelPublishedOutput
+from app.db.models.modeling import ModelPublishedOutput, ModelVersion
 from app.db.models.projection import ProjectionSet
 from app.db.models.run_artifact import RunManifest
 from app.db.models.run_package import RunAttempt, RunPackage
@@ -80,6 +80,33 @@ def test_submitted_package_records_executable_build_identity(env):
         recorded = build["source_commit"]
     assert recorded is None or re.fullmatch(r"[0-9a-f]{40}", recorded)
     assert re.fullmatch(r"[0-9a-f]{64}", build["build_fingerprint"])
+
+
+def test_model_version_configuration_is_frozen_in_run_package(env):
+    provenance = {
+        "implementation_version": "spia-reference-v1",
+        "reference_model": {
+            "source": {"release": "v0.17.2", "commit": "b706d8b"},
+            "runtime_required": False,
+        },
+    }
+    with env.Session() as db:
+        version = db.get(ModelVersion, env.projects["A"]["version"])
+        version.configuration = provenance
+        db.commit()
+
+    submitted = env.submit("A", ["Base"])
+    run_id = submitted["by_scenario"]["Base"]
+    frozen = package_of(env, run_id)["package"]["configuration"]["model_version"]
+    assert frozen["configuration"] == provenance
+
+    with env.Session() as db:
+        version = db.get(ModelVersion, env.projects["A"]["version"])
+        version.configuration = {"changed_after_submission": True}
+        db.commit()
+
+    still_frozen = package_of(env, run_id)["package"]["configuration"]["model_version"]
+    assert still_frozen["configuration"] == provenance
 
 
 def test_run_submission_rejects_missing_build_identity(env, monkeypatch):

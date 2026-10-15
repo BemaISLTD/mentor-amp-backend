@@ -6,12 +6,14 @@ package, loader and persistence paths are exactly the production ones.
 """
 
 import importlib.util
+import re
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -42,10 +44,26 @@ def load_seed_module():
 class Env:
     """One isolated database + API client. Call ``close()`` when done."""
 
-    def __init__(self):
-        self.engine = create_engine(
-            "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
-        )
+    def __init__(self, database_url: str | None = None, *, reset_schema: bool = False):
+        if database_url:
+            url = database_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+            database = urlparse(url).path.lstrip("/")
+            if reset_schema and not re.fullmatch(
+                r"mentoramp_[a-z0-9_]+_test", database
+            ):
+                raise ValueError(
+                    f"Refusing to reset database '{database}': expected "
+                    "'mentoramp_<purpose>_test'."
+                )
+            self.engine = create_engine(url)
+            if reset_schema:
+                with self.engine.begin() as connection:
+                    connection.execute(text("DROP SCHEMA public CASCADE"))
+                    connection.execute(text("CREATE SCHEMA public"))
+        else:
+            self.engine = create_engine(
+                "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+            )
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine, autocommit=False, autoflush=False)
         self.monkeypatch = pytest.MonkeyPatch()
