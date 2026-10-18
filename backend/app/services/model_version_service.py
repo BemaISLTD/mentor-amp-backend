@@ -11,7 +11,9 @@ from app.db.models.formula import FormulaRegistry
 from app.db.models.formula_dependency import FormulaDependency
 from app.db.models.model_variable import ModelVariableDefinition
 from app.db.models.modeling import FormulaGroup, Model, ModelPublishedOutput, ModelVersion
-from app.services import access
+from app.db.models.projection import ProjectionSet
+from app.products.registry import register_all_products
+from app.services import access, catalog_service
 from app.services.common import ServiceError, conflict, iso, not_found, now_utc
 
 
@@ -183,7 +185,7 @@ def update_version(db: Session, version_id: str, payload: dict[str, Any], user: 
     access.require_project_access(db, user, model.project_id, write=True)
     require_active_project(db, model.project_id)
     if row.status in {"published", "approved"}:
-        raise conflict("Published model versions are immutable; create a new version.")
+        raise ServiceError(409, "MODEL_VERSION_IMMUTABLE", "Published model versions are immutable; create a new version.")
     before = _version_state(row)
     for field in (
         "version_label", "block_name", "profile_name", "basis", "methodology", "illustrative",
@@ -210,6 +212,11 @@ def publish_version(db: Session, version_id: str, user: Any) -> dict[str, Any]:
     model = db.get(Model, row.model_id)
     access.require_project_access(db, user, model.project_id, write=True)
     require_active_project(db, model.project_id)
+    if row.status not in {"validated", "approved"}:
+        raise ServiceError(
+            409, "MODEL_VERSION_NOT_READY",
+            f"Only validated or approved model versions can be published; current status is '{row.status}'.",
+        )
     before = _version_state(row)
     db.query(ModelVersion).filter(
         ModelVersion.model_id == row.model_id, ModelVersion.id != row.id
@@ -241,6 +248,16 @@ def archive_version(db: Session, version_id: str, user: Any) -> None:
     model = db.get(Model, row.model_id)
     access.require_project_access(db, user, model.project_id, write=True)
     require_active_project(db, model.project_id)
+    if row.is_current:
+        raise ServiceError(409, "CANNOT_ARCHIVE_CURRENT_VERSION", "Cannot archive the current active model version.")
+    if row.status in {"approved", "published"}:
+        raise ServiceError(409, "CANNOT_ARCHIVE_APPROVED_VERSION", "Cannot archive an approved or published model version; create a replacement version first.")
+    in_use = db.query(ProjectionSet).filter(
+        ProjectionSet.model_version_id == row.id,
+        ProjectionSet.status != "archived",
+    ).count()
+    if in_use > 0:
+        raise ServiceError(409, "MODEL_VERSION_IN_USE", f"Cannot archive model version '{row.version_label}': it is referenced by {in_use} active projection set(s).")
     before = _version_state(row)
     row.deleted_at = now_utc()
     row.deleted_by = user.id
@@ -253,3 +270,132 @@ def archive_version(db: Session, version_id: str, user: Any) -> None:
                  before_state=before, after_state=_version_state(row),
                  context={"deletion": "soft"})
     db.commit()
+
+
+def validate_version(db: Session, version_id: str, user: Any) -> dict[str, Any]:
+    row = db.query(ModelVersion).filter(
+        ModelVersion.id == version_id, ModelVersion.deleted_at.is_(None)
+    ).first()
+    if row is None:
+        raise not_found(f"Model version '{version_id}' not found.")
+    model = db.get(Model, row.model_id)
+    access.require_project_access(db, user, model.project_id, write=True)
+    require_active_project(db, model.project_id)
+
+    register_all_products()
+    formulas = db.query(FormulaRegistry).filter(
+        FormulaRegistry.model_version_id == row.id,
+        FormulaRegistry.deleted_at.is_(None),
+    ).order_by(FormulaRegistry.output_variable).all()
+    published = db.query(ModelPublishedOutput).filter(
+        ModelPublishedOutput.model_version_id == row.id
+    ).order_by(ModelPublishedOutput.sort_order, ModelPublishedOutput.variable_name).all()
+
+    checks_result = catalog_service.model_version_checks(db, formulas, published, row.id)
+    before = _version_state(row)
+    if checks_result["status"] == "validated":
+        row.status = "validated"
+        for formula in formulas:
+            if formula.status == "draft":
+                formula.status = "validated"
+                formula.updated_by = user.id
+        row.updated_by = user.id
+        db.flush()
+        record_audit(db, actor_user_id=user.id, action="model_version.validated",
+                     entity_type="model_version", entity_id=row.id,
+                     before_state=before, after_state=_version_state(row),
+                     context={"checks": checks_result["checks"]})
+        db.commit()
+        db.refresh(row)
+
+    return {
+        "model_version": serialize_version(row),
+        "status": row.status,
+        "validation": checks_result,
+    }
+
+
+def approve_version(db: Session, version_id: str, user: Any, reason: str | None = None) -> dict[str, Any]:
+    row = db.query(ModelVersion).filter(
+        ModelVersion.id == version_id, ModelVersion.deleted_at.is_(None)
+    ).first()
+    if row is None:
+        raise not_found(f"Model version '{version_id}' not found.")
+    model = db.get(Model, row.model_id)
+    access.require_project_access(db, user, model.project_id)
+    require_active_project(db, model.project_id)
+
+    user_roles = {role.name for role in getattr(user, "roles", [])}
+    user_permissions = {
+        p.name for role in getattr(user, "roles", []) for p in getattr(role, "permissions", [])
+    }
+    can_approve = bool(
+        "imports:approve" in user_permissions
+        or user_roles.intersection({"admin", "actuary", "reviewer"})
+    )
+    if not can_approve:
+        raise ServiceError(403, "FORBIDDEN", "You do not have permission to approve model versions.")
+
+    if row.status not in {"validated", "needs_review"}:
+        raise ServiceError(
+            409, "MODEL_VERSION_NOT_VALIDATED",
+            f"Only validated or needs_review model versions can be approved; current status is '{row.status}'.",
+        )
+
+    if row.created_by == user.id:
+        raise ServiceError(409, "SELF_APPROVAL_FORBIDDEN", "A model version must be approved by another user.")
+
+    before = _version_state(row)
+    row.status = "approved"
+    row.published_by = user.id
+    row.published_at = now_utc()
+    row.updated_by = user.id
+    db.flush()
+    record_audit(
+        db, actor_user_id=user.id, action="model_version.approved",
+        entity_type="model_version", entity_id=row.id,
+        before_state=before, after_state=_version_state(row),
+        context={"reason": reason},
+    )
+    db.commit()
+    db.refresh(row)
+    return serialize_version(row)
+
+
+def reject_version(db: Session, version_id: str, user: Any, reason: str | None = None) -> dict[str, Any]:
+    row = db.query(ModelVersion).filter(
+        ModelVersion.id == version_id, ModelVersion.deleted_at.is_(None)
+    ).first()
+    if row is None:
+        raise not_found(f"Model version '{version_id}' not found.")
+    model = db.get(Model, row.model_id)
+    access.require_project_access(db, user, model.project_id)
+    require_active_project(db, model.project_id)
+
+    user_roles = {role.name for role in getattr(user, "roles", [])}
+    user_permissions = {
+        p.name for role in getattr(user, "roles", []) for p in getattr(role, "permissions", [])
+    }
+    can_reject = bool(
+        "imports:approve" in user_permissions
+        or user_roles.intersection({"admin", "actuary", "reviewer"})
+    )
+    if not can_reject:
+        raise ServiceError(403, "FORBIDDEN", "You do not have permission to reject model versions.")
+
+    if row.status in {"approved", "published"}:
+        raise conflict(f"Approved or published model versions cannot be rejected; current status is '{row.status}'.")
+
+    before = _version_state(row)
+    row.status = "rejected"
+    row.updated_by = user.id
+    db.flush()
+    record_audit(
+        db, actor_user_id=user.id, action="model_version.rejected",
+        entity_type="model_version", entity_id=row.id,
+        before_state=before, after_state=_version_state(row),
+        context={"reason": reason},
+    )
+    db.commit()
+    db.refresh(row)
+    return serialize_version(row)

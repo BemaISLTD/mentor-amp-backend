@@ -2,14 +2,14 @@
 
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import authorize_path
+from app.api.dependencies import authorize_path, get_current_user
 from app.db.database import get_db
 from app.db.models.user import User
-from app.services import catalog_service, model_version_service, variable_definition_service
+from app.services import access, catalog_service, model_version_service, variable_definition_service
 
 router = APIRouter(tags=["models"])
 ProjectReader = Annotated[User, Depends(authorize_path("project", "project_id", "projects:read"))]
@@ -25,6 +25,35 @@ VersionWriter = Annotated[
     User, Depends(authorize_path("model_version", "model_version_id", "registries:write", write=True))
 ]
 FormulaReader = Annotated[User, Depends(authorize_path("formula", "formula_id", "projects:read"))]
+
+
+def _authorize_version_review(
+    request: Request,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+) -> User:
+    access.require_object_access(db, user, "model_version", request.path_params["model_version_id"])
+    user_roles = {role.name for role in getattr(user, "roles", [])}
+    user_permissions = {
+        p.name for role in getattr(user, "roles", []) for p in getattr(role, "permissions", [])
+    }
+    can_review = bool(
+        "imports:approve" in user_permissions
+        or user_roles.intersection({"admin", "actuary", "reviewer"})
+    )
+    if not can_review:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to review model versions.",
+        )
+    return user
+
+
+VersionReviewer = Annotated[User, Depends(_authorize_version_review)]
+
+
+class ModelReviewRequest(BaseModel):
+    reason: str | None = None
 
 
 class VariableDefinitionUpdate(BaseModel):
@@ -127,6 +156,42 @@ def archive_model_version(
 ) -> Response:
     model_version_service.archive_version(db, model_version_id, user)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/model-versions/{model_version_id}/validate")
+def validate_model_version(
+    model_version_id: str, user: VersionWriter, db: Session = Depends(get_db)
+):
+    return model_version_service.validate_version(db, model_version_id, user)
+
+
+@router.post("/model-versions/{model_version_id}/approve")
+def approve_model_version(
+    model_version_id: str,
+    user: VersionReviewer,
+    payload: ModelReviewRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    reason = payload.reason if payload else None
+    return model_version_service.approve_version(db, model_version_id, user, reason)
+
+
+@router.post("/model-versions/{model_version_id}/reject")
+def reject_model_version(
+    model_version_id: str,
+    user: VersionReviewer,
+    payload: ModelReviewRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    reason = payload.reason if payload else None
+    return model_version_service.reject_version(db, model_version_id, user, reason)
+
+
+@router.post("/model-versions/{model_version_id}/publish")
+def publish_model_version(
+    model_version_id: str, user: VersionWriter, db: Session = Depends(get_db)
+):
+    return model_version_service.publish_version(db, model_version_id, user)
 
 
 @router.get("/model-versions/{model_version_id}/structure")

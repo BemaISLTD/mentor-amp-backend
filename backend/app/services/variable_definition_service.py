@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.core.audit import record_audit
 from app.db.models.model_variable import ModelVariableDefinition
+from app.db.models.modeling import ModelVersion
 from app.services.common import ServiceError, not_found
 from app.services.model_definition import definition_view, definitions_for
 
@@ -47,6 +48,12 @@ def update_definition(
     )
     if row is None:
         raise not_found(f"Variable '{variable_name}' is not defined for this model version.")
+    model_version = db.get(ModelVersion, model_version_id)
+    if model_version is not None and model_version.status in {"published", "approved"}:
+        raise ServiceError(
+            409, "MODEL_VERSION_IMMUTABLE",
+            "Approved model versions are immutable; create a new version.",
+        )
     before = definition_view(row)
     # Fields that cannot be null: an explicit null means "no change".
     changes = {key: value for key, value in changes.items()
