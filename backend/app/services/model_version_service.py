@@ -6,6 +6,20 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.audit import record_audit
+from app.core.model_fingerprint import compute_model_definition_fingerprint
+from app.core.model_lifecycle import (
+    APPROVED,
+    DRAFT,
+    NEEDS_REVIEW,
+    PROTECTED_STATUSES,
+    PUBLISHED,
+    REJECTED,
+    SUPERSEDED,
+    VALIDATED,
+    invalidate_model_validation,
+    require_mutable_model_version,
+    transition_model_version,
+)
 from app.core.project_lifecycle import require_active_project
 from app.db.models.formula import FormulaRegistry
 from app.db.models.formula_dependency import FormulaDependency
@@ -35,7 +49,15 @@ def _version_state(row: ModelVersion) -> dict[str, Any]:
         "illustrative": row.illustrative, "notes": row.notes,
         "change_summary": row.change_summary, "configuration": row.configuration,
         "created_by": row.created_by, "updated_by": row.updated_by,
+        "validated_by": row.validated_by, "validated_at": iso(row.validated_at),
+        "validation_fingerprint": row.validation_fingerprint,
+        "approved_by": row.approved_by, "approved_at": iso(row.approved_at),
+        "approved_fingerprint": row.approved_fingerprint,
+        "rejected_by": row.rejected_by, "rejected_at": iso(row.rejected_at),
+        "rejection_reason": row.rejection_reason,
         "published_by": row.published_by, "published_at": iso(row.published_at),
+        "last_material_modified_by": row.last_material_modified_by,
+        "last_material_modified_at": iso(row.last_material_modified_at),
         "deleted_by": row.deleted_by, "deleted_at": iso(row.deleted_at),
     }
 
@@ -108,6 +130,7 @@ def create_version(db: Session, model_id: str, payload: dict[str, Any], user: An
         configuration=(payload.get("configuration")
                        or (dict(source.configuration or {}) if source else {})),
         status="draft", is_current=False, created_by=user.id, updated_by=user.id,
+        last_material_modified_by=user.id, last_material_modified_at=now_utc(),
     )
     if not row.basis:
         raise ServiceError(422, "VALIDATION_ERROR", "A model version requires a basis.")
@@ -176,30 +199,41 @@ def list_versions(db: Session, model_id: str) -> list[dict[str, Any]]:
 
 
 def update_version(db: Session, version_id: str, payload: dict[str, Any], user: Any) -> dict[str, Any]:
+    require_mutable_model_version(db, version_id, for_update=True)
     row = db.query(ModelVersion).filter(
         ModelVersion.id == version_id, ModelVersion.deleted_at.is_(None)
-    ).first()
+    ).with_for_update().first()
     if row is None:
         raise not_found(f"Model version '{version_id}' not found.")
     model = db.get(Model, row.model_id)
     access.require_project_access(db, user, model.project_id, write=True)
     require_active_project(db, model.project_id)
-    if row.status in {"published", "approved"}:
-        raise ServiceError(409, "MODEL_VERSION_IMMUTABLE", "Published model versions are immutable; create a new version.")
     before = _version_state(row)
+    changed = False
+    material_fields = {
+        "block_name", "profile_name", "basis", "methodology", "illustrative",
+        "notes", "configuration",
+    }
+    material_changed = False
     for field in (
         "version_label", "block_name", "profile_name", "basis", "methodology", "illustrative",
         "notes", "change_summary", "configuration",
     ):
-        if field in payload:
+        if field in payload and getattr(row, field) != payload[field]:
             setattr(row, field, payload[field])
-    row.updated_by = user.id
-    db.flush()
-    record_audit(db, actor_user_id=user.id, action="model_version.updated",
-                 entity_type="model_version", entity_id=row.id,
-                 before_state=before, after_state=_version_state(row))
-    db.commit()
-    db.refresh(row)
+            changed = True
+            if field in material_fields:
+                material_changed = True
+    if changed:
+        row.updated_by = user.id
+        if material_changed:
+            invalidate_model_validation(db, row.id, actor_id=user.id)
+        db.flush()
+        record_audit(db, actor_user_id=user.id, action="model_version.updated",
+                     entity_type="model_version", entity_id=row.id,
+                     before_state=before, after_state=_version_state(row))
+        db.commit()
+        db.refresh(row)
     return serialize_version(row)
 
 
@@ -212,18 +246,38 @@ def publish_version(db: Session, version_id: str, user: Any) -> dict[str, Any]:
     model = db.get(Model, row.model_id)
     access.require_project_access(db, user, model.project_id, write=True)
     require_active_project(db, model.project_id)
-    if row.status not in {"validated", "approved"}:
+
+    # Concurrency lock on parent model
+    db.query(Model).filter(Model.id == row.model_id).with_for_update().first()
+
+    # P0: Publish must require independent approval (status == approved)
+    if row.status != "approved":
         raise ServiceError(
-            409, "MODEL_VERSION_NOT_READY",
-            f"Only validated or approved model versions can be published; current status is '{row.status}'.",
+            409, "MODEL_VERSION_NOT_APPROVED",
+            f"Only approved model versions can be published; current status is '{row.status}'.",
         )
+
+    # P0: Verify current definition matches approved fingerprint
+    current_fingerprint = compute_model_definition_fingerprint(db, row.id)
+    if not row.approved_fingerprint or row.approved_fingerprint != current_fingerprint:
+        raise ServiceError(
+            409, "MODEL_DEFINITION_CHANGED_SINCE_APPROVAL",
+            "Model version definition differs from the approved definition; publication refused.",
+        )
+
     before = _version_state(row)
-    db.query(ModelVersion).filter(
-        ModelVersion.model_id == row.model_id, ModelVersion.id != row.id
-    ).update({ModelVersion.is_current: False}, synchronize_session=False)
-    # Approved is the existing runnable lifecycle state. ``published_at`` and ``is_current``
-    # express publication without inventing a status that the execution gate rejects.
-    row.status = "approved"
+    # Mark previous current version(s) as superseded / non-current
+    current_versions = db.query(ModelVersion).filter(
+        ModelVersion.model_id == row.model_id,
+        ModelVersion.id != row.id,
+        ModelVersion.is_current.is_(True),
+    ).all()
+    for prev in current_versions:
+        prev.is_current = False
+        prev.status = "superseded"
+    if current_versions:
+        db.flush()
+
     row.is_current = True
     row.published_by = user.id
     row.published_at = now_utc()
@@ -233,7 +287,8 @@ def publish_version(db: Session, version_id: str, user: Any) -> dict[str, Any]:
     db.flush()
     record_audit(db, actor_user_id=user.id, action="model_version.published",
                  entity_type="model_version", entity_id=row.id,
-                 before_state=before, after_state=_version_state(row))
+                 before_state=before, after_state=_version_state(row),
+                 context={"approved_fingerprint": row.approved_fingerprint})
     db.commit()
     db.refresh(row)
     return serialize_version(row)
@@ -275,12 +330,20 @@ def archive_version(db: Session, version_id: str, user: Any) -> None:
 def validate_version(db: Session, version_id: str, user: Any) -> dict[str, Any]:
     row = db.query(ModelVersion).filter(
         ModelVersion.id == version_id, ModelVersion.deleted_at.is_(None)
-    ).first()
+    ).with_for_update().first()
     if row is None:
         raise not_found(f"Model version '{version_id}' not found.")
     model = db.get(Model, row.model_id)
     access.require_project_access(db, user, model.project_id, write=True)
     require_active_project(db, model.project_id)
+
+    # P0: Approved/current model versions must never go back to validated
+    if row.is_current or row.status in PROTECTED_STATUSES:
+        raise ServiceError(
+            409, "MODEL_VERSION_IMMUTABLE",
+            f"Model version '{row.version_label}' is in protected state '{row.status}' and cannot be revalidated.",
+            {"model_version_id": row.id, "status": row.status},
+        )
 
     register_all_products()
     formulas = db.query(FormulaRegistry).filter(
@@ -294,7 +357,12 @@ def validate_version(db: Session, version_id: str, user: Any) -> dict[str, Any]:
     checks_result = catalog_service.model_version_checks(db, formulas, published, row.id)
     before = _version_state(row)
     if checks_result["status"] == "validated":
+        fingerprint = compute_model_definition_fingerprint(db, row.id)
+        row.validation_fingerprint = fingerprint
+        row.validated_by = user.id
+        row.validated_at = now_utc()
         row.status = "validated"
+        checks_result["fingerprint"] = fingerprint
         for formula in formulas:
             if formula.status == "draft":
                 formula.status = "validated"
@@ -304,7 +372,7 @@ def validate_version(db: Session, version_id: str, user: Any) -> dict[str, Any]:
         record_audit(db, actor_user_id=user.id, action="model_version.validated",
                      entity_type="model_version", entity_id=row.id,
                      before_state=before, after_state=_version_state(row),
-                     context={"checks": checks_result["checks"]})
+                     context={"checks": checks_result["checks"], "validation_fingerprint": fingerprint})
         db.commit()
         db.refresh(row)
 
@@ -312,50 +380,69 @@ def validate_version(db: Session, version_id: str, user: Any) -> dict[str, Any]:
         "model_version": serialize_version(row),
         "status": row.status,
         "validation": checks_result,
+        "fingerprint": row.validation_fingerprint,
+        "validation_evidence": {
+            "validation_fingerprint": row.validation_fingerprint,
+            "validated_by": row.validated_by,
+            "validated_at": row.validated_at.isoformat() if row.validated_at else None,
+            "scheme": "mentoramp.model_definition/v1",
+        },
     }
 
 
 def approve_version(db: Session, version_id: str, user: Any, reason: str | None = None) -> dict[str, Any]:
     row = db.query(ModelVersion).filter(
         ModelVersion.id == version_id, ModelVersion.deleted_at.is_(None)
-    ).first()
+    ).with_for_update().first()
     if row is None:
         raise not_found(f"Model version '{version_id}' not found.")
     model = db.get(Model, row.model_id)
     access.require_project_access(db, user, model.project_id)
     require_active_project(db, model.project_id)
 
+    # P1: Dedicated model approval permission (models:approve)
     user_roles = {role.name for role in getattr(user, "roles", [])}
     user_permissions = {
         p.name for role in getattr(user, "roles", []) for p in getattr(role, "permissions", [])
     }
-    can_approve = bool(
-        "imports:approve" in user_permissions
-        or user_roles.intersection({"admin", "actuary", "reviewer"})
-    )
+    can_approve = bool("models:approve" in user_permissions or "admin" in user_roles)
     if not can_approve:
-        raise ServiceError(403, "FORBIDDEN", "You do not have permission to approve model versions.")
+        raise ServiceError(403, "MODEL_APPROVAL_PERMISSION_REQUIRED", "You do not have permission to approve model versions.")
 
+    # P0: Eligible status check
     if row.status not in {"validated", "needs_review"}:
         raise ServiceError(
             409, "MODEL_VERSION_NOT_VALIDATED",
             f"Only validated or needs_review model versions can be approved; current status is '{row.status}'.",
         )
 
-    if row.created_by == user.id:
-        raise ServiceError(409, "SELF_APPROVAL_FORBIDDEN", "A model version must be approved by another user.")
+    # P0: Four-eyes rule: creator cannot self-approve, AND last material editor cannot self-approve
+    if row.created_by == user.id or row.last_material_modified_by == user.id:
+        raise ServiceError(
+            409, "SELF_APPROVAL_FORBIDDEN",
+            "A model version must be approved by another user who did not create or materially modify it.",
+        )
+
+    # P0: Approval must verify current validation fingerprint
+    current_fingerprint = compute_model_definition_fingerprint(db, row.id)
+    if not row.validation_fingerprint or row.validation_fingerprint != current_fingerprint:
+        raise ServiceError(
+            409, "MODEL_VALIDATION_STALE",
+            "Model version content has changed since it was validated; revalidation is required.",
+        )
 
     before = _version_state(row)
     row.status = "approved"
-    row.published_by = user.id
-    row.published_at = now_utc()
+    row.approved_by = user.id
+    row.approved_at = now_utc()
+    row.approved_fingerprint = current_fingerprint
     row.updated_by = user.id
     db.flush()
     record_audit(
         db, actor_user_id=user.id, action="model_version.approved",
         entity_type="model_version", entity_id=row.id,
         before_state=before, after_state=_version_state(row),
-        context={"reason": reason},
+        context={"reason": reason, "approved_fingerprint": current_fingerprint},
     )
     db.commit()
     db.refresh(row)
@@ -365,7 +452,7 @@ def approve_version(db: Session, version_id: str, user: Any, reason: str | None 
 def reject_version(db: Session, version_id: str, user: Any, reason: str | None = None) -> dict[str, Any]:
     row = db.query(ModelVersion).filter(
         ModelVersion.id == version_id, ModelVersion.deleted_at.is_(None)
-    ).first()
+    ).with_for_update().first()
     if row is None:
         raise not_found(f"Model version '{version_id}' not found.")
     model = db.get(Model, row.model_id)
@@ -376,26 +463,144 @@ def reject_version(db: Session, version_id: str, user: Any, reason: str | None =
     user_permissions = {
         p.name for role in getattr(user, "roles", []) for p in getattr(role, "permissions", [])
     }
-    can_reject = bool(
-        "imports:approve" in user_permissions
-        or user_roles.intersection({"admin", "actuary", "reviewer"})
-    )
+    can_reject = bool("models:approve" in user_permissions or "admin" in user_roles)
     if not can_reject:
-        raise ServiceError(403, "FORBIDDEN", "You do not have permission to reject model versions.")
+        raise ServiceError(403, "MODEL_APPROVAL_PERMISSION_REQUIRED", "You do not have permission to reject model versions.")
 
-    if row.status in {"approved", "published"}:
+    # P1: Rejection must require a real reason
+    clean_reason = (reason or "").strip()
+    if not clean_reason or len(clean_reason) < 3:
+        raise ServiceError(422, "MODEL_REJECTION_REASON_REQUIRED", "A non-empty reason is required to reject a model version.")
+
+    if row.status in PROTECTED_STATUSES or row.is_current:
         raise conflict(f"Approved or published model versions cannot be rejected; current status is '{row.status}'.")
 
     before = _version_state(row)
     row.status = "rejected"
+    row.rejected_by = user.id
+    row.rejected_at = now_utc()
+    row.rejection_reason = clean_reason
+    row.validation_fingerprint = None
+    row.validated_at = None
+    row.validated_by = None
     row.updated_by = user.id
     db.flush()
     record_audit(
         db, actor_user_id=user.id, action="model_version.rejected",
         entity_type="model_version", entity_id=row.id,
         before_state=before, after_state=_version_state(row),
-        context={"reason": reason},
+        context={"reason": clean_reason},
     )
     db.commit()
     db.refresh(row)
     return serialize_version(row)
+
+
+def create_published_output(
+    db: Session, model_version_id: str, payload: dict[str, Any], user: Any
+) -> dict[str, Any]:
+    require_mutable_model_version(db, model_version_id)
+    model_version, model = catalog_service.get_model_version(db, model_version_id)
+    access.require_project_access(db, user, model.project_id, write=True)
+    require_active_project(db, model.project_id)
+
+    existing = (
+        db.query(ModelPublishedOutput)
+        .filter(
+            ModelPublishedOutput.model_version_id == model_version_id,
+            ModelPublishedOutput.variable_name == payload["variable_name"],
+        )
+        .first()
+    )
+    if existing:
+        raise conflict(f"Published output for '{payload['variable_name']}' already exists.")
+
+    row = ModelPublishedOutput(
+        model_version_id=model_version_id,
+        variable_name=payload["variable_name"],
+        display_name=payload.get("display_name", payload["variable_name"]),
+        unit=payload.get("unit"),
+        dimension=payload.get("dimension"),
+        aggregation=payload.get("aggregation", "sum"),
+        description=payload.get("description"),
+        sort_order=payload.get("sort_order", 0),
+    )
+    db.add(row)
+    invalidate_model_validation(db, model_version_id, actor_id=user.id)
+    db.commit()
+    db.refresh(row)
+    return {
+        "id": row.id,
+        "model_version_id": row.model_version_id,
+        "variable_name": row.variable_name,
+        "display_name": row.display_name,
+        "unit": row.unit,
+        "dimension": row.dimension,
+        "aggregation": row.aggregation,
+        "description": row.description,
+        "sort_order": row.sort_order,
+    }
+
+
+def update_published_output(
+    db: Session, model_version_id: str, variable_name: str, payload: dict[str, Any], user: Any
+) -> dict[str, Any]:
+    require_mutable_model_version(db, model_version_id)
+    model_version, model = catalog_service.get_model_version(db, model_version_id)
+    access.require_project_access(db, user, model.project_id, write=True)
+    require_active_project(db, model.project_id)
+
+    row = (
+        db.query(ModelPublishedOutput)
+        .filter(
+            ModelPublishedOutput.model_version_id == model_version_id,
+            ModelPublishedOutput.variable_name == variable_name,
+        )
+        .first()
+    )
+    if row is None:
+        raise not_found(f"Published output '{variable_name}' not found.")
+
+    for field in ("display_name", "unit", "dimension", "aggregation", "description", "sort_order"):
+        if field in payload:
+            setattr(row, field, payload[field])
+
+    invalidate_model_validation(db, model_version_id, actor_id=user.id)
+    db.commit()
+    db.refresh(row)
+    return {
+        "id": row.id,
+        "model_version_id": row.model_version_id,
+        "variable_name": row.variable_name,
+        "display_name": row.display_name,
+        "unit": row.unit,
+        "dimension": row.dimension,
+        "aggregation": row.aggregation,
+        "description": row.description,
+        "sort_order": row.sort_order,
+    }
+
+
+def delete_published_output(
+    db: Session, model_version_id: str, variable_name: str, user: Any
+) -> None:
+    require_mutable_model_version(db, model_version_id)
+    model_version, model = catalog_service.get_model_version(db, model_version_id)
+    access.require_project_access(db, user, model.project_id, write=True)
+    require_active_project(db, model.project_id)
+
+    row = (
+        db.query(ModelPublishedOutput)
+        .filter(
+            ModelPublishedOutput.model_version_id == model_version_id,
+            ModelPublishedOutput.variable_name == variable_name,
+        )
+        .first()
+    )
+    if row is None:
+        raise not_found(f"Published output '{variable_name}' not found.")
+
+    db.delete(row)
+    invalidate_model_validation(db, model_version_id, actor_id=user.id)
+    db.commit()
+

@@ -38,8 +38,8 @@ def _authorize_version_review(
         p.name for role in getattr(user, "roles", []) for p in getattr(role, "permissions", [])
     }
     can_review = bool(
-        "imports:approve" in user_permissions
-        or user_roles.intersection({"admin", "actuary", "reviewer"})
+        "models:approve" in user_permissions
+        or "admin" in user_roles
     )
     if not can_review:
         raise HTTPException(
@@ -64,6 +64,26 @@ class VariableDefinitionUpdate(BaseModel):
     default_value: Any = None
     source: dict[str, Any] | None = None
     allow_scenario_override: bool | None = None
+
+
+class PublishedOutputCreate(BaseModel):
+    variable_name: str = Field(min_length=1, max_length=255)
+    display_name: str | None = Field(None, max_length=255)
+    unit: str | None = Field(None, max_length=50)
+    dimension: str | None = Field(None, max_length=255)
+    aggregation: str | None = Field("sum", max_length=20)
+    description: str | None = None
+    sort_order: int | None = 0
+
+
+class PublishedOutputUpdate(BaseModel):
+    display_name: str | None = Field(None, max_length=255)
+    unit: str | None = Field(None, max_length=50)
+    dimension: str | None = Field(None, max_length=255)
+    aggregation: str | None = Field(None, max_length=20)
+    description: str | None = None
+    sort_order: int | None = None
+
 
 
 class ModelCreate(BaseModel):
@@ -236,3 +256,51 @@ def update_model_version_variable(
     return variable_definition_service.update_definition(
         db, model_version_id, variable_name, payload.model_dump(exclude_unset=True), user,
     )
+
+
+@router.delete("/model-versions/{model_version_id}/variables/{variable_name}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_model_version_variable(
+    model_version_id: str,
+    variable_name: str,
+    user: VersionWriter,
+    db: Session = Depends(get_db),
+) -> Response:
+    variable_definition_service.delete_definition(db, model_version_id, variable_name, user)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/model-versions/{model_version_id}/published-outputs", status_code=status.HTTP_201_CREATED)
+def create_published_output(
+    model_version_id: str,
+    payload: PublishedOutputCreate,
+    user: VersionWriter,
+    db: Session = Depends(get_db),
+):
+    return model_version_service.create_published_output(
+        db, model_version_id, payload.model_dump(exclude_unset=True), user
+    )
+
+
+@router.patch("/model-versions/{model_version_id}/published-outputs/{variable_name}")
+def update_published_output(
+    model_version_id: str,
+    variable_name: str,
+    payload: PublishedOutputUpdate,
+    user: VersionWriter,
+    db: Session = Depends(get_db),
+):
+    return model_version_service.update_published_output(
+        db, model_version_id, variable_name, payload.model_dump(exclude_unset=True), user
+    )
+
+
+@router.delete("/model-versions/{model_version_id}/published-outputs/{variable_name}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_published_output(
+    model_version_id: str,
+    variable_name: str,
+    user: VersionWriter,
+    db: Session = Depends(get_db),
+) -> Response:
+    model_version_service.delete_published_output(db, model_version_id, variable_name, user)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+

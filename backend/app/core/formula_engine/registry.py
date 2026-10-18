@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.core.audit import record_audit
+from app.core.model_lifecycle import invalidate_model_validation, require_mutable_model_version
 from app.db.models.formula import FormulaRegistry as FormulaModel
 from app.db.models.formula_dependency import FormulaDependency
 from app.db.models.modeling import ModelVersion
@@ -49,24 +50,21 @@ def _model_to_definition(model: FormulaModel) -> FormulaDefinition:
         basis_applicability=model.basis_applicability or [],
         version=model.version or "v1",
         status=model.status or "draft",
+        model_version_id=model.model_version_id,
     )
 
 
 def _require_mutable_model_version(db: Session, model: FormulaModel) -> None:
-    if not model.model_version_id:
-        return
-    version = db.get(ModelVersion, model.model_version_id)
-    if version and (version.status in {"published", "approved"} or version.published_at is not None):
-        raise ServiceError(
-            409,
-            "MODEL_VERSION_IMMUTABLE",
-            "Formulas on a published or approved model version are immutable; create a new version.",
-            {"model_version_id": version.id, "status": version.status},
-        )
+    if model.model_version_id:
+        require_mutable_model_version(db, model.model_version_id)
 
 
 def register(db: Session, formula: FormulaDefinition, actor_user_id: str) -> FormulaDefinition:
     """Create a formula with its dependencies."""
+    mv_id = getattr(formula, "model_version_id", None)
+    if mv_id:
+        require_mutable_model_version(db, mv_id)
+        invalidate_model_validation(db, mv_id, actor_user_id)
     model = FormulaModel(
         id=formula.id,
         name=formula.name,
@@ -77,6 +75,7 @@ def register(db: Session, formula: FormulaDefinition, actor_user_id: str) -> For
         basis_applicability=formula.basis_applicability,
         version=formula.version,
         status=formula.status,
+        model_version_id=mv_id,
         created_by=actor_user_id,
         updated_by=actor_user_id,
     )
@@ -127,12 +126,17 @@ def update(db: Session, formula_id: str, updates: dict, actor_user_id: str) -> F
     if model is None:
         return None
     _require_mutable_model_version(db, model)
+    invalidate_model_validation(db, model.model_version_id, actor_user_id)
     before = _state(model)
     allowed = {"name", "output_variable", "function_ref", "category",
                "product_applicability", "basis_applicability", "status"}
     for key, value in updates.items():
         if key in allowed:
             setattr(model, key, value)
+    if "dependencies" in updates and updates["dependencies"] is not None:
+        model.dependencies.clear()
+        for dep in updates["dependencies"]:
+            model.dependencies.append(FormulaDependency(depends_on_variable=dep))
     model.updated_by = actor_user_id
     db.flush()
     record_audit(
@@ -152,6 +156,7 @@ def delete(db: Session, formula_id: str, actor_user_id: str) -> bool:
     if model is None:
         return False
     _require_mutable_model_version(db, model)
+    invalidate_model_validation(db, model.model_version_id, actor_user_id)
     before = _state(model)
     model.deleted_at = datetime.now(timezone.utc)
     model.deleted_by = actor_user_id
