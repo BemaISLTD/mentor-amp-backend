@@ -300,6 +300,11 @@ def test_same_variable_name_resolves_independently_per_model_version(two_project
         headers=env.admin_headers(), json={"source": {"type": "manual", "value": 0.06}, "default_value": 0.06},
     )
     assert patched.status_code == 200 and patched.json()["version"] == "v2"
+    validated = env.client.post(
+        f"/v1/model-versions/{env.projects['B']['version']}/validate",
+        headers=env.admin_headers(),
+    )
+    assert validated.status_code == 200
     a, b = env.submit("A", ["Base"]), env.submit("B", ["Base"])
     env.execute(a)
     env.execute(b)

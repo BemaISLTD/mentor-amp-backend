@@ -79,7 +79,7 @@ class ModelVersion(Base):
     basis: Mapped[str] = mapped_column(String(100), nullable=False)
     methodology: Mapped[str | None] = mapped_column(String(100), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="draft", nullable=False)
-    is_current: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_current: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     illustrative: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     change_summary: Mapped[str | None] = mapped_column(Text, nullable=True)

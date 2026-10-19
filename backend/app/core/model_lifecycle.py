@@ -47,7 +47,7 @@ def require_mutable_model_version(
     version = query.first()
     if version is None:
         return None
-    if version.is_current or version.status in PROTECTED_STATUSES:
+    if version.status in PROTECTED_STATUSES or (version.is_current and version.published_at is not None):
         raise ServiceError(
             409,
             "MODEL_VERSION_IMMUTABLE",

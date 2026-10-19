@@ -338,7 +338,7 @@ def validate_version(db: Session, version_id: str, user: Any) -> dict[str, Any]:
     require_active_project(db, model.project_id)
 
     # P0: Approved/current model versions must never go back to validated
-    if row.is_current or row.status in PROTECTED_STATUSES:
+    if row.status in PROTECTED_STATUSES or (row.is_current and row.published_at is not None):
         raise ServiceError(
             409, "MODEL_VERSION_IMMUTABLE",
             f"Model version '{row.version_label}' is in protected state '{row.status}' and cannot be revalidated.",
@@ -472,7 +472,7 @@ def reject_version(db: Session, version_id: str, user: Any, reason: str | None =
     if not clean_reason or len(clean_reason) < 3:
         raise ServiceError(422, "MODEL_REJECTION_REASON_REQUIRED", "A non-empty reason is required to reject a model version.")
 
-    if row.status in PROTECTED_STATUSES or row.is_current:
+    if row.status in PROTECTED_STATUSES or (row.is_current and row.published_at is not None):
         raise conflict(f"Approved or published model versions cannot be rejected; current status is '{row.status}'.")
 
     before = _version_state(row)

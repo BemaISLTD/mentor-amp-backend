@@ -141,18 +141,18 @@ def test_bootstrap_creates_the_complete_role_permission_matrix(auth_client):
     assert roles == {
         "admin": {
             "projects:read", "projects:write", "registries:read", "registries:write",
-            "imports:read", "imports:write", "imports:approve", "runs:read", "runs:execute",
+            "imports:read", "imports:write", "imports:approve", "models:approve", "runs:read", "runs:execute",
         },
         "actuary": {
             "projects:read", "registries:read", "registries:write", "imports:read",
-            "imports:write", "imports:approve", "runs:read", "runs:execute",
+            "imports:write", "imports:approve", "models:approve", "runs:read", "runs:execute",
         },
         "model_developer": {
             "projects:read", "registries:read", "registries:write", "imports:read",
             "imports:write", "runs:read", "runs:execute",
         },
         "reviewer": {
-            "projects:read", "registries:read", "imports:read", "imports:approve", "runs:read",
+            "projects:read", "registries:read", "imports:read", "imports:approve", "models:approve", "runs:read",
         },
         "read_only": {"projects:read", "registries:read", "imports:read", "runs:read"},
     }
