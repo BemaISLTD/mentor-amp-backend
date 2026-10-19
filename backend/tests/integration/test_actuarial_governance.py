@@ -72,7 +72,8 @@ def test_model_versions_are_whole_model_versions_and_published_versions_are_immu
     assert first.status_code == 201, first.text
     first_id = first.json()["id"]
     published = client.post(f"/v1/model-versions/{first_id}/publish")
-    assert published.status_code == 404
+    assert published.status_code == 409
+    assert published.json()["error"]["code"] == "MODEL_VERSION_NOT_READY"
     stored_version = db.get(ModelVersion, first_id)
     stored_version.status = "approved"
     stored_version.published_at = stored_version.created_at

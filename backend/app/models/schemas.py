@@ -94,6 +94,7 @@ class FormulaDefinition(BaseModel):
     # Legacy statuses plus the lifecycle statuses M1 formulas use (app.core.lifecycle).
     status: Literal["draft", "active", "deprecated", "needs_review", "validated", "approved"] = "draft"
     test_case_ids: list[str] = Field(default_factory=list)
+    model_version_id: Optional[str] = None
 
 
 class FormulaDatabase(BaseModel):

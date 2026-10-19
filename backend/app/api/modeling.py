@@ -2,14 +2,14 @@
 
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import authorize_path
+from app.api.dependencies import authorize_path, get_current_user
 from app.db.database import get_db
 from app.db.models.user import User
-from app.services import catalog_service, model_version_service, variable_definition_service
+from app.services import access, catalog_service, model_version_service, variable_definition_service
 
 router = APIRouter(tags=["models"])
 ProjectReader = Annotated[User, Depends(authorize_path("project", "project_id", "projects:read"))]
@@ -27,6 +27,35 @@ VersionWriter = Annotated[
 FormulaReader = Annotated[User, Depends(authorize_path("formula", "formula_id", "projects:read"))]
 
 
+def _authorize_version_review(
+    request: Request,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+) -> User:
+    access.require_object_access(db, user, "model_version", request.path_params["model_version_id"])
+    user_roles = {role.name for role in getattr(user, "roles", [])}
+    user_permissions = {
+        p.name for role in getattr(user, "roles", []) for p in getattr(role, "permissions", [])
+    }
+    can_review = bool(
+        "models:approve" in user_permissions
+        or "admin" in user_roles
+    )
+    if not can_review:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to review model versions.",
+        )
+    return user
+
+
+VersionReviewer = Annotated[User, Depends(_authorize_version_review)]
+
+
+class ModelReviewRequest(BaseModel):
+    reason: str | None = None
+
+
 class VariableDefinitionUpdate(BaseModel):
     display_name: str | None = None
     description: str | None = None
@@ -35,6 +64,26 @@ class VariableDefinitionUpdate(BaseModel):
     default_value: Any = None
     source: dict[str, Any] | None = None
     allow_scenario_override: bool | None = None
+
+
+class PublishedOutputCreate(BaseModel):
+    variable_name: str = Field(min_length=1, max_length=255)
+    display_name: str | None = Field(None, max_length=255)
+    unit: str | None = Field(None, max_length=50)
+    dimension: str | None = Field(None, max_length=255)
+    aggregation: str | None = Field("sum", max_length=20)
+    description: str | None = None
+    sort_order: int | None = 0
+
+
+class PublishedOutputUpdate(BaseModel):
+    display_name: str | None = Field(None, max_length=255)
+    unit: str | None = Field(None, max_length=50)
+    dimension: str | None = Field(None, max_length=255)
+    aggregation: str | None = Field(None, max_length=20)
+    description: str | None = None
+    sort_order: int | None = None
+
 
 
 class ModelCreate(BaseModel):
@@ -129,6 +178,42 @@ def archive_model_version(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@router.post("/model-versions/{model_version_id}/validate")
+def validate_model_version(
+    model_version_id: str, user: VersionWriter, db: Session = Depends(get_db)
+):
+    return model_version_service.validate_version(db, model_version_id, user)
+
+
+@router.post("/model-versions/{model_version_id}/approve")
+def approve_model_version(
+    model_version_id: str,
+    user: VersionReviewer,
+    payload: ModelReviewRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    reason = payload.reason if payload else None
+    return model_version_service.approve_version(db, model_version_id, user, reason)
+
+
+@router.post("/model-versions/{model_version_id}/reject")
+def reject_model_version(
+    model_version_id: str,
+    user: VersionReviewer,
+    payload: ModelReviewRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    reason = payload.reason if payload else None
+    return model_version_service.reject_version(db, model_version_id, user, reason)
+
+
+@router.post("/model-versions/{model_version_id}/publish")
+def publish_model_version(
+    model_version_id: str, user: VersionWriter, db: Session = Depends(get_db)
+):
+    return model_version_service.publish_version(db, model_version_id, user)
+
+
 @router.get("/model-versions/{model_version_id}/structure")
 def model_version_structure(model_version_id: str, user: VersionReader, db: Session = Depends(get_db)):
     del user
@@ -171,3 +256,51 @@ def update_model_version_variable(
     return variable_definition_service.update_definition(
         db, model_version_id, variable_name, payload.model_dump(exclude_unset=True), user,
     )
+
+
+@router.delete("/model-versions/{model_version_id}/variables/{variable_name}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_model_version_variable(
+    model_version_id: str,
+    variable_name: str,
+    user: VersionWriter,
+    db: Session = Depends(get_db),
+) -> Response:
+    variable_definition_service.delete_definition(db, model_version_id, variable_name, user)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/model-versions/{model_version_id}/published-outputs", status_code=status.HTTP_201_CREATED)
+def create_published_output(
+    model_version_id: str,
+    payload: PublishedOutputCreate,
+    user: VersionWriter,
+    db: Session = Depends(get_db),
+):
+    return model_version_service.create_published_output(
+        db, model_version_id, payload.model_dump(exclude_unset=True), user
+    )
+
+
+@router.patch("/model-versions/{model_version_id}/published-outputs/{variable_name}")
+def update_published_output(
+    model_version_id: str,
+    variable_name: str,
+    payload: PublishedOutputUpdate,
+    user: VersionWriter,
+    db: Session = Depends(get_db),
+):
+    return model_version_service.update_published_output(
+        db, model_version_id, variable_name, payload.model_dump(exclude_unset=True), user
+    )
+
+
+@router.delete("/model-versions/{model_version_id}/published-outputs/{variable_name}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_published_output(
+    model_version_id: str,
+    variable_name: str,
+    user: VersionWriter,
+    db: Session = Depends(get_db),
+) -> Response:
+    model_version_service.delete_published_output(db, model_version_id, variable_name, user)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+

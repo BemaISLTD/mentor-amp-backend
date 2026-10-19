@@ -11,7 +11,9 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.audit import record_audit
+from app.core.model_lifecycle import invalidate_model_validation, require_mutable_model_version
 from app.db.models.model_variable import ModelVariableDefinition
+from app.db.models.modeling import ModelVersion
 from app.services.common import ServiceError, not_found
 from app.services.model_definition import definition_view, definitions_for
 
@@ -47,6 +49,7 @@ def update_definition(
     )
     if row is None:
         raise not_found(f"Variable '{variable_name}' is not defined for this model version.")
+    require_mutable_model_version(db, model_version_id)
     before = definition_view(row)
     # Fields that cannot be null: an explicit null means "no change".
     changes = {key: value for key, value in changes.items()
@@ -65,6 +68,7 @@ def update_definition(
             setattr(row, field, changes[field])
             changed = True
     if changed:
+        invalidate_model_validation(db, model_version_id, actor_id=user.id if user else None)
         row.version = _next_version(row.version)
         row.updated_by = user.id if user else row.updated_by
         db.flush()
@@ -77,3 +81,29 @@ def update_definition(
     db.commit()
     db.refresh(row)
     return definition_view(row)
+
+
+def delete_definition(
+    db: Session, model_version_id: str, variable_name: str, user: Any | None = None,
+) -> None:
+    row = (
+        db.query(ModelVariableDefinition)
+        .filter(ModelVariableDefinition.model_version_id == model_version_id,
+                ModelVariableDefinition.variable_name == variable_name)
+        .first()
+    )
+    if row is None:
+        raise not_found(f"Variable '{variable_name}' is not defined for this model version.")
+    require_mutable_model_version(db, model_version_id)
+    invalidate_model_validation(db, model_version_id, actor_id=user.id if user else None)
+    before = definition_view(row)
+    db.delete(row)
+    db.flush()
+    if user is not None:
+        record_audit(
+            db, actor_user_id=user.id, action="model_variable_definition.deleted",
+            entity_type="model_variable_definition", entity_id=row.id,
+            before_state=before, after_state={},
+        )
+    db.commit()
+

@@ -23,6 +23,7 @@ BUILTIN_PERMISSIONS = {
     "imports:read": "View imported actuarial data.",
     "imports:write": "Upload actuarial data files.",
     "imports:approve": "Approve or reject actuarial dataset versions.",
+    "models:approve": "Approve or reject actuarial model versions.",
     "runs:read": "View projection runs and results.",
     "runs:execute": "Start projection runs.",
 }
@@ -55,6 +56,7 @@ BUILTIN_ROLES = {
             "registries:read",
             "imports:read",
             "imports:approve",
+            "models:approve",
             "runs:read",
         },
     },
