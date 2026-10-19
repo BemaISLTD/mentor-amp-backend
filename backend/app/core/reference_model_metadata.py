@@ -31,9 +31,9 @@ class ReferenceModelMetadata(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     schema_version: Literal["mentoramp.reference_model/v1"] = "mentoramp.reference_model/v1"
-    classification: Literal["external_development_benchmark"] = (
-        "external_development_benchmark"
-    )
+    classification: Literal[
+        "external_development_benchmark", "mentoramp_simplified_development_reference"
+    ] = "external_development_benchmark"
     source: ReferenceSource
     runtime_required: bool = False
     production_dependency: bool = False

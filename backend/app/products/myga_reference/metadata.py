@@ -1,4 +1,4 @@
-"""Pinned external benchmark metadata for the MentorAmp MYGA reference model."""
+"""Development reference metadata for the MentorAmp MYGA model."""
 
 from datetime import date
 
@@ -6,30 +6,31 @@ from app.core.reference_model_metadata import ReferenceModelMetadata, ReferenceS
 
 
 LIFELIB_MYGA_REFERENCE = ReferenceModelMetadata(
+    classification="mentoramp_simplified_development_reference",
     source=ReferenceSource(
-        provider="lifelib Developers",
-        library="lifelib uslib",
-        model="MYGA_US_S",
-        release="v0.17.2",
+        provider="MentorAmp Development Team",
+        library="mentoramp-actuarial-reference",
+        model="MYGA_SIMPLIFIED_DEVELOPMENT_REFERENCE",
+        release="v1.0",
         commit="5d91f95a7c2b3e8f419b846e273f081492576b5e",
         retrieved_on=date(2026, 10, 18),
         documentation_urls=(
             "https://lifelib.io/libraries/uslib/index.html",
             "https://lifelib.io/libraries/uslib/products/fixed_deferred_annuity/product-spec.html",
             "https://lifelib.io/libraries/uslib/products/fixed_deferred_annuity/technical-notes.html",
-            "https://lifelib.io/libraries/uslib/products/fixed_deferred_annuity/model.html",
         ),
     ),
     compared_outputs=(
         "account_value_bom",
         "credited_interest",
-        "partial_withdrawals",
-        "surrender_charges_incurred",
+        "gross_withdrawal",
+        "surrender_charge",
+        "net_withdrawal_benefit",
         "account_value_eom",
         "mgsv_eom",
         "cash_surrender_value_eom",
         "death_benefit_eom",
-        "maintenance_expenses",
+        "maintenance_expense",
         "net_insurer_cash_flow",
     ),
     excluded_uses=(
@@ -40,8 +41,9 @@ LIFELIB_MYGA_REFERENCE = ReferenceModelMetadata(
         "production run execution",
     ),
     limitations=(
-        "The upstream uslib model is a development composite, not an insurer-specific contract.",
-        "Market value adjustments (MVA) are optional rider extensions outside the core MYGA definition.",
-        "Illustrative assumptions must be replaced by company-approved data for valuation use.",
+        "This fixture is an internally generated development reference, not an independent LifeLib oracle run.",
+        "Market Value Adjustment (MVA) is not modeled in this development reference.",
+        "MGSV nonforfeiture accumulation rate is an illustrative contractual assumption, not a verified statutory derivation under Model #805.",
+        "Surrender charge and waiver schedules are illustrative contractual examples.",
     ),
 )

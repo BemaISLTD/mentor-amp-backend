@@ -1,21 +1,28 @@
-"""Unit and reconciliation tests for the native MYGA reference-model anchor and sample data."""
-
 import csv
+import copy
 import json
 import math
+import sys
 from pathlib import Path
 
 import pytest
 
+BACKEND_DIR = Path(__file__).resolve().parents[2]
+REPO_ROOT = BACKEND_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from app.products.myga_reference.metadata import LIFELIB_MYGA_REFERENCE
+from tools.lifelib_crosscheck.myga_crosscheck import reconcile_ledger, REQUIRED_FIELDS
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
-FIXTURE_PATH = BACKEND_DIR / "tests" / "fixtures" / "myga_reference_lifelib_v0_17_2.json"
+FIXTURE_PATH = BACKEND_DIR / "tests" / "fixtures" / "myga_reference_simplified_v1.json"
 SAMPLES_DIR = BACKEND_DIR.parent / "samples" / "myga"
 
 
 @pytest.fixture(scope="module")
 def fixture_data() -> dict:
+    assert FIXTURE_PATH.is_file(), f"Fixture missing at {FIXTURE_PATH}"
     return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
 
@@ -24,16 +31,19 @@ def test_myga_fixture_schema_and_metadata():
     assert FIXTURE_PATH.is_file()
     fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
     assert fixture["fixture_schema"] == "mentoramp.reference_fixture/v1"
-    assert fixture["source"]["model"] == "MYGA_US_S"
-    assert fixture["source"]["release"] == "v0.17.2"
+    assert fixture["reference_classification"] == "mentoramp_simplified_development_reference"
+    assert fixture["mva_status"] == "excluded_not_modeled"
+    assert "NOT an independent LifeLib oracle run" in fixture["provenance_statement"]
 
     config = LIFELIB_MYGA_REFERENCE.as_configuration()
     assert config["schema_version"] == "mentoramp.reference_model/v1"
+    assert config["classification"] == "mentoramp_simplified_development_reference"
     assert config["runtime_required"] is False
     assert config["production_dependency"] is False
     assert config["actuarial_status"] == "illustrative_not_approved"
     assert "account_value_eom" in config["compared_outputs"]
-    assert "cash_surrender_value_eom" in config["compared_outputs"]
+    assert "net_withdrawal_benefit" in config["compared_outputs"]
+    assert "net_insurer_cash_flow" in config["compared_outputs"]
 
 
 def test_myga_anchor_account_value_rollforward_precision(fixture_data):
@@ -47,11 +57,10 @@ def test_myga_anchor_account_value_rollforward_precision(fixture_data):
 
     av = premium
     for row in anchor["rows"]:
-        m = row["month"]
         expected_av_bom = row["account_value_bom"]
-        expected_interest = row["interest_credited"]
+        expected_interest = row["credited_interest"]
         expected_av_eom = row["account_value_eom"]
-        wd = row["partial_withdrawal"]
+        gross_wd = row["gross_withdrawal"]
 
         # 1. BOM balance check
         assert math.isclose(av, expected_av_bom, abs_tol=1e-12)
@@ -60,8 +69,8 @@ def test_myga_anchor_account_value_rollforward_precision(fixture_data):
         calculated_interest = av * monthly_rate
         assert math.isclose(calculated_interest, expected_interest, abs_tol=1e-12)
 
-        # 3. EOM balance after withdrawal check
-        av = av + calculated_interest - wd
+        # 3. EOM balance after gross withdrawal check
+        av = av + calculated_interest - gross_wd
         assert math.isclose(av, expected_av_eom, abs_tol=1e-12)
 
     # 4. Diagnostics check at Month 60 (5 years)
@@ -71,32 +80,38 @@ def test_myga_anchor_account_value_rollforward_precision(fixture_data):
 
 
 def test_myga_free_withdrawal_allowance_and_surrender_charges(fixture_data):
-    """Verify free partial withdrawal thresholding and surrender charge mechanics."""
+    """Verify free partial withdrawal thresholding, surrender charge, net benefit, and insurer cash flow."""
     anchor = fixture_data["anchor_case"]
     m12_row = [r for r in anchor["rows"] if r["month"] == 12][0]
 
     # Month 12: $4,000 withdrawal is within the 10% ($10,000) limit -> 0 charge
-    assert m12_row["partial_withdrawal"] == 4000.0
-    assert m12_row["chargeable_withdrawal"] == 0.0
-    assert m12_row["surrender_charge_on_withdrawal"] == 0.0
+    assert m12_row["gross_withdrawal"] == 4000.0
+    assert m12_row["surrender_charge"] == 0.0
+    assert m12_row["net_withdrawal_benefit"] == 4000.0
+    assert m12_row["maintenance_expense"] == 5.0
+    # Insurer cash flow = -net_benefit - expense = -4000 - 5 = -4005
+    assert m12_row["net_insurer_cash_flow"] == -4005.0
 
-    # Excess case: Month 24 has a $20,000 withdrawal
+    # Excess case: Month 24 has a $20,000 gross withdrawal
     excess = fixture_data["excess_withdrawal_case"]
     m24_row = [r for r in excess["rows"] if r["month"] == 24][0]
 
-    assert m24_row["partial_withdrawal"] == 20000.0
-    # In Year 2, prior anniversary AV was $104,500.00; free limit is 10% = $10,450.00
+    assert m24_row["gross_withdrawal"] == 20000.0
+    # In Year 2 for MYGA-0002, prior anniversary AV was $104,500.00; free limit is 10% = $10,450.00
     expected_free = 104500.0 * 0.10
     expected_chargeable = 20000.0 - expected_free
-    assert math.isclose(m24_row["chargeable_withdrawal"], expected_chargeable, abs_tol=1e-12)
+    expected_sc = expected_chargeable * 0.06  # 6% surrender charge in Year 2
+    expected_net_benefit = 20000.0 - expected_sc
 
-    # Year 2 surrender charge rate is 6%
-    expected_sc = expected_chargeable * 0.06
-    assert math.isclose(m24_row["surrender_charge_on_withdrawal"], expected_sc, abs_tol=1e-12)
+    assert math.isclose(m24_row["surrender_charge"], expected_sc, abs_tol=1e-9)
+    assert math.isclose(m24_row["net_withdrawal_benefit"], expected_net_benefit, abs_tol=1e-9)
+    # Insurer cash flow must deduct net benefit paid to policyholder, not gross
+    expected_insurer_cf = -expected_net_benefit - 5.0
+    assert math.isclose(m24_row["net_insurer_cash_flow"], expected_insurer_cf, abs_tol=1e-9)
 
 
 def test_myga_mgsv_nonforfeiture_statutory_floor(fixture_data):
-    """Verify NAIC Model #805 MGSV accumulation and CSV >= MGSV floor protection."""
+    """Verify contractual MGSV accumulation and CSV >= MGSV floor protection."""
     anchor = fixture_data["anchor_case"]
     premium = float(anchor["premium"])
     mgsv_load = float(anchor["mgsv_premium_load"])
@@ -106,11 +121,11 @@ def test_myga_mgsv_nonforfeiture_statutory_floor(fixture_data):
     mgsv = premium * mgsv_load
     for row in anchor["rows"]:
         interest = mgsv * m_mgsv_rate
-        wd = row["partial_withdrawal"]
-        mgsv = mgsv + interest - wd
+        gross_wd = row["gross_withdrawal"]
+        mgsv = mgsv + interest - gross_wd
 
         assert math.isclose(mgsv, row["mgsv_eom"], abs_tol=1e-12)
-        # Cash Surrender Value must never be lower than the statutory MGSV floor
+        # Cash Surrender Value must never be lower than the contractual MGSV floor
         assert row["cash_surrender_value_eom"] >= row["mgsv_eom"] - 1e-12
 
 
@@ -124,13 +139,11 @@ def test_myga_sample_inforce_and_schedules_integrity():
     assert sc_csv.is_file()
     assert cap_csv.is_file()
 
-    # Verify surrender charge schedules
     with sc_csv.open(encoding="utf-8") as f:
         reader = list(csv.DictReader(f))
     schedules = {row["schedule_id"] for row in reader}
     assert {"SC_3YR_STANDARD", "SC_5YR_STANDARD", "SC_7YR_STANDARD", "SC_10YR_STANDARD"} <= schedules
 
-    # Verify each schedule monotonically steps down to 0
     by_sched: dict[str, list[dict]] = {}
     for r in reader:
         by_sched.setdefault(r["schedule_id"], []).append(r)
@@ -138,7 +151,6 @@ def test_myga_sample_inforce_and_schedules_integrity():
         sorted_rows = sorted(rows, key=lambda x: int(x["policy_year"]))
         assert float(sorted_rows[-1]["surrender_charge_rate"]) == 0.0
 
-    # Verify inforce policies
     with inforce_csv.open(encoding="utf-8") as f:
         inforce = list(csv.DictReader(f))
 
@@ -152,8 +164,174 @@ def test_myga_sample_inforce_and_schedules_integrity():
     assert float(anchor_policy["free_withdrawal_pct"]) == 0.10
     assert anchor_policy["surrender_charge_schedule_id"] == "SC_5YR_STANDARD"
 
-    # All policies reference valid schedules
     for p in inforce:
         assert p["surrender_charge_schedule_id"] in schedules
         assert 20000.0 <= float(p["premium"]) <= 1000000.0
         assert 0.02 <= float(p["credited_rate"]) <= 0.08
+
+
+def test_myga_sample_data_generator_reproducibility():
+    """Verify deterministic generator produces bit-for-bit exact files to committed samples."""
+    import importlib.util
+
+    gen_path = BACKEND_DIR / "scripts" / "generate_myga_samples.py"
+    assert gen_path.is_file()
+
+    spec = importlib.util.spec_from_file_location("gen_myga", gen_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        module.generate_surrender_charge_tables(tmppath)
+        module.generate_inforce(tmppath / "synthetic_myga_inforce.csv")
+
+        # Compare files
+        for filename in ["synthetic_myga_inforce.csv", "myga_surrender_charge.csv", "myga_sc_age_cap.csv"]:
+            generated_content = (tmppath / filename).read_text(encoding="utf-8").replace("\r\n", "\n")
+            committed_content = (SAMPLES_DIR / filename).read_text(encoding="utf-8").replace("\r\n", "\n")
+            assert generated_content == committed_content, f"File {filename} drifted from generator output!"
+
+
+# =============================================================================
+# NEGATIVE TESTS FOR FALSE-PASS CONDITIONS (T-01 through T-14)
+# =============================================================================
+
+@pytest.fixture()
+def base_rows(fixture_data) -> list[dict]:
+    return copy.deepcopy(fixture_data["anchor_case"]["rows"])
+
+
+def test_t01_zero_actual_rows(base_rows):
+    """T-01: Comparator must fail when actual output contains zero rows."""
+    res = reconcile_ledger(actual_rows=[], expected_rows=base_rows)
+    assert res["status"] == "FAIL"
+    assert any("zero rows" in err for err in res["errors"])
+
+
+def test_t02_only_first_expected_month(base_rows):
+    """T-02: Comparator must fail when actual output has only the first month."""
+    res = reconcile_ledger(actual_rows=[base_rows[0]], expected_rows=base_rows)
+    assert res["status"] == "FAIL"
+    assert any("Missing 59 expected keys" in err for err in res["errors"])
+
+
+def test_t03_expected_60_actual_59(base_rows):
+    """T-03: Comparator must fail when actual output has 59 months instead of 60."""
+    res = reconcile_ledger(actual_rows=base_rows[:-1], expected_rows=base_rows)
+    assert res["status"] == "FAIL"
+    assert any("Missing 1 expected keys" in err for err in res["errors"])
+
+
+def test_t04_expected_60_actual_61(base_rows):
+    """T-04: Comparator must fail when actual output has an extra month (61 months)."""
+    extra_row = copy.deepcopy(base_rows[-1])
+    extra_row["month"] = 61
+    res = reconcile_ledger(actual_rows=base_rows + [extra_row], expected_rows=base_rows)
+    assert res["status"] == "FAIL"
+    assert any("unexpected extra keys" in err for err in res["errors"])
+
+
+def test_t05_missing_middle_month(base_rows):
+    """T-05: Comparator must fail when a middle month (e.g. month 30) is missing."""
+    filtered = [r for r in base_rows if r["month"] != 30]
+    res = reconcile_ledger(actual_rows=filtered, expected_rows=base_rows)
+    assert res["status"] == "FAIL"
+    assert any("Missing 1 expected keys" in err for err in res["errors"])
+
+
+def test_t06_duplicate_month(base_rows):
+    """T-06: Comparator must fail when actual output contains duplicate months."""
+    dupe = copy.deepcopy(base_rows[11])  # month 12
+    res = reconcile_ledger(actual_rows=base_rows + [dupe], expected_rows=base_rows)
+    assert res["status"] == "FAIL"
+    assert any("Duplicate" in err for err in res["errors"])
+
+
+def test_t07_wrong_month_id_with_copied_values(base_rows):
+    """T-07: Comparator must fail when a row has an incorrect month ID."""
+    tampered = copy.deepcopy(base_rows)
+    tampered[15]["month"] = 99
+    res = reconcile_ledger(actual_rows=tampered, expected_rows=base_rows)
+    assert res["status"] == "FAIL"
+    assert any("Missing 1 expected keys" in err for err in res["errors"])
+    assert any("unexpected extra keys" in err for err in res["errors"])
+
+
+def test_t08_missing_required_output_variable(base_rows):
+    """T-08: Comparator must fail when any required output variable is omitted."""
+    tampered = copy.deepcopy(base_rows)
+    del tampered[10]["net_insurer_cash_flow"]
+    res = reconcile_ledger(actual_rows=tampered, expected_rows=base_rows)
+    assert res["status"] == "FAIL"
+    assert any("missing required field 'net_insurer_cash_flow'" in err for err in res["errors"])
+
+
+def test_t09_nan_value(base_rows):
+    """T-09: Comparator must fail when actual output contains NaN."""
+    tampered = copy.deepcopy(base_rows)
+    tampered[5]["account_value_eom"] = float("nan")
+    res = reconcile_ledger(actual_rows=tampered, expected_rows=base_rows)
+    assert res["status"] == "FAIL"
+    assert any("NaN" in err for err in res["errors"])
+
+
+def test_t10_positive_infinity(base_rows):
+    """T-10: Comparator must fail when actual output contains +Infinity."""
+    tampered = copy.deepcopy(base_rows)
+    tampered[5]["credited_interest"] = float("inf")
+    res = reconcile_ledger(actual_rows=tampered, expected_rows=base_rows)
+    assert res["status"] == "FAIL"
+    assert any("+Infinity" in err for err in res["errors"])
+
+
+def test_t11_negative_infinity(base_rows):
+    """T-11: Comparator must fail when actual output contains -Infinity."""
+    tampered = copy.deepcopy(base_rows)
+    tampered[5]["net_insurer_cash_flow"] = float("-inf")
+    res = reconcile_ledger(actual_rows=tampered, expected_rows=base_rows)
+    assert res["status"] == "FAIL"
+    assert any("-Infinity" in err for err in res["errors"])
+
+
+def test_t12_wrong_policy_id(base_rows):
+    """T-12: Comparator must fail when actual output references an unexpected policy ID."""
+    tampered = copy.deepcopy(base_rows)
+    for r in tampered:
+        r["policy_id"] = "WRONG-POLICY-999"
+    res = reconcile_ledger(
+        actual_rows=tampered,
+        expected_rows=base_rows,
+        expected_policy_id="MYGA-0001",
+    )
+    assert res["status"] == "FAIL"
+    assert any("policy_id mismatch" in err or "Missing" in err for err in res["errors"])
+
+
+def test_t13_wrong_schema_version(base_rows):
+    """T-13: Comparator must fail when schema version does not match expected version."""
+    res = reconcile_ledger(
+        actual_rows=base_rows,
+        expected_rows=base_rows,
+        expected_schema_version="mentoramp.reference_fixture/v1",
+        actual_schema_version="mentoramp.reference_fixture/v0_deprecated",
+    )
+    assert res["status"] == "FAIL"
+    assert any("Schema version mismatch" in err for err in res["errors"])
+
+
+def test_t14_correct_full_result_set(base_rows):
+    """T-14: Comparator must PASS only when the complete, exact, finite result set matches."""
+    res = reconcile_ledger(
+        actual_rows=base_rows,
+        expected_rows=base_rows,
+        expected_policy_id="MYGA-0001",
+        expected_schema_version="mentoramp.reference_fixture/v1",
+        actual_schema_version="mentoramp.reference_fixture/v1",
+    )
+    assert res["status"] == "PASS"
+    assert len(res["errors"]) == 0
+    for field, stat in res["field_discrepancies"].items():
+        assert stat["status"] == "PASS"
+        assert stat["max_abs_diff"] == 0.0
