@@ -1,5 +1,5 @@
 schedule_id,min_age,waiver_type,surrender_charge_multiplier
 AGE_CAP_59_HALF,59.5,attained_age,0.0
-RMD_WAIVER,73.0,rmd_statutory,0.0
+RMD_WAIVER,73.0,rmd_waiver,0.0
 NURSING_HOME_WAIVER,0.0,confinement,0.0
 TERMINAL_ILLNESS_WAIVER,0.0,terminal_diagnosis,0.0

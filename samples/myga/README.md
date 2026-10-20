@@ -72,7 +72,21 @@ $$\text{net\_insurer\_cash\_flow}(t) = \text{premium\_inflow}(t) - \text{net\_wi
 
 ---
 
-## 4. How Noah Uses This Package
+## 4. Tolerance Semantics
+
+MentorAmp establishes a strict two-tier tolerance hierarchy:
+
+1. **Internal Arithmetic Precision (`1e-12`):**
+   - Applies to internal fixture self-consistency checks, closed-form recursion validations, and unit tests within the reference package.
+   - Enforces exact mathematical identity across double-precision floating-point operations.
+
+2. **Engine Cross-Check Reconciliation Tolerance (`1e-6` / $\le \$0.000001$):**
+   - Applies to cross-checking MentorAmp runtime engine outputs (such as Noah's C++ or vectorized NumPy engine) against the development reference.
+   - Allows for minor compiler-level floating-point noise, FMA instruction reordering, or SIMD vectorization differences while strictly catching any material actuarial or algorithmic divergence.
+
+---
+
+## 5. How Noah Uses This Package
 
 Noah is building the MYGA projection engine on `feat/m2b-myga-product`. Here is how Noah should utilize this reference package:
 
@@ -84,7 +98,7 @@ Noah is building the MYGA projection engine on `feat/m2b-myga-product`. Here is 
    - Export the monthly projection results to JSON or CSV containing the canonical columns.
 4. **Run Cross-Check Verification:**
    ```powershell
-   python tools/lifelib_crosscheck/myga_crosscheck.py --run-output <path_to_noah_output.json>
+   python tools/myga_reference_crosscheck/myga_crosscheck.py --run-output <path_to_noah_output.json>
    ```
 5. **Evaluation Criteria:**
    - The cross-check tool requires complete key-set agreement (`(policy_id, month)` across all 60 months).
@@ -94,7 +108,7 @@ Noah is building the MYGA projection engine on `feat/m2b-myga-product`. Here is 
 
 ---
 
-## 5. Regeneration
+## 6. Regeneration
 
 To verify or regenerate all sample CSV files deterministically:
 

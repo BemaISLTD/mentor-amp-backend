@@ -6,13 +6,17 @@
     "provider": "MentorAmp Development Team",
     "model": "MYGA_SIMPLIFIED_DEVELOPMENT_REFERENCE",
     "release": "v1.0",
-    "commit": "5d91f95a7c2b3e8f419b846e273f081492576b5e",
-    "generated_on": "2026-10-18"
+    "generated_on": "2026-10-18",
+    "generated_by": "MentorAmp Development Team",
+    "reference_type": "internal_development_reference"
   },
   "mva_status": "excluded_not_modeled",
   "tolerance": {
+    "internal_arithmetic_precision": 1e-12,
+    "engine_crosscheck_tolerance": 1e-06,
     "relative": 1e-12,
-    "absolute": 1e-12
+    "absolute": 1e-12,
+    "description": "Internal arithmetic precision is 1e-12 for exact mathematical self-consistency; engine cross-check tolerance is 1e-6 for engine reconciliation."
   },
   "anchor_case": {
     "policy_id": "MYGA-0001",
@@ -1091,7 +1095,7 @@
   },
   "excess_withdrawal_case": {
     "policy_id": "MYGA-0002",
-    "description": "Excess partial withdrawal benchmark: $100k premium, 5-yr guarantee at 4.50%, $20,000 gross withdrawal at month 24 exceeding 10% free limit ($10,050 free, $9,950 chargeable at 6% SC).",
+    "description": "Excess partial withdrawal benchmark: $100k premium, 5-yr guarantee at 4.50%, $20,000 gross withdrawal at month 24 exceeding 10% free limit ($10,450 free limit, $9,550 chargeable withdrawal at 6% surrender charge).",
     "issue_date": "2022-01-01",
     "issue_age": 65,
     "gender": "F",

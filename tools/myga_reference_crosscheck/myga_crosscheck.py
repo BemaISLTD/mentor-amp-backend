@@ -1,9 +1,12 @@
-"""Strict reconciliation harness comparing MentorAmp MYGA outputs against the reference development oracle.
+"""Strict reconciliation harness comparing MentorAmp MYGA outputs against the internal development reference.
 
 Usage:
-  python tools/lifelib_crosscheck/myga_crosscheck.py [--run-output <path>] [--tolerance 1e-6] [--report <path>]
+  python tools/myga_reference_crosscheck/myga_crosscheck.py [--run-output <path>] [--tolerance 1e-6] [--report <path>]
 
-Target precision: <= $0.000001 (1e-6)
+Tolerance Standards:
+  - Internal Arithmetic Precision (1e-12): Pinned mathematical consistency in fixture self-tests.
+  - Engine Cross-Check Tolerance (1e-6): Default tolerance for reconciling against Noah's projection
+    engine output to accommodate floating-point noise and SIMD/vectorized compiler differences.
 """
 
 import argparse
@@ -22,6 +25,10 @@ DEFAULT_FIXTURE = (
     / "myga_reference_simplified_v1.json"
 )
 
+# Standard tolerance standards
+INTERNAL_ARITHMETIC_PRECISION = 1e-12
+DEFAULT_ENGINE_TOLERANCE = 1e-6
+
 REQUIRED_FIELDS = [
     "account_value_bom",
     "credited_interest",
@@ -37,6 +44,98 @@ REQUIRED_FIELDS = [
 ]
 
 
+def validate_projection_month(raw_month: Any) -> tuple[int | None, str | None]:
+    """Strictly validate that raw_month is a positive integer (1, 2, 3, ...).
+
+    Rejects:
+      - booleans (e.g. True/False)
+      - floats (e.g. 1.5, 1.0)
+      - strings containing non-integer representations (e.g. "1.5", "abc")
+      - zero or negative integers (e.g. 0, -1)
+      - NaN / Infinity
+      - None / missing
+
+    Returns:
+      (month_int, error_message_or_None)
+    """
+    if raw_month is None:
+        return None, "Month is missing (None)."
+    # Python booleans inherit from int (isinstance(True, int) is True), so check bool explicitly first!
+    if isinstance(raw_month, bool):
+        return None, f"Month cannot be a boolean ({raw_month!r}). Projection month must be a strictly positive integer."
+    if isinstance(raw_month, float):
+        return None, f"Month cannot be a float ({raw_month!r}). Projection month must be a strictly positive integer."
+    if isinstance(raw_month, int):
+        if raw_month <= 0:
+            return None, f"Month must be strictly positive (got {raw_month})."
+        return raw_month, None
+    if isinstance(raw_month, str):
+        cleaned = raw_month.strip()
+        if not cleaned:
+            return None, "Month string is empty."
+        if "." in cleaned or "e" in cleaned.lower():
+            return None, f"Month cannot have decimal or exponential format ({raw_month!r}). Projection month must be a strictly positive integer."
+        try:
+            val = int(cleaned)
+        except ValueError:
+            return None, f"Month '{raw_month}' cannot be parsed as an integer."
+        if val <= 0:
+            return None, f"Month must be strictly positive (got {val})."
+        return val, None
+
+    return None, f"Month has unsupported type {type(raw_month).__name__}: {raw_month!r}"
+
+
+def prevalidate_expected_fixture(
+    expected_rows: Any,
+    expected_policy_id: str | None = None,
+) -> tuple[bool, list[str]]:
+    """Validate that the expected reference fixture is structurally sound before comparison.
+
+    Returns:
+      (is_valid, list_of_errors)
+    """
+    errors: list[str] = []
+    if not isinstance(expected_rows, list) or not expected_rows:
+        return False, ["Expected fixture rows are empty or not a list."]
+
+    expected_map: dict[tuple[str, int], dict[str, Any]] = {}
+    for idx, r in enumerate(expected_rows):
+        if not isinstance(r, dict):
+            errors.append(f"Row {idx} in expected fixture is not a dictionary: {r!r}")
+            continue
+
+        pol = str(r.get("policy_id", expected_policy_id or "")).strip()
+        if not pol:
+            errors.append(f"Row {idx} in expected fixture is missing a non-empty 'policy_id'.")
+            continue
+
+        m, m_err = validate_projection_month(r.get("month"))
+        if m_err is not None:
+            errors.append(f"Row {idx} in expected fixture has invalid month: {m_err}")
+            continue
+
+        key = (pol, m)
+        if key in expected_map:
+            errors.append(f"Duplicate key in expected fixture: {key}")
+            continue
+        expected_map[key] = r
+
+        for field in REQUIRED_FIELDS:
+            if field not in r:
+                errors.append(f"Row {idx} (key {key}) in expected fixture missing required field '{field}'.")
+                continue
+            raw_val = r[field]
+            try:
+                val = float(raw_val)
+                if math.isnan(val) or math.isinf(val):
+                    errors.append(f"Row {idx} (key {key}) in expected fixture field '{field}' has non-finite value: {val}.")
+            except (ValueError, TypeError):
+                errors.append(f"Row {idx} (key {key}) in expected fixture field '{field}' has non-numeric value: {raw_val!r}.")
+
+    return (len(errors) == 0, errors)
+
+
 def load_fixture(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(f"Reference fixture not found: {path}")
@@ -49,7 +148,7 @@ def load_fixture(path: Path) -> dict[str, Any]:
 def reconcile_ledger(
     actual_rows: list[dict[str, Any]],
     expected_rows: list[dict[str, Any]],
-    tolerance: float = 1e-6,
+    tolerance: float = DEFAULT_ENGINE_TOLERANCE,
     expected_policy_id: str | None = None,
     expected_schema_version: str | None = None,
     actual_schema_version: str | None = None,
@@ -57,8 +156,11 @@ def reconcile_ledger(
     """Strictly reconcile monthly ledger rows against expected reference values.
 
     Requires:
-      - Schema version agreement (if specified)
+      - Valid reference fixture structure (or returns REFERENCE_FIXTURE_INVALID)
+      - Schema version agreement: if expected_schema_version is declared, actual_schema_version
+        must be explicitly provided and match exactly
       - Exact canonical key-set agreement: set((policy_id, month))
+      - Strictly positive integer projection months (no floats, strings with decimals, booleans, or non-positives)
       - No duplicate keys
       - No missing or extra months
       - All required fields present in every row
@@ -74,51 +176,56 @@ def reconcile_ledger(
         },
     }
 
-    # 1. Schema version check
-    if expected_schema_version and actual_schema_version:
-        if expected_schema_version != actual_schema_version:
+    # 1. Pre-validate expected reference fixture
+    valid_fixture, fixture_errors = prevalidate_expected_fixture(expected_rows, expected_policy_id)
+    if not valid_fixture:
+        results["status"] = "REFERENCE_FIXTURE_INVALID"
+        results["errors"].extend(fixture_errors)
+        for stat in results["field_discrepancies"].values():
+            stat["status"] = "FAIL"
+        return results
+
+    # 2. Schema version check (explicit validation: missing actual schema is a FAIL)
+    if expected_schema_version is not None:
+        if not actual_schema_version:
+            results["status"] = "FAIL"
+            results["errors"].append(
+                f"Missing actual schema version: expected '{expected_schema_version}', "
+                f"but actual run output did not declare a schema version."
+            )
+        elif expected_schema_version != actual_schema_version:
             results["status"] = "FAIL"
             results["errors"].append(
                 f"Schema version mismatch: expected '{expected_schema_version}', got '{actual_schema_version}'"
             )
 
-    # 2. Check for empty actual output
-    if not actual_rows:
+    # 3. Check for empty actual output
+    if not isinstance(actual_rows, list) or not actual_rows:
         results["status"] = "FAIL"
         results["errors"].append("Actual run output contains zero rows.")
         return results
 
-    if not expected_rows:
-        results["status"] = "FAIL"
-        results["errors"].append("Expected fixture rows are empty.")
-        return results
-
-    # 3. Build expected key map and detect any fixture defects
+    # 4. Build expected key map (already verified safe by pre-validation)
     expected_map: dict[tuple[str, int], dict[str, Any]] = {}
     for r in expected_rows:
-        pol = str(r.get("policy_id", expected_policy_id or ""))
-        try:
-            m = int(r["month"])
-        except (KeyError, ValueError, TypeError):
-            results["status"] = "FAIL"
-            results["errors"].append(f"Expected row missing valid 'month': {r}")
-            return results
-        key = (pol, m)
-        if key in expected_map:
-            results["status"] = "FAIL"
-            results["errors"].append(f"Duplicate key in expected fixture: {key}")
-            return results
-        expected_map[key] = r
+        pol = str(r.get("policy_id", expected_policy_id or "")).strip()
+        m, _ = validate_projection_month(r["month"])
+        assert m is not None
+        expected_map[(pol, m)] = r
 
-    # 4. Build actual key map and check for duplicates or invalid keys
+    # 5. Build actual key map and check for duplicates or invalid keys
     actual_map: dict[tuple[str, int], dict[str, Any]] = {}
-    for r in actual_rows:
-        pol = str(r.get("policy_id", expected_policy_id or ""))
-        try:
-            m = int(r["month"])
-        except (KeyError, ValueError, TypeError):
+    for idx, r in enumerate(actual_rows):
+        if not isinstance(r, dict):
             results["status"] = "FAIL"
-            results["errors"].append(f"Actual row missing valid 'month': {r}")
+            results["errors"].append(f"Actual row {idx} is not a dictionary: {r!r}")
+            continue
+
+        pol = str(r.get("policy_id", expected_policy_id or "")).strip()
+        m, m_err = validate_projection_month(r.get("month"))
+        if m_err is not None:
+            results["status"] = "FAIL"
+            results["errors"].append(f"Actual row {idx} has invalid 'month': {m_err}")
             continue
 
         key = (pol, m)
@@ -128,7 +235,7 @@ def reconcile_ledger(
             continue
         actual_map[key] = r
 
-    # 5. Key set agreement check (catches missing, extra, wrong month, or wrong policy ID)
+    # 6. Key set agreement check (catches missing, extra, wrong month, or wrong policy ID)
     expected_keys = set(expected_map.keys())
     actual_keys = set(actual_map.keys())
 
@@ -147,7 +254,7 @@ def reconcile_ledger(
             f"Found {len(extra_keys)} unexpected extra keys: {sorted(extra_keys)[:10]}"
         )
 
-    # 6. Deep value comparison for matching keys
+    # 7. Deep value comparison for matching keys
     common_keys = sorted(expected_keys & actual_keys, key=lambda k: (k[0], k[1]))
 
     for key in common_keys:
@@ -156,7 +263,7 @@ def reconcile_ledger(
         pol, m = key
 
         # Check policy_id explicitly if declared
-        if expected_policy_id and str(act.get("policy_id", "")) != expected_policy_id:
+        if expected_policy_id and str(act.get("policy_id", "")).strip() != expected_policy_id:
             results["status"] = "FAIL"
             results["errors"].append(
                 f"Month {m}: policy_id mismatch: expected '{expected_policy_id}', got '{act.get('policy_id')}'"
@@ -214,14 +321,24 @@ def reconcile_ledger(
                     f"Key {key}: field '{field}' diff {abs_diff:.2e} exceeds tolerance {tolerance:.2e} (actual: {act_val}, expected: {exp_val})"
                 )
 
+    if results["errors"] and results["status"] == "PASS":
+        results["status"] = "FAIL"
+
     return results
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Strict cross-check of MYGA output against reference oracle.")
+    parser = argparse.ArgumentParser(
+        description="Strict cross-check of MentorAmp MYGA output against internal development reference."
+    )
     parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE, help="Path to reference oracle JSON fixture")
     parser.add_argument("--run-output", type=Path, default=None, help="Path to run output JSON or CSV to test")
-    parser.add_argument("--tolerance", type=float, default=1e-6, help="Reconciliation tolerance (default: 1e-6)")
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=DEFAULT_ENGINE_TOLERANCE,
+        help="Reconciliation tolerance (default: 1e-6; use 1e-12 for internal precision checks)",
+    )
     parser.add_argument("--report", type=Path, default=None, help="Path to write reconciliation report JSON")
     args = parser.parse_args()
 
@@ -240,7 +357,7 @@ def main() -> int:
         if args.run_output.suffix == ".json":
             data = json.loads(text)
             actual_rows = data if isinstance(data, list) else data.get("rows", [])
-            actual_schema = data.get("fixture_schema") if isinstance(data, dict) else schema_version
+            actual_schema = data.get("fixture_schema") if isinstance(data, dict) else None
         else:
             import csv
             actual_rows = list(csv.DictReader(text.splitlines()))

@@ -20,9 +20,11 @@ class ReferenceSource(BaseModel):
     library: str = Field(min_length=1)
     model: str = Field(min_length=1)
     release: str = Field(min_length=1)
-    commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    commit: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     retrieved_on: date
     documentation_urls: tuple[str, ...] = Field(min_length=1)
+    generated_by: str | None = None
+    reference_type: str | None = None
 
 
 class ReferenceModelMetadata(BaseModel):

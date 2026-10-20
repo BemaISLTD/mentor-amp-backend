@@ -3,7 +3,7 @@
 Writes:
   samples/myga/synthetic_myga_inforce.csv       25 synthetic MYGA policies (no real people)
   samples/myga/myga_surrender_charge.csv        Surrender charge schedules (3, 5, 7, 10 years)
-  samples/myga/myga_sc_age_cap.csv              Age caps and statutory waiver provisions
+  samples/myga/myga_sc_age_cap.csv              Age caps and illustrative contractual waiver provisions
 
 Run from the repository root or the backend folder:
   backend/.venv/Scripts/python backend/scripts/generate_myga_samples.py
@@ -63,10 +63,10 @@ def generate_surrender_charge_tables(samples_dir: Path) -> None:
         writer.writeheader()
         writer.writerows(sc_rows)
 
-    # 2. Age cap and statutory waiver schedules
+    # 2. Age cap and contractual waiver schedules
     cap_rows = [
         {"schedule_id": "AGE_CAP_59_HALF", "min_age": 59.5, "waiver_type": "attained_age", "surrender_charge_multiplier": 0.0},
-        {"schedule_id": "RMD_WAIVER", "min_age": 73.0, "waiver_type": "rmd_statutory", "surrender_charge_multiplier": 0.0},
+        {"schedule_id": "RMD_WAIVER", "min_age": 73.0, "waiver_type": "rmd_waiver", "surrender_charge_multiplier": 0.0},
         {"schedule_id": "NURSING_HOME_WAIVER", "min_age": 0.0, "waiver_type": "confinement", "surrender_charge_multiplier": 0.0},
         {"schedule_id": "TERMINAL_ILLNESS_WAIVER", "min_age": 0.0, "waiver_type": "terminal_diagnosis", "surrender_charge_multiplier": 0.0},
     ]
@@ -120,7 +120,7 @@ def generate_inforce(path: Path) -> None:
             "mgsv_premium_load": mgsv_load,
         })
 
-    # Policy MYGA-0001 is the LifeLib Worked Example Anchor:
+    # Policy MYGA-0001 is the Development Reference Anchor Benchmark:
     # Issued 2022-01-01, Age 62, Male, 100,000 USD premium, 5-yr guarantee at 4.5%, 10% free withdrawal
     rows[0].update({
         "issue_date": "2022-01-01",

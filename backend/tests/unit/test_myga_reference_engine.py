@@ -12,10 +12,19 @@ REPO_ROOT = BACKEND_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from app.products.myga_reference.metadata import LIFELIB_MYGA_REFERENCE
-from tools.lifelib_crosscheck.myga_crosscheck import reconcile_ledger, REQUIRED_FIELDS
+from app.products.myga_reference.metadata import (
+    ENGINE_CROSSCHECK_TOLERANCE,
+    INTERNAL_ARITHMETIC_PRECISION,
+    LIFELIB_MYGA_REFERENCE,
+    MYGA_DEVELOPMENT_REFERENCE,
+)
+from tools.myga_reference_crosscheck.myga_crosscheck import (
+    REQUIRED_FIELDS,
+    prevalidate_expected_fixture,
+    reconcile_ledger,
+    validate_projection_month,
+)
 
-BACKEND_DIR = Path(__file__).resolve().parents[2]
 FIXTURE_PATH = BACKEND_DIR / "tests" / "fixtures" / "myga_reference_simplified_v1.json"
 SAMPLES_DIR = BACKEND_DIR.parent / "samples" / "myga"
 
@@ -34,16 +43,25 @@ def test_myga_fixture_schema_and_metadata():
     assert fixture["reference_classification"] == "mentoramp_simplified_development_reference"
     assert fixture["mva_status"] == "excluded_not_modeled"
     assert "NOT an independent LifeLib oracle run" in fixture["provenance_statement"]
+    assert fixture["source"]["provider"] == "MentorAmp Development Team"
+    assert fixture["source"]["generated_by"] == "MentorAmp Development Team"
+    assert fixture["source"]["reference_type"] == "internal_development_reference"
+    assert "commit" not in fixture["source"]
 
-    config = LIFELIB_MYGA_REFERENCE.as_configuration()
+    config = MYGA_DEVELOPMENT_REFERENCE.as_configuration()
     assert config["schema_version"] == "mentoramp.reference_model/v1"
     assert config["classification"] == "mentoramp_simplified_development_reference"
     assert config["runtime_required"] is False
     assert config["production_dependency"] is False
     assert config["actuarial_status"] == "illustrative_not_approved"
+    assert config["source"]["commit"] is None
+    assert config["source"]["generated_by"] == "MentorAmp Development Team"
     assert "account_value_eom" in config["compared_outputs"]
     assert "net_withdrawal_benefit" in config["compared_outputs"]
     assert "net_insurer_cash_flow" in config["compared_outputs"]
+
+    # Verify backwards compatibility alias
+    assert LIFELIB_MYGA_REFERENCE == MYGA_DEVELOPMENT_REFERENCE
 
 
 def test_myga_anchor_account_value_rollforward_precision(fixture_data):
@@ -53,7 +71,7 @@ def test_myga_anchor_account_value_rollforward_precision(fixture_data):
     annual_rate = float(anchor["credited_rate"])
     monthly_rate = (1.0 + annual_rate) ** (1.0 / 12.0) - 1.0
 
-    assert math.isclose(monthly_rate, anchor["monthly_credited_rate"], rel_tol=1e-12)
+    assert math.isclose(monthly_rate, anchor["monthly_credited_rate"], rel_tol=INTERNAL_ARITHMETIC_PRECISION)
 
     av = premium
     for row in anchor["rows"]:
@@ -63,19 +81,19 @@ def test_myga_anchor_account_value_rollforward_precision(fixture_data):
         gross_wd = row["gross_withdrawal"]
 
         # 1. BOM balance check
-        assert math.isclose(av, expected_av_bom, abs_tol=1e-12)
+        assert math.isclose(av, expected_av_bom, abs_tol=INTERNAL_ARITHMETIC_PRECISION)
 
         # 2. Monthly interest crediting check
         calculated_interest = av * monthly_rate
-        assert math.isclose(calculated_interest, expected_interest, abs_tol=1e-12)
+        assert math.isclose(calculated_interest, expected_interest, abs_tol=INTERNAL_ARITHMETIC_PRECISION)
 
         # 3. EOM balance after gross withdrawal check
         av = av + calculated_interest - gross_wd
-        assert math.isclose(av, expected_av_eom, abs_tol=1e-12)
+        assert math.isclose(av, expected_av_eom, abs_tol=INTERNAL_ARITHMETIC_PRECISION)
 
     # 4. Diagnostics check at Month 60 (5 years)
     diag = anchor["full_projection_diagnostics"]
-    assert math.isclose(av, diag["ending_account_value"], abs_tol=1e-12)
+    assert math.isclose(av, diag["ending_account_value"], abs_tol=INTERNAL_ARITHMETIC_PRECISION)
     assert diag["projection_months"] == 60
 
 
@@ -110,7 +128,7 @@ def test_myga_free_withdrawal_allowance_and_surrender_charges(fixture_data):
     assert math.isclose(m24_row["net_insurer_cash_flow"], expected_insurer_cf, abs_tol=1e-9)
 
 
-def test_myga_mgsv_nonforfeiture_statutory_floor(fixture_data):
+def test_myga_mgsv_nonforfeiture_contractual_floor(fixture_data):
     """Verify contractual MGSV accumulation and CSV >= MGSV floor protection."""
     anchor = fixture_data["anchor_case"]
     premium = float(anchor["premium"])
@@ -124,9 +142,9 @@ def test_myga_mgsv_nonforfeiture_statutory_floor(fixture_data):
         gross_wd = row["gross_withdrawal"]
         mgsv = mgsv + interest - gross_wd
 
-        assert math.isclose(mgsv, row["mgsv_eom"], abs_tol=1e-12)
+        assert math.isclose(mgsv, row["mgsv_eom"], abs_tol=INTERNAL_ARITHMETIC_PRECISION)
         # Cash Surrender Value must never be lower than the contractual MGSV floor
-        assert row["cash_surrender_value_eom"] >= row["mgsv_eom"] - 1e-12
+        assert row["cash_surrender_value_eom"] >= row["mgsv_eom"] - INTERNAL_ARITHMETIC_PRECISION
 
 
 def test_myga_sample_inforce_and_schedules_integrity():
@@ -335,3 +353,181 @@ def test_t14_correct_full_result_set(base_rows):
     for field, stat in res["field_discrepancies"].items():
         assert stat["status"] == "PASS"
         assert stat["max_abs_diff"] == 0.0
+
+
+# =============================================================================
+# FINAL CLEANUP TESTS (F-01 through F-09)
+# =============================================================================
+
+def test_f01_month_as_float_fails(base_rows):
+    """F-01: Month as a float (e.g. 1.5 or 1.0) or string float must fail without uncaught exception."""
+    tampered_float = copy.deepcopy(base_rows)
+    tampered_float[0]["month"] = 1.5
+    res1 = reconcile_ledger(actual_rows=tampered_float, expected_rows=base_rows)
+    assert res1["status"] == "FAIL"
+    assert any("cannot be a float" in err for err in res1["errors"])
+
+    tampered_str_float = copy.deepcopy(base_rows)
+    tampered_str_float[0]["month"] = "1.5"
+    res2 = reconcile_ledger(actual_rows=tampered_str_float, expected_rows=base_rows)
+    assert res2["status"] == "FAIL"
+    assert any("decimal or exponential format" in err for err in res2["errors"])
+
+    # Also verify validate_projection_month directly
+    m_val, m_err = validate_projection_month(1.5)
+    assert m_val is None
+    assert "cannot be a float" in m_err
+
+
+def test_f02_month_as_bool_fails(base_rows):
+    """F-02: Month as a boolean (e.g. True/False) must fail because bool is a subclass of int in Python."""
+    tampered = copy.deepcopy(base_rows)
+    tampered[0]["month"] = True
+    res = reconcile_ledger(actual_rows=tampered, expected_rows=base_rows)
+    assert res["status"] == "FAIL"
+    assert any("cannot be a boolean" in err for err in res["errors"])
+
+    # Also verify validate_projection_month directly
+    m_val, m_err = validate_projection_month(True)
+    assert m_val is None
+    assert "cannot be a boolean" in m_err
+
+
+def test_f03_month_zero_or_negative_fails(base_rows):
+    """F-03: Projection month <= 0 must fail."""
+    tampered_zero = copy.deepcopy(base_rows)
+    tampered_zero[0]["month"] = 0
+    res_zero = reconcile_ledger(actual_rows=tampered_zero, expected_rows=base_rows)
+    assert res_zero["status"] == "FAIL"
+    assert any("must be strictly positive" in err for err in res_zero["errors"])
+
+    tampered_neg = copy.deepcopy(base_rows)
+    tampered_neg[0]["month"] = -5
+    res_neg = reconcile_ledger(actual_rows=tampered_neg, expected_rows=base_rows)
+    assert res_neg["status"] == "FAIL"
+    assert any("must be strictly positive" in err for err in res_neg["errors"])
+
+    # Direct helper checks
+    assert validate_projection_month(0)[0] is None
+    assert validate_projection_month(-1)[0] is None
+
+
+def test_f04_missing_actual_schema_version_fails(base_rows):
+    """F-04: When expected schema version is defined, missing actual schema version must fail."""
+    res_none = reconcile_ledger(
+        actual_rows=base_rows,
+        expected_rows=base_rows,
+        expected_schema_version="mentoramp.reference_fixture/v1",
+        actual_schema_version=None,
+    )
+    assert res_none["status"] == "FAIL"
+    assert any("Missing actual schema version" in err for err in res_none["errors"])
+
+    res_empty = reconcile_ledger(
+        actual_rows=base_rows,
+        expected_rows=base_rows,
+        expected_schema_version="mentoramp.reference_fixture/v1",
+        actual_schema_version="",
+    )
+    assert res_empty["status"] == "FAIL"
+    assert any("Missing actual schema version" in err for err in res_empty["errors"])
+
+
+def test_f05_mismatched_schema_version_fails(base_rows):
+    """F-05: Mismatched schema version must fail with structured error."""
+    res = reconcile_ledger(
+        actual_rows=base_rows,
+        expected_rows=base_rows,
+        expected_schema_version="mentoramp.reference_fixture/v1",
+        actual_schema_version="mentoramp.reference_fixture/v2_unexpected",
+    )
+    assert res["status"] == "FAIL"
+    assert any("Schema version mismatch" in err for err in res["errors"])
+
+
+def test_f06_malformed_expected_fixture_triggers_reference_fixture_invalid(base_rows):
+    """F-06: Malformed expected fixture must return REFERENCE_FIXTURE_INVALID without unhandled traceback."""
+    # 1. Empty expected rows
+    res_empty = reconcile_ledger(actual_rows=base_rows, expected_rows=[])
+    assert res_empty["status"] == "REFERENCE_FIXTURE_INVALID"
+    assert any("empty or not a list" in err for err in res_empty["errors"])
+
+    # 2. Expected rows missing required fields
+    malformed_rows = [{"policy_id": "MYGA-0001", "month": 1}]
+    res_missing_fields = reconcile_ledger(actual_rows=base_rows, expected_rows=malformed_rows)
+    assert res_missing_fields["status"] == "REFERENCE_FIXTURE_INVALID"
+    assert any("missing required field" in err for err in res_missing_fields["errors"])
+
+    # 3. Expected rows with invalid month type (e.g. float)
+    bad_month_rows = copy.deepcopy(base_rows[:2])
+    bad_month_rows[0]["month"] = 1.5
+    res_bad_month = reconcile_ledger(actual_rows=base_rows, expected_rows=bad_month_rows)
+    assert res_bad_month["status"] == "REFERENCE_FIXTURE_INVALID"
+    assert any("invalid month" in err for err in res_bad_month["errors"])
+
+    # 4. Expected rows with duplicate keys
+    dupe_rows = copy.deepcopy(base_rows[:2]) + [copy.deepcopy(base_rows[0])]
+    res_dupe = reconcile_ledger(actual_rows=base_rows, expected_rows=dupe_rows)
+    assert res_dupe["status"] == "REFERENCE_FIXTURE_INVALID"
+    assert any("Duplicate key in expected fixture" in err for err in res_dupe["errors"])
+
+
+def test_f07_excess_withdrawal_description_matches_arithmetic(fixture_data):
+    """F-07: Descriptive metadata in excess_withdrawal_case must not drift from actual arithmetic.
+
+    Arithmetic:
+      prior anniversary AV = 104,500
+      free limit = 10% = 10,450
+      gross withdrawal = 20,000
+      chargeable withdrawal = 9,550
+      surrender charge = 6% × 9,550 = 573
+    """
+    excess_case = fixture_data["excess_withdrawal_case"]
+    desc = excess_case["description"]
+
+    # Verify updated accurate numbers are present
+    assert "$10,450 free limit" in desc
+    assert "$9,550 chargeable withdrawal" in desc
+    assert "6% surrender charge" in desc or "6% SC" in desc
+
+    # Verify stale erroneous values do NOT appear
+    assert "$10,050" not in desc
+    assert "$9,950" not in desc
+
+    # Re-verify underlying month 24 row numbers
+    m24 = [r for r in excess_case["rows"] if r["month"] == 24][0]
+    assert math.isclose(m24["surrender_charge"], 573.0, abs_tol=1e-6)
+    assert m24["gross_withdrawal"] == 20000.0
+
+
+def test_f08_tolerance_semantics_and_metadata_verification(fixture_data):
+    """F-08: Verify tolerance semantics (1e-12 internal vs 1e-6 engine cross-check) and metadata."""
+    # Verify module constants
+    assert INTERNAL_ARITHMETIC_PRECISION == 1e-12
+    assert ENGINE_CROSSCHECK_TOLERANCE == 1e-6
+
+    # Verify fixture tolerance object
+    tol = fixture_data.get("tolerance", {})
+    assert tol["internal_arithmetic_precision"] == 1e-12
+    assert tol["engine_crosscheck_tolerance"] == 1e-6
+    assert "description" in tol
+    assert "Internal arithmetic precision is 1e-12" in tol["description"]
+    assert "1e-6" in tol["description"]
+
+
+def test_f09_contractual_waiver_naming_convention():
+    """F-09: Verify contractual waiver labels are used, and false statutory labels are absent."""
+    cap_csv = SAMPLES_DIR / "myga_sc_age_cap.csv"
+    assert cap_csv.is_file()
+    content = cap_csv.read_text(encoding="utf-8")
+
+    # Ensure rmd_waiver exists and rmd_statutory does NOT
+    assert "rmd_waiver" in content
+    assert "rmd_statutory" not in content
+
+    # Check generator source code as well
+    gen_file = BACKEND_DIR / "scripts" / "generate_myga_samples.py"
+    gen_content = gen_file.read_text(encoding="utf-8")
+    assert "rmd_statutory" not in gen_content
+    assert "statutory waiver provisions" not in gen_content
+    assert "rmd_waiver" in gen_content
