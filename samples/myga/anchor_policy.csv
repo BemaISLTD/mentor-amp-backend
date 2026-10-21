@@ -1,0 +1,2 @@
+policy_id,product_type,issue_date,issue_age,gender,premium,guarantee_period_years,declared_rate,gmir,gmsv_rate,mva_ref_yield_at_issue,account_value,mgsv_value,free_wd_base
+MYGA-ANCHOR,MYGA,2026-12-31,60,M,100000,5,0.0445,0.0025,0.028,0.05,100000,87500,100000

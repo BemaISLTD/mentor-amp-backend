@@ -8,9 +8,11 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core import artifacts
 from app.core.artifacts import (
+    IDENTITY_NEUTRAL_SCHEMA,
     LocalParquetArtifactStore,
     RunArtifactBuffer,
     read_attempt_artifact_rows,
+    verified_parquet_rows,
 )
 from app.core.output import storage as output_storage
 from app.core.projection_engine import runner
@@ -82,6 +84,52 @@ def test_local_store_rejects_path_traversal(tmp_path):
         assert "escapes" in str(exc)
     else:
         raise AssertionError("Path traversal should be rejected.")
+
+
+def test_identity_neutral_parquet_is_bitwise_reproducible_and_run_bound(tmp_path):
+    store = LocalParquetArtifactStore(tmp_path)
+    payload = [{
+        "policy_id": "P001", "scenario_id": "base", "projection_month": 1,
+        "variable_name": "reserve", "value_json": "100.5", "product": "MYGA",
+    }]
+    first = store.write_rows("run-first", "outputs", payload)
+    second = store.write_rows("run-second", "outputs", payload)
+    assert store.read_bytes(first.uri) == store.read_bytes(second.uri)
+    assert first.checksum_sha256 == second.checksum_sha256
+
+    rows = verified_parquet_rows(
+        store, first.uri, first.checksum_sha256, first.row_count,
+        IDENTITY_NEUTRAL_SCHEMA, supported_schemas=artifacts.RUN_ARTIFACT_SCHEMAS,
+        expected_run_id="run-first", expected_attempt_number=1,
+    )
+    assert rows == [{"run_id": "run-first", "attempt_number": 1, **payload[0]}]
+
+    with pytest.raises(ServiceError) as wrong_run:
+        verified_parquet_rows(
+            store, first.uri, first.checksum_sha256, first.row_count,
+            IDENTITY_NEUTRAL_SCHEMA, supported_schemas=artifacts.RUN_ARTIFACT_SCHEMAS,
+            expected_run_id="run-second", expected_attempt_number=1,
+        )
+    assert wrong_run.value.code == "ARTIFACT_IDENTITY_MISMATCH"
+
+    with pytest.raises(ServiceError) as missing_attempt:
+        verified_parquet_rows(
+            store, first.uri, first.checksum_sha256, first.row_count,
+            IDENTITY_NEUTRAL_SCHEMA, supported_schemas=artifacts.RUN_ARTIFACT_SCHEMAS,
+            expected_run_id="run-first",
+        )
+    assert missing_attempt.value.code == "ARTIFACT_IDENTITY_MISMATCH"
+
+    malformed = store.write_rows("run-first", "outputs", [
+        {**payload[0], "run_id": "run-first"},
+    ])
+    with pytest.raises(ServiceError) as embedded_identity:
+        verified_parquet_rows(
+            store, malformed.uri, malformed.checksum_sha256, malformed.row_count,
+            IDENTITY_NEUTRAL_SCHEMA, supported_schemas=artifacts.RUN_ARTIFACT_SCHEMAS,
+            expected_run_id="run-first", expected_attempt_number=1,
+        )
+    assert embedded_identity.value.code == "ARTIFACT_IDENTITY_MISMATCH"
 
 
 def test_orphan_reconciliation_never_deletes_registered_evidence(tmp_path, monkeypatch):

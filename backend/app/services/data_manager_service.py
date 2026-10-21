@@ -1,6 +1,7 @@
 """Governed upload → preview → map → validate → commit → approve lifecycle."""
 
 import json
+import math
 import mimetypes
 import os
 import tempfile
@@ -43,6 +44,7 @@ from app.db.models.factor import FactorSet, FactorTable
 from app.db.models.inforce import InforceFile, InforceRecord
 from app.db.models.model_variable import ModelVariableDefinition
 from app.db.models.scenario import ScenarioSet, ScenarioTable
+from app.products.myga_lite.config import MIN_GMSV_RATE
 from app.services import access
 from app.services.common import ServiceError, conflict, iso, not_found, now_utc
 
@@ -60,10 +62,26 @@ PARENT_COLUMNS = {
     "inforce": "parent_file_id", "assumption": "parent_table_id",
     "factor": "parent_table_id", "scenario": "parent_table_id",
 }
-INFORCE_FIELDS = {
+COMMON_INFORCE_FIELDS = {
     "policy_id": "string", "product_type": "string", "issue_date": "date",
     "issue_age": "integer", "gender": "string", "premium": "number",
-    "monthly_payment": "number",
+}
+PRODUCT_INFORCE_SCHEMAS = {
+    "SPIA": {
+        **COMMON_INFORCE_FIELDS,
+        "monthly_payment": "number",
+    },
+    "MYGA": {
+        **COMMON_INFORCE_FIELDS,
+        "guarantee_period_years": "integer",
+        "declared_rate": "number",
+        "gmir": "number",
+        "gmsv_rate": "number",
+        "mva_ref_yield_at_issue": "number",
+        "account_value": "number",
+        "mgsv_value": "number",
+        "free_wd_base": "number",
+    },
 }
 SCENARIO_FIELDS = {
     "scenario_name": "string", "target_variable": "string", "operation": "string",
@@ -524,7 +542,84 @@ def _duplicate_issues(rows: list[dict[str, Any]], keys: list[str]) -> list[dict[
 
 def _validate_inforce(row: ImportSession, rows: list[dict[str, Any]],
                       issues: list[dict[str, Any]]) -> None:
-    _required_and_types(rows, INFORCE_FIELDS, issues)
+    # Validate common identity fields first, then select the remaining contract fields from
+    # each row's product type. Files may contain more than one supported product; fields that
+    # belong to another product are ignored rather than treated as required.
+    _required_and_types(rows, COMMON_INFORCE_FIELDS, issues)
+    columns = set(rows[0]) if rows else set()
+    products_present: set[str] = set()
+    for number, item in enumerate(rows, start=1):
+        product_type = str(item.get("product_type") or "").strip().upper()
+        item["product_type"] = product_type
+        schema = PRODUCT_INFORCE_SCHEMAS.get(product_type)
+        if schema is None:
+            if product_type:
+                issues.append(_issue(
+                    "error", "INVALID_PRODUCT_TYPE",
+                    f"Unsupported product_type '{product_type}'.",
+                    number, "product_type", product_type,
+                ))
+            continue
+        products_present.add(product_type)
+        product_fields = {
+            field: kind for field, kind in schema.items()
+            if field not in COMMON_INFORCE_FIELDS
+        }
+        for field, kind in product_fields.items():
+            value = item.get(field)
+            if value in (None, ""):
+                issues.append(_issue(
+                    "error", "MISSING_VALUE", f"'{field}' is required for {product_type}.",
+                    number, field, value,
+                ))
+                continue
+            try:
+                item[field] = _coerce(value, kind)
+                if product_type == "MYGA" and kind == "integer" and (
+                    not math.isfinite(float(str(value)))
+                    or float(str(value)) != item[field]
+                ):
+                    issues.append(_issue(
+                        "error", "TYPE_MISMATCH",
+                        f"'{field}' must be a whole number for MYGA.",
+                        number, field, value,
+                    ))
+                if product_type == "MYGA" and kind == "number" and (
+                    not math.isfinite(item[field])
+                ):
+                    issues.append(_issue(
+                        "error", "VALUE_NOT_FINITE",
+                        f"'{field}' must be finite for MYGA.",
+                        number, field, str(value),
+                    ))
+            except (TypeError, ValueError, OverflowError):
+                issues.append(_issue(
+                    "error", "TYPE_MISMATCH", f"'{field}' must be {kind} for {product_type}.",
+                    number, field, value,
+                ))
+        if product_type == "MYGA":
+            period = item.get("guarantee_period_years")
+            if isinstance(period, int) and period != 5:
+                issues.append(_issue(
+                    "error", "INVALID_GUARANTEE_PERIOD",
+                    "This illustrative MYGA product requires a five-year guarantee period.",
+                    number, "guarantee_period_years", period,
+                ))
+            rate = item.get("gmsv_rate")
+            if isinstance(rate, (int, float)) and math.isfinite(rate) and rate < MIN_GMSV_RATE:
+                issues.append(_issue(
+                    "error", "GMSV_RATE_BELOW_MINIMUM",
+                    "MYGA gmsv_rate must be at least 0.15%.",
+                    number, "gmsv_rate", rate,
+                ))
+    for product_type in sorted(products_present):
+        for field in PRODUCT_INFORCE_SCHEMAS[product_type]:
+            if field not in COMMON_INFORCE_FIELDS and field not in columns:
+                issues.append(_issue(
+                    "error", "REQUIRED_FIELD_NOT_MAPPED",
+                    f"Required field '{field}' is not mapped for {product_type}.",
+                    column=field,
+                ))
     issues.extend(_duplicate_issues(rows, ["policy_id"]))
     valuation = (row.options or {}).get("valuation_date")
     for number, item in enumerate(rows, start=1):
@@ -537,10 +632,22 @@ def _validate_inforce(row: ImportSession, rows: list[dict[str, Any]],
         if isinstance(age, int) and not 0 <= age <= 120:
             issues.append(_issue("warning", "RANGE_WARNING", "issue_age is outside 0–120.",
                                  number, "issue_age", age))
-        for field in ("premium", "monthly_payment"):
+        product_type = str(item.get("product_type") or "").upper()
+        amount_fields = (
+            ("premium", "monthly_payment")
+            if product_type == "SPIA"
+            else ("premium", "account_value", "mgsv_value", "free_wd_base")
+        )
+        for field in amount_fields:
             value = item.get(field)
+            if (product_type == "MYGA" and field == "premium" and isinstance(value, (int, float))
+                    and not math.isfinite(value)):
+                issues.append(_issue("error", "VALUE_NOT_FINITE", f"{field} must be finite.",
+                                     number, field, str(value)))
             if isinstance(value, (int, float)) and value < 0:
-                issues.append(_issue("warning", "RANGE_WARNING", f"{field} is negative.",
+                severity = "error" if product_type == "MYGA" else "warning"
+                code = "NEGATIVE_AMOUNT" if product_type == "MYGA" else "RANGE_WARNING"
+                issues.append(_issue(severity, code, f"{field} is negative.",
                                      number, field, value))
         if valuation and item.get("issue_date"):
             try:

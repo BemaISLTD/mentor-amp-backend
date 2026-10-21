@@ -337,7 +337,9 @@ def validate(db: Session, projection_set_id: str, user: Any | None = None) -> di
     mappings = [
         item
         for file in files
-        for item in catalog_service.input_mappings(db, project_id, file.id)["mappings"]
+        for item in catalog_service.input_mappings(
+            db, project_id, file.id, projection_set.model_version_id
+        )["mappings"]
     ]
     present = [item for item in mappings if item["status"] == "validated"]
     if len(present) != len(mappings):

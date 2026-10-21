@@ -17,7 +17,8 @@ from app.db.models.run_artifact import RunArtifact
 from app.models.schemas import ProjectionContext, ProjectionSummary, VariableResolutionResult
 from app.services.common import ServiceError
 
-RUN_ARTIFACT_SCHEMAS = frozenset({"v1", "m1-v1"})
+RUN_ARTIFACT_SCHEMAS = frozenset({"v1", "m1-v1", "m2-v1"})
+IDENTITY_NEUTRAL_SCHEMA = "m2-v1"
 
 
 @dataclass(frozen=True)
@@ -191,18 +192,31 @@ def verified_parquet_rows(
                 "The artifact row count does not match its registered evidence.",
                 uri,
             )
-        identity = None
-        if expected_run_id is not None:
-            identity = pl.col("run_id") != expected_run_id
-        if expected_attempt_number is not None:
-            mismatch = pl.col("attempt_number") != expected_attempt_number
-            identity = mismatch if identity is None else identity | mismatch
-        if identity is not None and base.filter(identity).limit(1).collect().height:
-            raise _artifact_error(
-                "ARTIFACT_IDENTITY_MISMATCH",
-                "Artifact rows do not match the registered run attempt.",
-                uri,
-            )
+        if schema_version == IDENTITY_NEUTRAL_SCHEMA:
+            # Ownership is carried by the immutable RunArtifact record and its
+            # run-scoped path, not by non-deterministic fields inside the file.
+            # Keep accepting older self-identifying Parquet schemas unchanged.
+            if (expected_run_id is None or expected_attempt_number is None
+                    or path.parent.parent != store.root / store._safe_component(expected_run_id)
+                    or {"run_id", "attempt_number"} & set(base.collect_schema().names())):
+                raise _artifact_error(
+                    "ARTIFACT_IDENTITY_MISMATCH",
+                    "The artifact is not bound to the registered run attempt.",
+                    uri,
+                )
+        else:
+            identity = None
+            if expected_run_id is not None:
+                identity = pl.col("run_id") != expected_run_id
+            if expected_attempt_number is not None:
+                mismatch = pl.col("attempt_number") != expected_attempt_number
+                identity = mismatch if identity is None else identity | mismatch
+            if identity is not None and base.filter(identity).limit(1).collect().height:
+                raise _artifact_error(
+                    "ARTIFACT_IDENTITY_MISMATCH",
+                    "Artifact rows do not match the registered run attempt.",
+                    uri,
+                )
         query = base
         for column, value in (filters or {}).items():
             if value is None:
@@ -218,6 +232,11 @@ def verified_parquet_rows(
             if upper is not None:
                 query = query.filter(pl.col(column) <= upper)
         rows = query.collect().to_dicts()
+        if schema_version == IDENTITY_NEUTRAL_SCHEMA:
+            rows = [
+                {"run_id": expected_run_id, "attempt_number": expected_attempt_number, **row}
+                for row in rows
+            ]
     except ServiceError:
         raise
     except Exception as error:
@@ -257,6 +276,7 @@ def read_artifact_rows(
             artifact.schema_version,
             supported_schemas=RUN_ARTIFACT_SCHEMAS,
             expected_run_id=run_id,
+            expected_attempt_number=artifact.attempt_number,
         ))
     return rows
 

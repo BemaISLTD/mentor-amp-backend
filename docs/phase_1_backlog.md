@@ -12,7 +12,7 @@ it is considered complete.
 
 | Area | Verified state | Status |
 | --- | --- | --- |
-| Tests | Original test modules were empty placeholders | **Correction-pass evidence:** all 268 application tests pass (19 opt-in skips without PostgreSQL); all 18 PostgreSQL migration/concurrency/terminal-run tests pass separately; all 269 native Windows tests pass (18 PostgreSQL skips) |
+| Tests | Original test modules were empty placeholders | **Current evidence:** 364 application tests pass (24 opt-in skips without PostgreSQL); all 23 selected PostgreSQL migration, concurrency, SPIA, and MYGA workflow tests pass separately; the earlier 269-test native Windows correction gate remains recorded |
 | Seed data | No seed script existed | Complete for illustrative SPIA demo; broader product and workflow seed remains open |
 | Authentication/RBAC | No auth dependency or user/RBAC models existed | **Complete:** JWT and the administrator, actuary, model developer, reviewer, and read-only permission matrix are enforced |
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
@@ -31,11 +31,10 @@ it is considered complete.
   - Build coverage for database connectivity, migrations, model constraints,
     validation, authentication/authorization, API behavior, engine behavior,
     and golden policies.
-  - Current reliable named-container evidence: 268 passed, 19 skipped, exit
-    code 0. Exact 600-month, 24-month, payment-total, and trace references are
-    asserted without tolerances.
-  - All 18 PostgreSQL migration/concurrency/terminal-run tests pass with exit
-    code 0 on a disposable PostgreSQL 15 database. Running cancellation,
+  - Current reliable named-container evidence: 364 passed, 24 skipped, exit
+    code 0. Exact SPIA and MYGA golden values and trace references are asserted.
+  - All 23 selected PostgreSQL migration, concurrency, SPIA, and MYGA workflow
+    tests pass with exit code 0 on a disposable PostgreSQL 15 database. Running cancellation,
     all-policy failure, and post-write execution failure each reach a terminal
     state and can be retried.
   - The native Windows suite passes 269 tests with 18 PostgreSQL-only skips.
@@ -214,6 +213,48 @@ it is considered complete.
   - A dry-run-by-default operator command finds only old unregistered local
     files; deletion requires an exact database confirmation and never removes a
     registered historical artifact.
+
+- **[BUILD] Five-Year MYGA Illustrative Model — COMPLETE FOR M2B LOCAL SCOPE**
+  - A second registered product executes through the shared declarative formula
+    engine; no product-specific engine fork was introduced.
+  - The 20 ordered contract-value stages cover guarantee-period resets, account
+    value, Model #805 floor, free withdrawal, surrender charge, symmetric
+    charge-capped MVA, surrender benefit, and death benefit. Supporting scalar
+    stages cover decrements, expenses, cash flows, discounting, and reserve.
+  - The Data Manager selects required in-force fields by `product_type`; MYGA
+    fields are independent from SPIA fields, and unknown product types fail closed.
+    MYGA's whole-number five-year term, finite nonnegative balances, and 0.15% minimum floor-crediting
+    input are validated before commit. The input rate is not independently derived
+    from a five-year CMT series; an actuarial owner must verify that rate for
+    statutory use.
+  - Governed mortality and two-part surrender-factor lookups execute from approved
+    canonical datasets. The 25-policy sample is synthetic and non-production.
+  - The 480-month Base and Rates Up workflow passes upload, mapping, validation,
+    immutable commit, independent approval, preflight, execution, Parquet results,
+    trace, and byte-identical Parquet replay on SQLite and disposable PostgreSQL.
+    Premium and acquisition commission are recognized only at issue, not again for
+    existing in-force contracts at the valuation date. A scenario withdrawal
+    outside the available opening account value fails its policy calculation
+    instead of generating an overpayment.
+  - Frozen regression anchors live in `backend/app/products/myga_lite/golden.py`.
+    The external LifeLib reference-only oracle checks the native declarative
+    projection engine over 480 months in both scenarios using separately parsed
+    reference mortality and factor inputs; its worst difference is approximately
+    `1.82e-12`, below `1e-6`.
+  - AC-10 uses the new `m2-v1` identity-neutral Parquet schema. The file bytes
+    contain only deterministic results and traces, while the immutable artifact
+    registration, run-scoped path, checksum, row count, and accepted-attempt
+    metadata bind each file to its run. Readers restore `run_id` and
+    `attempt_number` after verification. Older `m1-v1`/`v1` files retain their
+    original row-level identity checks. Integration tests compare actual retained
+    file bytes across two separate runs, not normalized exports.
+  - LifeLib source and data are not vendored, installed in the application image,
+    or used by application execution. The cross-check requires a caller-supplied
+    checkout pinned to `5d91f9558c52fc98bca71a5978a1327baf5b0d11`.
+  - The frontend handoff is documented in
+    `docs/build/MYGA_BACKEND_FRONTEND_INTEGRATION_CONTRACT.md`.
+  - The model remains illustrative and requires actuarial-owner approval before
+    business use. Durable workers and production object storage remain open.
 
 ## Implementation Order
 

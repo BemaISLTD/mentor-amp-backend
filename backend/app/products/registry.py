@@ -14,11 +14,15 @@ def register_all_products() -> list[str]:
     """Register all product formula functions; return the product codes registered."""
     from app.products.spia_lite import config as spia
     from app.products.spia_reference import config as spia_reference
+    from app.products.myga_lite import config as myga
 
     spia.register_functions()
     spia_reference.register_functions()
+    myga.register_functions()
     if spia.PRODUCT_CODE not in REGISTERED_PRODUCTS:
         REGISTERED_PRODUCTS.append(spia.PRODUCT_CODE)
+    if myga.PRODUCT_CODE not in REGISTERED_PRODUCTS:
+        REGISTERED_PRODUCTS.append(myga.PRODUCT_CODE)
     return list(REGISTERED_PRODUCTS)
 
 

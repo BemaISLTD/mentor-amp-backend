@@ -1,0 +1,11 @@
+schedule,year_in_gp,rate
+initial,1,0.09
+initial,2,0.08
+initial,3,0.07
+initial,4,0.06
+initial,5,0.05
+renewal,1,0.05
+renewal,2,0.04
+renewal,3,0.03
+renewal,4,0.02
+renewal,5,0.01

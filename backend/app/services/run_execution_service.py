@@ -32,7 +32,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.execution import run_package, run_state
-from app.core.artifacts import get_artifact_store
+from app.core.artifacts import IDENTITY_NEUTRAL_SCHEMA, get_artifact_store
 from app.config import settings
 from app.core.execution.run_package import RunPackageError
 from app.core.projection_engine.engine import EngineError, run_policy
@@ -361,8 +361,6 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
             encoded = []
             for row in rows:
                 common = {
-                    "run_id": run.id,
-                    "attempt_number": attempt.attempt_number,
                     "policy_id": row["policy_id"],
                     "scenario_id": row["scenario_id"],
                     "projection_month": row["projection_month"],
@@ -393,7 +391,7 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                 storage_uri=stored.uri,
                 storage_backend=store.backend_name,
                 file_format="parquet",
-                schema_version="m1-v1",
+                schema_version=IDENTITY_NEUTRAL_SCHEMA,
                 row_count=stored.row_count,
                 checksum_sha256=stored.checksum_sha256,
                 partition={"attempt_number": attempt.attempt_number},

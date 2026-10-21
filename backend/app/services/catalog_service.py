@@ -651,13 +651,17 @@ def list_inputs(db: Session, project_id: str, category: str | None = None, searc
     }
 
 
-def _input_variables(db: Session, project_id: str) -> list[VariableSpec]:
-    versions = (
+def _input_variables(
+    db: Session, project_id: str, model_version_id: str | None = None,
+) -> list[VariableSpec]:
+    query = (
         db.query(ModelVersion.id)
         .join(Model, Model.id == ModelVersion.model_id)
         .filter(Model.project_id == project_id)
-        .all()
     )
+    if model_version_id:
+        query = query.filter(ModelVersion.id == model_version_id)
+    versions = query.all()
     variables: dict[str, VariableSpec] = {}
     for (version_id,) in sorted(versions):
         for name, spec in load_variable_closure(db, version_id, _model_formulas(db, version_id), []).items():
@@ -675,13 +679,18 @@ def _file_columns(file: InforceFile) -> list[str]:
     return list(columns or [])
 
 
-def input_mappings(db: Session, project_id: str, inforce_file_id: str | None = None) -> dict[str, Any]:
+def input_mappings(
+    db: Session,
+    project_id: str,
+    inforce_file_id: str | None = None,
+    model_version_id: str | None = None,
+) -> dict[str, Any]:
     get_project(db, project_id)
     query = db.query(InforceFile).filter(InforceFile.project_id == project_id)
     if inforce_file_id:
         query = query.filter(InforceFile.id == inforce_file_id)
     files = query.order_by(InforceFile.uploaded_at).all()
-    variables = _input_variables(db, project_id)
+    variables = _input_variables(db, project_id, model_version_id)
     mappings: list[dict[str, Any]] = []
     for file in files:
         columns = set(_file_columns(file))

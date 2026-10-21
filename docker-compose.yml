@@ -38,6 +38,8 @@ services:
     volumes:
       # Mount the local backend folder to /app for hot-reloading
       - ./backend:/app
+      # Keep newly added deterministic sample inputs visible without rebuilding the image.
+      - ./samples:/samples:ro
 
 volumes:
   postgres_data:

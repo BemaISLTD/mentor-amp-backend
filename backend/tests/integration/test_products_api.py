@@ -15,6 +15,7 @@ from app.db.models.audit_log import AuditLog
 from app.db.models.product import AssetPosition, Product, ProductMapping
 from app.db.models.project import Project
 from app.main import app
+from app.products.registry import register_all_products
 
 
 @pytest.fixture()
@@ -75,6 +76,16 @@ def _create_product(client: TestClient) -> str:
     assert response.status_code == 201
     assert response.json()["code"] == "FIA-001"
     return response.json()["id"]
+
+
+def test_system_status_registers_spia_and_myga(product_client):
+    client, _session = product_client
+    register_all_products()
+
+    response = client.get("/v1/system/status")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["engine"]["products"] == ["SPIA", "MYGA"]
 
 
 def test_product_crud_uniqueness_and_audit(product_client):
