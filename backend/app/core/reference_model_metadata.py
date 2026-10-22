@@ -20,9 +20,11 @@ class ReferenceSource(BaseModel):
     library: str = Field(min_length=1)
     model: str = Field(min_length=1)
     release: str = Field(min_length=1)
-    commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    commit: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     retrieved_on: date
     documentation_urls: tuple[str, ...] = Field(min_length=1)
+    generated_by: str | None = None
+    reference_type: str | None = None
 
 
 class ReferenceModelMetadata(BaseModel):
@@ -31,9 +33,9 @@ class ReferenceModelMetadata(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     schema_version: Literal["mentoramp.reference_model/v1"] = "mentoramp.reference_model/v1"
-    classification: Literal["external_development_benchmark"] = (
-        "external_development_benchmark"
-    )
+    classification: Literal[
+        "external_development_benchmark", "mentoramp_simplified_development_reference"
+    ] = "external_development_benchmark"
     source: ReferenceSource
     runtime_required: bool = False
     production_dependency: bool = False

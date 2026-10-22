@@ -241,7 +241,7 @@ def monthly_mortality(mortality_rate_annual: float) -> float:
 
 
 def gmir_lapse_factor(gmir: float) -> float:
-    """VM-22 fixed-annuity lapse multiplier selected from the GMIR band."""
+    """Illustrative fixed-annuity lapse multiplier selected from the GMIR band (illustrative best-estimate, not VM-22 prescribed)."""
     if gmir <= 0.01:
         return 1.25
     if gmir <= 0.025:
@@ -424,11 +424,75 @@ def acquisition_commission(
     )
 
 
-def withdrawal_payment(
-    inforce_open: float, withdrawal: float, account_value_open: float,
+def gross_withdrawal(account_value_open: float, withdrawal: float) -> float:
+    """Gross withdrawal requested and debited from opening account value."""
+    return _valid_withdrawal(account_value_open, withdrawal)
+
+
+def free_withdrawal_allowance(
+    policy_year: float,
+    month_in_policy_year: float,
+    free_wd_base: float,
+    account_value_open: float,
+    free_withdrawal_available_previous: float,
 ) -> float:
-    """Pay gross elective withdrawals to policies active at the month's opening."""
-    return float(inforce_open) * _valid_withdrawal(account_value_open, withdrawal)
+    """Annual free withdrawal allowance available at the beginning of the month before current withdrawal."""
+    if int(month_in_policy_year) == 0:
+        return 0.10 * (float(free_wd_base) if int(policy_year) == 1 else float(account_value_open))
+    return float(free_withdrawal_available_previous)
+
+
+def chargeable_withdrawal(gross_withdrawal: float, free_withdrawal_allowance: float) -> float:
+    """Portion of gross withdrawal exceeding the available free withdrawal allowance."""
+    return max(0.0, float(gross_withdrawal) - float(free_withdrawal_allowance))
+
+
+def surrender_charge_on_withdrawal(
+    chargeable_withdrawal: float, surrender_charge_rate: float,
+) -> float:
+    """Contractual surrender charge assessed on the chargeable portion of partial withdrawal."""
+    return float(chargeable_withdrawal) * float(surrender_charge_rate)
+
+
+def withdrawal_mva(
+    renewal_window: float,
+    locked_mva_reference_yield: float,
+    mva_ref_yield: float,
+    mva_term: float,
+    chargeable_withdrawal: float,
+    surrender_charge_on_withdrawal: float,
+) -> float:
+    """Linear MVA applied to chargeable partial withdrawal, capped symmetrically by the withdrawal charge."""
+    if renewal_window >= 0.5 or float(chargeable_withdrawal) <= 0.0:
+        return 0.0
+    raw = (
+        (float(locked_mva_reference_yield) - float(mva_ref_yield))
+        * float(mva_term)
+        * float(chargeable_withdrawal)
+    )
+    cap = max(0.0, float(surrender_charge_on_withdrawal))
+    return max(-cap, min(raw, cap))
+
+
+def net_withdrawal_benefit(
+    gross_withdrawal: float,
+    surrender_charge_on_withdrawal: float,
+    withdrawal_mva: float,
+) -> float:
+    """Net benefit amount paid to policyholder for partial withdrawal after charges and MVA."""
+    return max(0.0, float(gross_withdrawal) - float(surrender_charge_on_withdrawal) + float(withdrawal_mva))
+
+
+def withdrawal_payment(
+    inforce_open: float,
+    net_withdrawal_benefit: float,
+    account_value_open: float | None = None,
+) -> float:
+    """Pay net elective withdrawal benefits to policies active at the month's opening."""
+    if account_value_open is not None:
+        gross = _valid_withdrawal(account_value_open, net_withdrawal_benefit)
+        return float(inforce_open) * gross
+    return float(inforce_open) * float(net_withdrawal_benefit)
 
 
 def liability_outgo(
@@ -487,6 +551,12 @@ _SUPPORT_FUNCTIONS = [
     ("maintenance_expense", maintenance_expense),
     ("premium_cash_flow", premium_cash_flow),
     ("acquisition_commission", acquisition_commission),
+    ("gross_withdrawal", gross_withdrawal),
+    ("free_withdrawal_allowance", free_withdrawal_allowance),
+    ("chargeable_withdrawal", chargeable_withdrawal),
+    ("surrender_charge_on_withdrawal", surrender_charge_on_withdrawal),
+    ("withdrawal_mva", withdrawal_mva),
+    ("net_withdrawal_benefit", net_withdrawal_benefit),
     ("withdrawal_payment", withdrawal_payment),
     ("liability_outgo", liability_outgo),
     ("net_cash_flow", net_cash_flow),
@@ -517,7 +587,13 @@ _SUPPORT_EXPRESSIONS = {
     "maintenance_expense": "inforce_open * annual_expense / 12 * (1 + inflation)^(year-1)",
     "premium_cash_flow": "premium at issue in projection month 1; otherwise 0",
     "acquisition_commission": "premium * commission_rate at issue in projection month 1; otherwise 0",
-    "withdrawal_payment": "inforce_open * validated gross_withdrawal (0 <= withdrawal <= AV_open)",
+    "gross_withdrawal": "validated withdrawal (0 <= withdrawal <= account_value_open)",
+    "free_withdrawal_allowance": "10% of anniversary AV (or free_wd_base in Y1) in month 0; else prior available",
+    "chargeable_withdrawal": "max(0, gross_withdrawal - free_withdrawal_allowance)",
+    "surrender_charge_on_withdrawal": "chargeable_withdrawal * surrender_charge_rate",
+    "withdrawal_mva": "clamp((locked_yield - current_yield) * term * chargeable_withdrawal, -charge, charge)",
+    "net_withdrawal_benefit": "max(0, gross_withdrawal - surrender_charge_on_withdrawal + withdrawal_mva)",
+    "withdrawal_payment": "inforce_open * net_withdrawal_benefit",
     "liability_outgo": "withdrawals + claims + annuitization + maturity + expenses + commission",
     "net_cash_flow": "premium_cash_flow - liability_outgo",
     "discount_factor": "(1 + annual_discount_rate)^(-projection_month/12)",
@@ -737,7 +813,13 @@ _SUPPORT_FORMULA_DEPS = [
     ("maintenance_expense", ["inforce_open", "policy_year", "annual_maintenance_expense", "expense_inflation_rate"]),
     ("premium_cash_flow", ["projection_month", "policy_month", "premium"]),
     ("acquisition_commission", ["projection_month", "policy_month", "premium", "commission_rate"]),
-    ("withdrawal_payment", ["inforce_open", "withdrawal", "account_value_open"]),
+    ("gross_withdrawal", ["account_value_open", "withdrawal"]),
+    ("free_withdrawal_allowance", ["policy_year", "month_in_policy_year", "free_wd_base", "account_value_open", "free_withdrawal_available_previous"]),
+    ("chargeable_withdrawal", ["gross_withdrawal", "free_withdrawal_allowance"]),
+    ("surrender_charge_on_withdrawal", ["chargeable_withdrawal", "surrender_charge_rate"]),
+    ("withdrawal_mva", ["renewal_window", "locked_mva_reference_yield", "mva_ref_yield", "mva_term", "chargeable_withdrawal", "surrender_charge_on_withdrawal"]),
+    ("net_withdrawal_benefit", ["gross_withdrawal", "surrender_charge_on_withdrawal", "withdrawal_mva"]),
+    ("withdrawal_payment", ["inforce_open", "net_withdrawal_benefit"]),
     ("liability_outgo", ["withdrawal_payment", "death_claims", "surrender_claims", "annuitization_transfer", "maturity_benefit", "maintenance_expense", "acquisition_commission"]),
     ("net_cash_flow", ["premium_cash_flow", "liability_outgo"]),
     ("discount_factor", ["discount_rate_annual", "projection_month"]),
@@ -747,6 +829,8 @@ _SUPPORT_FORMULA_DEPS = [
 _USD_SUPPORT = {
     "death_claims", "surrender_claims", "annuitization_transfer", "maturity_benefit",
     "maintenance_expense", "premium_cash_flow", "acquisition_commission",
+    "gross_withdrawal", "free_withdrawal_allowance", "chargeable_withdrawal",
+    "surrender_charge_on_withdrawal", "withdrawal_mva", "net_withdrawal_benefit",
     "withdrawal_payment", "liability_outgo", "net_cash_flow", "pv_liability_outgo",
 }
 for _name, _dependencies in _SUPPORT_FORMULA_DEPS:
@@ -811,8 +895,24 @@ MODEL = {
         "illustrative": True,
         "configuration": {
             "reference_only": True,
-            "external_reference": "LifeLib MYGA_US_S at 5d91f95",
-            "regulatory_claim": "No compliance claim; actuarial owner approval required",
+            "reference_classification": "mentoramp_simplified_development_reference",
+            "generated_by": "MentorAmp Development Team",
+            "reference_type": "internal_development_reference",
+            "regulatory_claim": "No compliance claim; illustrative development reference only",
+            "methodology": {
+                "contract_mechanics": "myga_fixed_guaranteed_rollforward",
+                "decrement_basis": "illustrative_best_estimate",
+                "vm22_status": "illustrative_departure_not_prescribed",
+                "assumption_sources": {
+                    "base_lapse": "illustrative_duration_schedule",
+                    "gmir_lapse_factor": "gmir_banded_factor",
+                    "mva_lapse_factor": "best_estimate_factor_0_35",
+                    "dynamic_lapse": "illustrative_spread_power",
+                    "mortality": MORTALITY_TABLE_NAME,
+                    "surrender_charge": SURRENDER_CHARGE_TABLE_NAME,
+                    "surrender_charge_age_cap": SURRENDER_CHARGE_AGE_CAP_TABLE_NAME,
+                },
+            },
         },
     },
     "formula_group": {

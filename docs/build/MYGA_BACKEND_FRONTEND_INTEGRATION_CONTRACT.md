@@ -63,9 +63,15 @@ new business issued in the projected first month.
 ### Scenarios, traces, and artifacts
 
 - `market_rate`, `mva_ref_yield`, `discount_rate_annual`, and `withdrawal` accept governed
-  scenario overrides. Standard valuation scenarios leave `withdrawal` at zero. A withdrawal
-  outside `[0, opening account value]` fails the affected policy; it is not silently capped
-  or paid in excess of account value.
+  scenario overrides. In the 'Rates Up 150bp' scenario, only `market_rate` (+150bp to 5.95%) and
+  `mva_ref_yield` (+150bp to 6.50%) are shocked; the liability valuation discount rate remains
+  fixed at 4.50% (market asset/reinvestment yield shift with constant liability discount basis).
+  Standard valuation scenarios leave `withdrawal` at zero. Partial withdrawals distinguish
+  gross withdrawal (debited from AV), free withdrawal allowance (10% of anniversary AV),
+  chargeable excess, surrender charge on excess, withdrawal MVA, and net withdrawal benefit
+  paid to the policyholder and reflected in liability outgo. A withdrawal outside
+  `[0, opening account value]` fails the affected policy; it is not silently capped or paid
+  in excess of account value.
 - `GET /v1/runs/{run_id}/trace` returns a nested `root.children` tree, not a flat
   `dependencies` array. Surrender-benefit lineage connects account value, free amount,
   excess, charge, capped MVA, surrender value, MGSV floor, and final benefit.

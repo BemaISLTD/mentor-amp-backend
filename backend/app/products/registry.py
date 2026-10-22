@@ -6,6 +6,14 @@ idempotent.
 """
 
 from app.core.formula_engine.formulas import FORMULA_FUNCTIONS
+from app.products.inforce_registry import (
+    COMMON_INFORCE_FIELDS,
+    ProductInforceDefinition,
+    clear_product_inforce_registry,
+    get_product_inforce_definition,
+    get_registered_inforce_products,
+    register_inforce_product,
+)
 
 REGISTERED_PRODUCTS: list[str] = []
 

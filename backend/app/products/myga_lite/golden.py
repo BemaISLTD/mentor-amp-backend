@@ -1,7 +1,9 @@
 """Frozen results from the governed 25-policy, 480-month MYGA workflow.
 
-These figures were accepted only after the external LifeLib cross-check passed for every
-month in both scenarios at a maximum absolute difference below one millionth of a dollar.
+These figures are MentorAmp internal deterministic regression anchors for continuous integration
+and reproducibility verification. They represent internal deterministic regression targets for
+the 25-policy portfolio, not an external LifeLib validation across the 25-policy set. External
+LifeLib comparison is performed exclusively on the single anchor model point.
 """
 
 GOLDEN_RESULTS: dict[str, float] = {
