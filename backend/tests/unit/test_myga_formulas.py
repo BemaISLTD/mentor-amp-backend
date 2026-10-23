@@ -86,7 +86,7 @@ def test_withdrawal_cannot_exceed_opening_account_value():
         myga.account_value_before_credit(100, -1)
 
 
-def test_gmsv_rate_rejects_below_model_805_floor_but_allows_higher_contract_rate():
+def test_gmsv_rate_rejects_below_contractual_nonforfeiture_bound_but_allows_higher_rate():
     with pytest.raises(ValueError, match="at least 0.15%"):
         myga.mgsv_close(87_500, 0, 0, 0.001)
     assert myga.mgsv_close(87_500, 0, 0, 0.04) > 87_500
@@ -220,3 +220,22 @@ def test_declarative_model_executes_through_shared_projection_engine():
     rejected = run_policy(excessive, excessive.policies[0], FORMULA_FUNCTIONS)
     assert rejected.error is not None
     assert rejected.error.variable == "account_value_before_credit"
+
+
+def test_death_benefit_when_surrender_benefit_exceeds_account_value():
+    """Actuarial Decision Test: When positive MVA elevates Cash Surrender Value above Account Value,
+
+    the death benefit pays max(AV, CSV) = CSV so beneficiaries are not disadvantaged relative to surrender.
+    """
+    av_close = 100_000.0
+    # Falling interest rates produce positive MVA, making CSV = 105,000 > AV = 100,000
+    surrender_benefit = 105_000.0
+    benefit = myga.death_benefit(av_close, surrender_benefit)
+    assert benefit == 105_000.0
+    assert benefit > av_close
+
+    # Normal environment where surrender charge/MVA depresses CSV below AV
+    normal_csv = 95_000.0
+    normal_benefit = myga.death_benefit(av_close, normal_csv)
+    assert normal_benefit == 100_000.0
+    assert normal_benefit == av_close

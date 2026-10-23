@@ -133,6 +133,21 @@ def prevalidate_expected_fixture(
             except (ValueError, TypeError):
                 errors.append(f"Row {idx} (key {key}) in expected fixture field '{field}' has non-numeric value: {raw_val!r}.")
 
+    # Enforce strict month completeness: each policy must have contiguous months 1..N without gaps
+    if not errors and expected_map:
+        by_policy: dict[str, list[int]] = {}
+        for pol, m in expected_map.keys():
+            by_policy.setdefault(pol, []).append(m)
+        for pol, months in by_policy.items():
+            sorted_months = sorted(months)
+            full_seq = list(range(1, len(sorted_months) + 1))
+            if sorted_months != full_seq:
+                missing = sorted(set(range(1, max(sorted_months) + 1)) - set(sorted_months))
+                errors.append(
+                    f"Expected fixture for policy '{pol}' has discontinuous or missing months: "
+                    f"expected 1..{max(sorted_months)}, but missing months {missing}."
+                )
+
     return (len(errors) == 0, errors)
 
 

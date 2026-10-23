@@ -21,12 +21,24 @@ COMMON_INFORCE_FIELDS: dict[str, str] = {
 }
 
 
+def _normalize_version(version: str | None) -> str:
+    if not version:
+        return "v1"
+    v = str(version).strip().lower()
+    if "/" in v:
+        v = v.split("/")[-1]
+    if not v.startswith("v") and v.isdigit():
+        v = f"v{v}"
+    return v
+
+
 @dataclass(frozen=True)
 class ProductInforceDefinition:
-    """Registered inforce configuration for a specific product code."""
+    """Registered inforce configuration for a specific product code and schema version."""
 
     product_code: str
-    fields: dict[str, str]
+    schema_version: str = "v1"
+    fields: dict[str, str] = field(default_factory=dict)
     aliases: dict[str, str] = field(default_factory=dict)
     amount_fields: tuple[str, ...] = ("premium",)
     negative_allowed: bool = False
@@ -37,21 +49,39 @@ class ProductInforceDefinition:
         return {**COMMON_INFORCE_FIELDS, **self.fields}
 
 
-_PRODUCT_INFORCE_REGISTRY: dict[str, ProductInforceDefinition] = {}
+_PRODUCT_INFORCE_REGISTRY: dict[tuple[str, str], ProductInforceDefinition] = {}
 
 
 def register_inforce_product(definition: ProductInforceDefinition) -> None:
     """Register or replace an inforce product definition."""
     code = definition.product_code.strip().upper()
-    _PRODUCT_INFORCE_REGISTRY[code] = definition
+    ver = _normalize_version(definition.schema_version)
+    _PRODUCT_INFORCE_REGISTRY[(code, ver)] = definition
+    if ver == "v1":
+        _PRODUCT_INFORCE_REGISTRY[(code, "")] = definition
 
 
-def get_product_inforce_definition(product_code: str) -> ProductInforceDefinition | None:
-    """Look up an inforce product definition by case-insensitive code."""
-    return _PRODUCT_INFORCE_REGISTRY.get(product_code.strip().upper())
+def get_product_inforce_definition(
+    product_code: str, schema_version: str | None = None
+) -> ProductInforceDefinition | None:
+    """Look up an inforce product definition by case-insensitive code and schema version.
+
+    If an explicit schema_version is requested, only that exact registered version is
+    returned; it must NEVER fall back to v1 or default.
+    Only when schema_version is None or omitted does it fall back to the default v1 schema.
+    """
+    code = product_code.strip().upper()
+    if schema_version:
+        ver = _normalize_version(schema_version)
+        return _PRODUCT_INFORCE_REGISTRY.get((code, ver))
+    # Fallback to (code, "v1") or (code, "") only when no explicit version was supplied
+    defn = _PRODUCT_INFORCE_REGISTRY.get((code, "v1"))
+    if defn is not None:
+        return defn
+    return _PRODUCT_INFORCE_REGISTRY.get((code, ""))
 
 
-def get_registered_inforce_products() -> dict[str, ProductInforceDefinition]:
+def get_registered_inforce_products() -> dict[tuple[str, str], ProductInforceDefinition]:
     """Return an immutable snapshot of all registered inforce products."""
     return dict(_PRODUCT_INFORCE_REGISTRY)
 
@@ -124,6 +154,7 @@ def _register_builtin_products() -> None:
     register_inforce_product(
         ProductInforceDefinition(
             product_code="SPIA",
+            schema_version="v1",
             fields={"monthly_payment": "number"},
             aliases={},
             amount_fields=("premium", "monthly_payment"),
@@ -132,10 +163,11 @@ def _register_builtin_products() -> None:
         )
     )
 
-    # 2. MYGA
+    # 2. MYGA (mentoramp.myga.inforce/v1)
     register_inforce_product(
         ProductInforceDefinition(
             product_code="MYGA",
+            schema_version="v1",
             fields={
                 "guarantee_period_years": "integer",
                 "declared_rate": "number",

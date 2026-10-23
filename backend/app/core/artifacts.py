@@ -46,10 +46,38 @@ class LocalParquetArtifactStore:
         run_id: str,
         artifact_type: str,
         rows: list[dict[str, Any]],
+        attempt_number: int | None = None,
+        schema_version: str | None = None,
     ) -> StoredArtifact:
+        """Persist rows to a Parquet artifact.
+
+        Storage Path Architecture:
+        - New artifacts (schema 'm2-v1'):
+            Attempt-scoped path is REQUIRED:
+            <run_id>/attempt/<attempt_number>/<artifact_type>/<uuid>.parquet
+            New writes under 'm2-v1' can NEVER use unpartitioned paths.
+        - Legacy artifacts (schema 'v1' / 'm1-v1'):
+            DB RunArtifact metadata is authoritative for attempt identity, even if
+            the legacy storage path was run-scoped (<run_id>/<artifact_type>/<uuid>.parquet).
+            Unpartitioned paths are supported strictly for reading historical legacy data.
+        """
         if not rows:
             raise ValueError("Cannot write an empty artifact.")
-        relative = Path(self._safe_component(run_id)) / artifact_type / f"{uuid.uuid4()}.parquet"
+        if schema_version == IDENTITY_NEUTRAL_SCHEMA and attempt_number is None:
+            raise ValueError(
+                f"attempt_number is required for new '{IDENTITY_NEUTRAL_SCHEMA}' artifact writes; "
+                "legacy non-attempt-scoped writes are prohibited."
+            )
+        if attempt_number is not None:
+            relative = (
+                Path(self._safe_component(run_id))
+                / "attempt"
+                / str(int(attempt_number))
+                / self._safe_component(artifact_type)
+                / f"{uuid.uuid4()}.parquet"
+            )
+        else:
+            relative = Path(self._safe_component(run_id)) / self._safe_component(artifact_type) / f"{uuid.uuid4()}.parquet"
         destination = self.root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_suffix(".tmp")
@@ -194,11 +222,44 @@ def verified_parquet_rows(
             )
         if schema_version == IDENTITY_NEUTRAL_SCHEMA:
             # Ownership is carried by the immutable RunArtifact record and its
-            # run-scoped path, not by non-deterministic fields inside the file.
-            # Keep accepting older self-identifying Parquet schemas unchanged.
-            if (expected_run_id is None or expected_attempt_number is None
-                    or path.parent.parent != store.root / store._safe_component(expected_run_id)
-                    or {"run_id", "attempt_number"} & set(base.collect_schema().names())):
+            # attempt-scoped path, not by non-deterministic fields inside the file.
+            if expected_run_id is None or expected_attempt_number is None:
+                raise _artifact_error(
+                    "ARTIFACT_IDENTITY_MISMATCH",
+                    "The artifact is not bound to the registered run attempt.",
+                    uri,
+                )
+            if {"run_id", "attempt_number"} & set(base.collect_schema().names()):
+                raise _artifact_error(
+                    "ARTIFACT_IDENTITY_MISMATCH",
+                    "The artifact is not bound to the registered run attempt.",
+                    uri,
+                )
+            try:
+                rel_parts = path.relative_to(store.root).parts
+            except ValueError:
+                raise _artifact_error(
+                    "ARTIFACT_IDENTITY_MISMATCH",
+                    "The artifact is not bound to the registered run attempt.",
+                    uri,
+                )
+            if len(rel_parts) >= 5 and rel_parts[1] == "attempt":
+                path_run_id = rel_parts[0]
+                path_attempt = rel_parts[2]
+                if path_run_id != store._safe_component(expected_run_id) or path_attempt != str(int(expected_attempt_number)):
+                    raise _artifact_error(
+                        "ARTIFACT_IDENTITY_MISMATCH",
+                        "The artifact is not bound to the registered run attempt.",
+                        uri,
+                    )
+            elif len(rel_parts) >= 3:
+                if rel_parts[0] != store._safe_component(expected_run_id):
+                    raise _artifact_error(
+                        "ARTIFACT_IDENTITY_MISMATCH",
+                        "The artifact is not bound to the registered run attempt.",
+                        uri,
+                    )
+            else:
                 raise _artifact_error(
                     "ARTIFACT_IDENTITY_MISMATCH",
                     "The artifact is not bound to the registered run attempt.",

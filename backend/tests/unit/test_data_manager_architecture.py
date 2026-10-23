@@ -130,3 +130,227 @@ def test_myga_column_aliases_harmonization():
     assert rows[0]["guarantee_period_years"] == 5
     assert rows[0]["declared_rate"] == 0.045
     assert rows[0]["gmsv_rate"] == 0.02
+    # Pruned aliases from canonical normalized row
+    assert "guarantee_term_years" not in rows[0]
+    assert "credited_rate" not in rows[0]
+    assert "mgsv_rate" not in rows[0]
+
+
+def test_dm_myga_01_and_02_canonical_and_alias_produce_identical_fingerprint():
+    """DM-MYGA-01 & DM-MYGA-02: Upload with canonical names vs aliases produces identical normalized rows & fingerprint."""
+    from app.services.data_manager_service import _canonical_fingerprint
+
+    session = ImportSession(options={"valuation_date": "2026-12-31"})
+
+    # DM-MYGA-01: Canonical names
+    canonical_rows = [
+        {
+            "policy_id": "MYGA-0001",
+            "product_type": "MYGA",
+            "issue_date": "2026-12-31",
+            "issue_age": 60,
+            "gender": "M",
+            "premium": 100000.0,
+            "guarantee_period_years": 5,
+            "declared_rate": 0.0445,
+            "gmir": 0.0025,
+            "gmsv_rate": 0.028,
+            "mva_ref_yield_at_issue": 0.05,
+            "account_value": 100000.0,
+            "mgsv_value": 87500.0,
+            "free_wd_base": 100000.0,
+        }
+    ]
+    issues_canon = []
+    _validate_inforce(session, canonical_rows, issues_canon)
+    assert not [i for i in issues_canon if i["severity"] == "error"]
+    fp_canon, scheme_canon = _canonical_fingerprint("liability_inforce", canonical_rows)
+
+    # DM-MYGA-02: Economically identical file using aliases
+    alias_rows = [
+        {
+            "policy_id": "MYGA-0001",
+            "product_type": "MYGA",
+            "issue_date": "2026-12-31",
+            "issue_age": 60,
+            "gender": "M",
+            "premium": 100000.0,
+            "guarantee_term_years": 5,       # alias for guarantee_period_years
+            "credited_rate": 0.0445,         # alias for declared_rate
+            "gmir": 0.0025,
+            "mgsv_rate": 0.028,              # alias for gmsv_rate
+            "mva_ref_yield_at_issue": 0.05,
+            "account_value": 100000.0,
+            "mgsv_value": 87500.0,
+            "free_wd_base": 100000.0,
+        }
+    ]
+    issues_alias = []
+    _validate_inforce(session, alias_rows, issues_alias)
+    assert not [i for i in issues_alias if i["severity"] == "error"]
+    fp_alias, scheme_alias = _canonical_fingerprint("liability_inforce", alias_rows)
+
+    # Both must yield identical normalized rows and identical fingerprint
+    assert canonical_rows == alias_rows
+    assert fp_canon == fp_alias
+    assert scheme_canon == scheme_alias
+
+
+def test_dm_myga_03_alias_and_canonical_both_present_same_value():
+    """DM-MYGA-03: Alias and canonical field both present with same value normalized once."""
+    from app.services.data_manager_service import _canonical_fingerprint
+
+    session = ImportSession(options={"valuation_date": "2026-12-31"})
+    rows = [
+        {
+            "policy_id": "MYGA-0001",
+            "product_type": "MYGA",
+            "issue_date": "2026-12-31",
+            "issue_age": 60,
+            "gender": "M",
+            "premium": 100000.0,
+            "guarantee_period_years": 5,
+            "guarantee_term_years": 5,       # both present with identical value
+            "declared_rate": 0.0445,
+            "credited_rate": 0.0445,         # both present with identical value
+            "gmir": 0.0025,
+            "gmsv_rate": 0.028,
+            "mgsv_rate": 0.028,              # both present with identical value
+            "mva_ref_yield_at_issue": 0.05,
+            "account_value": 100000.0,
+            "mgsv_value": 87500.0,
+            "free_wd_base": 100000.0,
+        }
+    ]
+    issues = []
+    _validate_inforce(session, rows, issues)
+    assert not [i for i in issues if i["severity"] == "error"]
+
+    # Canonical columns present once, aliases pruned
+    assert rows[0]["declared_rate"] == 0.0445
+    assert "credited_rate" not in rows[0]
+    assert rows[0]["guarantee_period_years"] == 5
+    assert "guarantee_term_years" not in rows[0]
+
+
+def test_dm_myga_04_alias_and_canonical_disagree_validation_error():
+    """DM-MYGA-04: Alias and canonical field disagree produces ALIAS_CONFLICT error."""
+    session = ImportSession(options={"valuation_date": "2026-12-31"})
+    rows = [
+        {
+            "policy_id": "MYGA-0001",
+            "product_type": "MYGA",
+            "issue_date": "2026-12-31",
+            "issue_age": 60,
+            "gender": "M",
+            "premium": 100000.0,
+            "guarantee_period_years": 5,
+            "declared_rate": 0.045,          # disagrees with credited_rate
+            "credited_rate": 0.050,          # disagrees
+            "gmir": 0.0025,
+            "gmsv_rate": 0.028,
+            "mva_ref_yield_at_issue": 0.05,
+            "account_value": 100000.0,
+            "mgsv_value": 87500.0,
+            "free_wd_base": 100000.0,
+        }
+    ]
+    issues = []
+    _validate_inforce(session, rows, issues)
+    errors = [i for i in issues if i["severity"] == "error"]
+    assert any(i["code"] == "ALIAS_CONFLICT" for i in errors)
+
+
+def test_schema_01_no_schema_version_uses_deliberate_default():
+    """SCHEMA-01: When no schema version is supplied, deliberate default v1 is used."""
+    defn = get_product_inforce_definition("MYGA")
+    assert defn is not None
+    assert defn.schema_version == "v1"
+
+    session = ImportSession(options={"valuation_date": "2026-12-31"})
+    rows = [
+        {
+            "policy_id": "MYGA-0001",
+            "product_type": "MYGA",
+            "issue_date": "2026-12-31",
+            "issue_age": 60,
+            "gender": "M",
+            "premium": 100000.0,
+            "guarantee_period_years": 5,
+            "declared_rate": 0.045,
+            "gmir": 0.025,
+            "gmsv_rate": 0.028,
+            "mva_ref_yield_at_issue": 0.05,
+            "account_value": 100000.0,
+            "mgsv_value": 87500.0,
+            "free_wd_base": 100000.0,
+        }
+    ]
+    issues = []
+    _validate_inforce(session, rows, issues)
+    errors = [i for i in issues if i["severity"] == "error"]
+    assert errors == []
+
+
+def test_schema_02_explicit_v1_uses_v1():
+    """SCHEMA-02: Explicit v1 schema version is accepted and resolves to registered v1 definition."""
+    defn = get_product_inforce_definition("MYGA", "v1")
+    assert defn is not None
+    assert defn.schema_version == "v1"
+
+    session = ImportSession(options={"valuation_date": "2026-12-31", "schema_version": "v1"})
+    rows = [
+        {
+            "policy_id": "MYGA-0001",
+            "product_type": "MYGA",
+            "issue_date": "2026-12-31",
+            "issue_age": 60,
+            "gender": "M",
+            "premium": 100000.0,
+            "guarantee_period_years": 5,
+            "declared_rate": 0.045,
+            "gmir": 0.025,
+            "gmsv_rate": 0.028,
+            "mva_ref_yield_at_issue": 0.05,
+            "account_value": 100000.0,
+            "mgsv_value": 87500.0,
+            "free_wd_base": 100000.0,
+        }
+    ]
+    issues = []
+    _validate_inforce(session, rows, issues)
+    errors = [i for i in issues if i["severity"] == "error"]
+    assert errors == []
+
+
+def test_schema_03_explicit_unknown_v99_fails():
+    """SCHEMA-03: Explicit unsupported schema version v99 fails with INFORCE_SCHEMA_VERSION_NOT_SUPPORTED."""
+    # Direct lookup returns None rather than silently falling back to v1
+    assert get_product_inforce_definition("MYGA", "v99") is None
+
+    session = ImportSession(options={"valuation_date": "2026-12-31", "schema_version": "v99"})
+    rows = [
+        {
+            "policy_id": "MYGA-0001",
+            "product_type": "MYGA",
+            "issue_date": "2026-12-31",
+            "issue_age": 60,
+            "gender": "M",
+            "premium": 100000.0,
+            "guarantee_period_years": 5,
+            "declared_rate": 0.045,
+            "gmir": 0.025,
+            "gmsv_rate": 0.028,
+            "mva_ref_yield_at_issue": 0.05,
+            "account_value": 100000.0,
+            "mgsv_value": 87500.0,
+            "free_wd_base": 100000.0,
+        }
+    ]
+    issues = []
+    _validate_inforce(session, rows, issues)
+    errors = [i for i in issues if i["severity"] == "error"]
+    assert any(i["code"] == "INFORCE_SCHEMA_VERSION_NOT_SUPPORTED" for i in errors)
+    assert not any(i["code"] == "INVALID_PRODUCT_TYPE" for i in errors)
+
+

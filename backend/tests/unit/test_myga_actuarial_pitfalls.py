@@ -32,7 +32,7 @@ def test_floor_deducts_withdrawal_gross():
     assert myga.mgsv_close(87_500, 4_000, 0, 0.028) == pytest.approx(expected)
 
 
-def test_model_805_corridor_has_fifteen_basis_point_floor():
+def test_illustrative_nonforfeiture_corridor_has_fifteen_basis_point_floor():
     assert myga.statutory_floor_rate(0.005) == 0.0015
     assert myga.statutory_floor_rate(0.10) == 0.03
 
@@ -79,3 +79,27 @@ def test_maturity_occurs_at_month_end_when_age_100_is_reached():
     assert myga.maturity_rate(99, 10) == 0.0
     assert myga.maturity_rate(99, 11) == 1.0
     assert myga.maturity_rate(100, 0) == 1.0
+
+
+def test_death_benefit_decision_visible_when_surrender_benefit_exceeds_av():
+    """NEEDS ACTUARIAL PRODUCT OWNER DECISION.
+
+    Makes visible the divergence between:
+    - Option A: death_benefit = account_value_close (100,000)
+    - Option B: death_benefit = max(account_value_close, surrender_benefit) (105,000)
+    - Option C: explicit APO contractual rule
+    where surrender_benefit (105,000) > account_value_close (100,000) due to positive MVA.
+    """
+    av_close = 100_000.0
+    surrender_ben = 105_000.0  # e.g., positive MVA case exceeding surrender charges
+
+    # Option A would yield:
+    option_a_result = av_close
+
+    # Option B (current development baseline implementation):
+    option_b_result = myga.death_benefit(av_close, surrender_ben)
+
+    assert option_a_result == 100_000.0
+    assert option_b_result == 105_000.0
+    assert option_b_result > option_a_result
+

@@ -60,6 +60,3 @@ MYGA_DEVELOPMENT_REFERENCE = ReferenceModelMetadata(
         "Surrender charge and waiver schedules are illustrative contractual examples.",
     ),
 )
-
-# Backwards compatibility alias
-LIFELIB_MYGA_REFERENCE = MYGA_DEVELOPMENT_REFERENCE

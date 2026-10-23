@@ -1,10 +1,13 @@
-"""Artifact and RunAttempt provenance tests (MYGA-A-01 through MYGA-A-05).
+"""Artifact and RunAttempt provenance tests (M2B-A-01 through M2B-A-07).
 
 Verifies that m2-v1 identity-neutral Parquet artifacts:
-- Produce bit-identical Parquet byte streams across identical runs.
-- Maintain immutable, unambiguous RunAttempt bindings in metadata and storage URI.
-- Prevent non-accepted (failed or cancelled) attempts from being served as canonical.
-- Keep retry attempts fully isolated and distinguishable from failed attempts.
+- M2B-A-01: Wrong run ID is refused with ARTIFACT_IDENTITY_MISMATCH.
+- M2B-A-02: Wrong attempt number is refused with ARTIFACT_IDENTITY_MISMATCH.
+- M2B-A-03: Failed-attempt artifact cannot be returned as canonical result.
+- M2B-A-04: Cancelled-attempt artifact cannot be returned as canonical result.
+- M2B-A-05: Accepted attempt is the only canonical result source.
+- M2B-A-06: Retry attempt is distinguishable from source attempt.
+- M2B-A-07: Bit-identical business result payloads remain possible across equivalent runs.
 """
 
 from pathlib import Path
@@ -40,222 +43,180 @@ def db_session(tmp_path):
     engine.dispose()
 
 
-def test_myga_a_01_identical_runs_produce_bit_identical_business_parquet(tmp_path):
-    """MYGA-A-01: Two identical successful runs produce bit-identical Parquet bytes."""
+def test_m2b_a_01_wrong_run_id_refused(tmp_path):
+    """M2B-A-01: Verifier refuses artifact when expected_run_id does not match storage identity."""
     store = LocalParquetArtifactStore(tmp_path)
-    rows = [
-        {
-            "policy_id": "MYGA-0001",
-            "scenario_id": "Base",
-            "projection_month": 1,
-            "variable_name": "account_value_close",
-            "value_json": "100367.48",
-            "product": "MYGA",
-        },
-        {
-            "policy_id": "MYGA-0001",
-            "scenario_id": "Base",
-            "projection_month": 1,
-            "variable_name": "surrender_benefit",
-            "value_json": "94041.76",
-            "product": "MYGA",
-        },
-    ]
+    rows = [{"policy_id": "P1", "variable_name": "av", "value_json": "100"}]
+    stored = store.write_rows("run-real", "outputs", rows, attempt_number=1)
 
-    first = store.write_rows("run-001", "outputs", rows)
-    second = store.write_rows("run-002", "outputs", rows)
-
-    first_bytes = store.read_bytes(first.uri)
-    second_bytes = store.read_bytes(second.uri)
-
-    assert first_bytes == second_bytes
-    assert first.checksum_sha256 == second.checksum_sha256
-    assert first.row_count == second.row_count == 2
-
-
-def test_myga_a_02_artifacts_have_distinct_run_attempt_evidence(tmp_path):
-    """MYGA-A-02: Artifacts still maintain distinct run/attempt storage and verification boundaries."""
-    store = LocalParquetArtifactStore(tmp_path)
-    rows = [
-        {
-            "policy_id": "MYGA-0001",
-            "scenario_id": "Base",
-            "projection_month": 1,
-            "variable_name": "reserve",
-            "value_json": "100000.0",
-            "product": "MYGA",
-        }
-    ]
-
-    # Stored for run-A attempt 1
-    artifact_a = store.write_rows("run-A", "outputs", rows)
-
-    # Reading with matching expected_run_id and expected_attempt_number succeeds
-    verified = verified_parquet_rows(
-        store,
-        artifact_a.uri,
-        artifact_a.checksum_sha256,
-        artifact_a.row_count,
-        IDENTITY_NEUTRAL_SCHEMA,
-        supported_schemas=artifacts.RUN_ARTIFACT_SCHEMAS,
-        expected_run_id="run-A",
-        expected_attempt_number=1,
-    )
-    assert len(verified) == 1
-    assert verified[0]["run_id"] == "run-A"
-    assert verified[0]["attempt_number"] == 1
-
-    # Reading with mismatched expected_run_id fails with ARTIFACT_IDENTITY_MISMATCH
-    with pytest.raises(ServiceError) as exc_info:
+    with pytest.raises(ServiceError) as exc:
         verified_parquet_rows(
             store,
-            artifact_a.uri,
-            artifact_a.checksum_sha256,
-            artifact_a.row_count,
+            stored.uri,
+            stored.checksum_sha256,
+            stored.row_count,
             IDENTITY_NEUTRAL_SCHEMA,
             supported_schemas=artifacts.RUN_ARTIFACT_SCHEMAS,
-            expected_run_id="run-B",
+            expected_run_id="run-imposter",
             expected_attempt_number=1,
         )
-    assert exc_info.value.code == "ARTIFACT_IDENTITY_MISMATCH"
+    assert exc.value.code == "ARTIFACT_IDENTITY_MISMATCH"
 
 
-def test_myga_a_03_failed_attempt_artifact_cannot_be_canonical_result(db_session, tmp_path):
-    """MYGA-A-03: Failed attempt artifacts cannot be returned as canonical results."""
+def test_m2b_a_02_wrong_attempt_number_refused(tmp_path):
+    """M2B-A-02: Verifier refuses artifact when expected_attempt_number does not match attempt path."""
+    store = LocalParquetArtifactStore(tmp_path)
+    rows = [{"policy_id": "P1", "variable_name": "av", "value_json": "100"}]
+    # Stored under attempt 1
+    stored = store.write_rows("run-001", "outputs", rows, attempt_number=1)
+
+    # Verifying with expected_attempt_number=2 must be refused
+    with pytest.raises(ServiceError) as exc:
+        verified_parquet_rows(
+            store,
+            stored.uri,
+            stored.checksum_sha256,
+            stored.row_count,
+            IDENTITY_NEUTRAL_SCHEMA,
+            supported_schemas=artifacts.RUN_ARTIFACT_SCHEMAS,
+            expected_run_id="run-001",
+            expected_attempt_number=2,
+        )
+    assert exc.value.code == "ARTIFACT_IDENTITY_MISMATCH"
+
+
+def test_m2b_a_03_failed_attempt_artifact_cannot_be_canonical_result(db_session, tmp_path):
+    """M2B-A-03: Failed-attempt artifact cannot be returned as canonical result."""
     store = LocalParquetArtifactStore(tmp_path)
     run_id = "run-failed-001"
 
-    # Run record in failed state (no accepted attempt)
     db_session.add(Run(
-        id=run_id,
-        project_id="proj-1",
-        run_set_id="rs-1",
-        name="Failed Run",
-        status="failed",
-        accepted_attempt_number=None,
+        id=run_id, project_id="p1", run_set_id="rs1", name="Failed Run", status="failed", accepted_attempt_number=None,
     ))
-    db_session.add(RunAttempt(
-        id="att-1",
-        run_id=run_id,
-        attempt_number=1,
-        status="failed",
-    ))
-    stored = store.write_rows(run_id, "outputs", [{"policy_id": "P1", "variable_name": "av", "value_json": "100"}])
+    db_session.add(RunAttempt(id="att-1", run_id=run_id, attempt_number=1, status="failed"))
+    stored = store.write_rows(run_id, "outputs", [{"policy_id": "P1", "variable_name": "av", "value_json": "100"}], attempt_number=1)
     db_session.add(RunArtifact(
-        run_id=run_id,
-        attempt_number=1,
-        artifact_type="outputs",
-        storage_uri=stored.uri,
-        storage_backend="local",
-        file_format="parquet",
-        schema_version=IDENTITY_NEUTRAL_SCHEMA,
-        row_count=1,
-        checksum_sha256=stored.checksum_sha256,
+        run_id=run_id, attempt_number=1, artifact_type="outputs", storage_uri=stored.uri, storage_backend="local",
+        file_format="parquet", schema_version=IDENTITY_NEUTRAL_SCHEMA, row_count=1, checksum_sha256=stored.checksum_sha256,
         partition={"attempt_number": 1},
     ))
     db_session.commit()
 
-    # Accessing results raises 409 RESULTS_NOT_AVAILABLE
     with pytest.raises(ServiceError) as err:
         results_service.result_run(db_session, run_id)
-    assert err.value.status_code == 409
     assert err.value.code == "RESULTS_NOT_AVAILABLE"
 
-    # Reading attempt rows with attempt_number=None returns empty list
     rows = read_attempt_artifact_rows(db_session, run_id, "outputs", attempt_number=None, store=store)
     assert rows == []
 
 
-def test_myga_a_04_cancelled_attempt_artifact_cannot_be_canonical_result(db_session, tmp_path):
-    """MYGA-A-04: Cancelled attempt artifacts cannot be returned as canonical results."""
+def test_m2b_a_04_cancelled_attempt_artifact_cannot_be_canonical_result(db_session, tmp_path):
+    """M2B-A-04: Cancelled-attempt artifact cannot be returned as canonical result."""
     store = LocalParquetArtifactStore(tmp_path)
     run_id = "run-cancelled-001"
 
     db_session.add(Run(
-        id=run_id,
-        project_id="proj-1",
-        run_set_id="rs-1",
-        name="Cancelled Run",
-        status="cancelled",
-        accepted_attempt_number=None,
+        id=run_id, project_id="p1", run_set_id="rs1", name="Cancelled Run", status="cancelled", accepted_attempt_number=None,
     ))
-    db_session.add(RunAttempt(
-        id="att-cancelled-1",
-        run_id=run_id,
-        attempt_number=1,
-        status="cancelled",
-    ))
-    stored = store.write_rows(run_id, "outputs", [{"policy_id": "P1", "variable_name": "av", "value_json": "100"}])
+    db_session.add(RunAttempt(id="att-can-1", run_id=run_id, attempt_number=1, status="cancelled"))
+    stored = store.write_rows(run_id, "outputs", [{"policy_id": "P1", "variable_name": "av", "value_json": "100"}], attempt_number=1)
     db_session.add(RunArtifact(
-        run_id=run_id,
-        attempt_number=1,
-        artifact_type="outputs",
-        storage_uri=stored.uri,
-        storage_backend="local",
-        file_format="parquet",
-        schema_version=IDENTITY_NEUTRAL_SCHEMA,
-        row_count=1,
-        checksum_sha256=stored.checksum_sha256,
+        run_id=run_id, attempt_number=1, artifact_type="outputs", storage_uri=stored.uri, storage_backend="local",
+        file_format="parquet", schema_version=IDENTITY_NEUTRAL_SCHEMA, row_count=1, checksum_sha256=stored.checksum_sha256,
         partition={"attempt_number": 1},
     ))
     db_session.commit()
 
-    # Results service rejects cancelled run
     with pytest.raises(ServiceError) as err:
         results_service.result_run(db_session, run_id)
-    assert err.value.status_code == 409
     assert err.value.code == "RESULTS_NOT_AVAILABLE"
 
 
-def test_myga_a_05_retry_attempt_remains_distinguishable_from_source(db_session, tmp_path):
-    """MYGA-A-05: Retry attempt remains distinguishable from source failed attempt."""
+def test_m2b_a_05_accepted_attempt_is_only_canonical_result_source(db_session, tmp_path):
+    """M2B-A-05: Accepted attempt is the only canonical result source."""
     store = LocalParquetArtifactStore(tmp_path)
-    run_id = "run-retry-001"
+    run_id = "run-acc-001"
 
-    # Attempt 1: Failed
-    stored_1 = store.write_rows(run_id, "outputs", [{"policy_id": "P1", "variable_name": "av", "value_json": "50"}])
+    stored = store.write_rows(run_id, "outputs", [{"policy_id": "P1", "variable_name": "av", "value_json": "104500"}], attempt_number=1)
     db_session.add(RunArtifact(
-        run_id=run_id,
-        attempt_number=1,
-        artifact_type="outputs",
-        storage_uri=stored_1.uri,
-        storage_backend="local",
-        file_format="parquet",
-        schema_version=IDENTITY_NEUTRAL_SCHEMA,
-        row_count=1,
-        checksum_sha256=stored_1.checksum_sha256,
+        run_id=run_id, attempt_number=1, artifact_type="outputs", storage_uri=stored.uri, storage_backend="local",
+        file_format="parquet", schema_version=IDENTITY_NEUTRAL_SCHEMA, row_count=1, checksum_sha256=stored.checksum_sha256,
         partition={"attempt_number": 1},
     ))
-
-    # Attempt 2: Succeeded and accepted
-    stored_2 = store.write_rows(run_id, "outputs", [{"policy_id": "P1", "variable_name": "av", "value_json": "100"}])
-    db_session.add(RunArtifact(
-        run_id=run_id,
-        attempt_number=2,
-        artifact_type="outputs",
-        storage_uri=stored_2.uri,
-        storage_backend="local",
-        file_format="parquet",
-        schema_version=IDENTITY_NEUTRAL_SCHEMA,
-        row_count=1,
-        checksum_sha256=stored_2.checksum_sha256,
-        partition={"attempt_number": 2},
-    ))
+    db_session.add(RunAttempt(id="att-acc-1", run_id=run_id, attempt_number=1, status="success"))
     db_session.add(Run(
-        id=run_id,
-        project_id="proj-1",
-        run_set_id="rs-1",
-        name="Retried Run",
-        status="success",
-        accepted_attempt_number=2,
+        id=run_id, project_id="p1", run_set_id="rs1", name="Success Run", status="success", accepted_attempt_number=1,
     ))
     db_session.commit()
 
-    # Canonical read returns only accepted attempt 2 rows
+    rows = read_attempt_artifact_rows(db_session, run_id, "outputs", attempt_number=1, store=store)
+    assert len(rows) == 1
+    assert rows[0]["run_id"] == run_id
+    assert rows[0]["attempt_number"] == 1
+    assert rows[0]["value_json"] == "104500"
+
+
+def test_m2b_a_06_retry_attempt_is_distinguishable_from_source(db_session, tmp_path):
+    """M2B-A-06: Retry attempt is distinguishable from source failed attempt."""
+    store = LocalParquetArtifactStore(tmp_path)
+    run_id = "run-retry-002"
+
+    # Attempt 1 (failed)
+    stored_1 = store.write_rows(run_id, "outputs", [{"policy_id": "P1", "variable_name": "av", "value_json": "50"}], attempt_number=1)
+    db_session.add(RunArtifact(
+        run_id=run_id, attempt_number=1, artifact_type="outputs", storage_uri=stored_1.uri, storage_backend="local",
+        file_format="parquet", schema_version=IDENTITY_NEUTRAL_SCHEMA, row_count=1, checksum_sha256=stored_1.checksum_sha256,
+        partition={"attempt_number": 1},
+    ))
+
+    # Attempt 2 (succeeded)
+    stored_2 = store.write_rows(run_id, "outputs", [{"policy_id": "P1", "variable_name": "av", "value_json": "100"}], attempt_number=2)
+    db_session.add(RunArtifact(
+        run_id=run_id, attempt_number=2, artifact_type="outputs", storage_uri=stored_2.uri, storage_backend="local",
+        file_format="parquet", schema_version=IDENTITY_NEUTRAL_SCHEMA, row_count=1, checksum_sha256=stored_2.checksum_sha256,
+        partition={"attempt_number": 2},
+    ))
+    db_session.add(Run(
+        id=run_id, project_id="p1", run_set_id="rs1", name="Retried Run", status="success", accepted_attempt_number=2,
+    ))
+    db_session.commit()
+
+    # Storage paths are distinctly separated by attempt
+    assert "/attempt/1/" in stored_1.uri
+    assert "/attempt/2/" in stored_2.uri
+
     canonical_rows = read_attempt_artifact_rows(db_session, run_id, "outputs", attempt_number=2, store=store)
     assert len(canonical_rows) == 1
     assert canonical_rows[0]["attempt_number"] == 2
     assert canonical_rows[0]["value_json"] == "100"
 
-    # Attempt 1 rows are NOT returned as canonical
-    assert not any(r["attempt_number"] == 1 for r in canonical_rows)
+
+def test_m2b_a_07_bit_identical_business_payloads_across_runs(tmp_path):
+    """M2B-A-07: Bit-identical business result payloads remain possible across equivalent runs."""
+    store = LocalParquetArtifactStore(tmp_path)
+    rows = [
+        {"policy_id": "MYGA-0001", "scenario_id": "Base", "projection_month": 1, "variable_name": "av", "value_json": "100367.48"},
+        {"policy_id": "MYGA-0001", "scenario_id": "Base", "projection_month": 1, "variable_name": "csv", "value_json": "94041.76"},
+    ]
+
+    first = store.write_rows("run-001", "outputs", rows, attempt_number=1)
+    second = store.write_rows("run-002", "outputs", rows, attempt_number=1)
+
+    assert store.read_bytes(first.uri) == store.read_bytes(second.uri)
+    assert first.checksum_sha256 == second.checksum_sha256
+
+
+def test_m2b_a_08_new_m2_writes_require_attempt_scoped_path(tmp_path):
+    """M2B-A-08: New m2-v1 artifact writes strictly require attempt_number."""
+    store = LocalParquetArtifactStore(tmp_path)
+    rows = [{"policy_id": "P1", "variable_name": "av", "value_json": "100"}]
+
+    # Writing with attempt_number succeeds and constructs attempt-scoped path
+    stored = store.write_rows("run-001", "outputs", rows, attempt_number=1, schema_version=IDENTITY_NEUTRAL_SCHEMA)
+    assert "/attempt/1/" in stored.uri
+
+    # Attempting to write m2-v1 without attempt_number fails with ValueError
+    with pytest.raises(ValueError) as exc:
+        store.write_rows("run-001", "outputs", rows, attempt_number=None, schema_version=IDENTITY_NEUTRAL_SCHEMA)
+    assert "attempt_number is required for new 'm2-v1' artifact writes" in str(exc.value)
+

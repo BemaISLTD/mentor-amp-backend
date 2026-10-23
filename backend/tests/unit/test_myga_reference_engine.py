@@ -15,7 +15,6 @@ if str(REPO_ROOT) not in sys.path:
 from app.products.myga_reference.metadata import (
     ENGINE_CROSSCHECK_TOLERANCE,
     INTERNAL_ARITHMETIC_PRECISION,
-    LIFELIB_MYGA_REFERENCE,
     MYGA_DEVELOPMENT_REFERENCE,
 )
 from tools.myga_reference_crosscheck.myga_crosscheck import (
@@ -60,8 +59,9 @@ def test_myga_fixture_schema_and_metadata():
     assert "net_withdrawal_benefit" in config["compared_outputs"]
     assert "net_insurer_cash_flow" in config["compared_outputs"]
 
-    # Verify backwards compatibility alias
-    assert LIFELIB_MYGA_REFERENCE == MYGA_DEVELOPMENT_REFERENCE
+    # Verify stale LifeLib alias is removed from metadata module
+    import app.products.myga_reference.metadata as meta
+    assert not hasattr(meta, "LIFELIB_MYGA_REFERENCE")
 
 
 def test_myga_anchor_account_value_rollforward_precision(fixture_data):
@@ -83,12 +83,13 @@ def test_myga_anchor_account_value_rollforward_precision(fixture_data):
         # 1. BOM balance check
         assert math.isclose(av, expected_av_bom, abs_tol=INTERNAL_ARITHMETIC_PRECISION)
 
-        # 2. Monthly interest crediting check
-        calculated_interest = av * monthly_rate
+        # 2. Monthly interest crediting check (BOM withdrawal timing: interest credited on balance after withdrawal)
+        av_before_credit = av - gross_wd
+        calculated_interest = av_before_credit * monthly_rate
         assert math.isclose(calculated_interest, expected_interest, abs_tol=INTERNAL_ARITHMETIC_PRECISION)
 
         # 3. EOM balance after gross withdrawal check
-        av = av + calculated_interest - gross_wd
+        av = av_before_credit + calculated_interest
         assert math.isclose(av, expected_av_eom, abs_tol=INTERNAL_ARITHMETIC_PRECISION)
 
     # 4. Diagnostics check at Month 60 (5 years)
@@ -138,9 +139,10 @@ def test_myga_mgsv_nonforfeiture_contractual_floor(fixture_data):
 
     mgsv = premium * mgsv_load
     for row in anchor["rows"]:
-        interest = mgsv * m_mgsv_rate
         gross_wd = row["gross_withdrawal"]
-        mgsv = mgsv + interest - gross_wd
+        mgsv_base = max(0.0, mgsv - gross_wd)
+        interest = mgsv_base * m_mgsv_rate
+        mgsv = mgsv_base + interest
 
         assert math.isclose(mgsv, row["mgsv_eom"], abs_tol=INTERNAL_ARITHMETIC_PRECISION)
         # Cash Surrender Value must never be lower than the contractual MGSV floor
@@ -179,7 +181,7 @@ def test_myga_sample_inforce_and_schedules_integrity():
 
 
 def test_myga_sample_data_generator_reproducibility():
-    """Verify deterministic generator produces valid reproducible reference tables."""
+    """Verify deterministic generator produces byte-identical canonical reference tables."""
     import importlib.util
 
     gen_path = BACKEND_DIR / "scripts" / "generate_myga_samples.py"
@@ -195,10 +197,16 @@ def test_myga_sample_data_generator_reproducibility():
         module.generate_surrender_charge_tables(tmppath)
         module.generate_inforce(tmppath / "synthetic_myga_inforce.csv")
 
-        # Verify generated files exist and contain expected row counts
-        assert (tmppath / "myga_surrender_charge.csv").is_file()
-        assert (tmppath / "myga_sc_age_cap.csv").is_file()
-        assert (tmppath / "synthetic_myga_inforce.csv").is_file()
+        # True sample reproducibility check: byte-for-byte canonical equality
+        for filename in ("myga_surrender_charge.csv", "myga_sc_age_cap.csv", "synthetic_myga_inforce.csv"):
+            gen_file = tmppath / filename
+            com_file = SAMPLES_DIR / filename
+            assert gen_file.is_file(), f"Generator failed to produce {filename}"
+            assert com_file.is_file(), f"Committed reference file missing: {filename}"
+
+            gen_text = gen_file.read_text(encoding="utf-8").replace("\r\n", "\n")
+            com_text = com_file.read_text(encoding="utf-8").replace("\r\n", "\n")
+            assert gen_text == com_text, f"Generated {filename} differs from committed reference data"
 
 
 # =============================================================================
@@ -460,6 +468,12 @@ def test_f06_malformed_expected_fixture_triggers_reference_fixture_invalid(base_
     assert res_dupe["status"] == "REFERENCE_FIXTURE_INVALID"
     assert any("Duplicate key in expected fixture" in err for err in res_dupe["errors"])
 
+    # 5. Expected rows with discontinuous/missing months (e.g. Month 30 missing from 60-month series)
+    gap_rows = [copy.deepcopy(r) for r in base_rows if r["month"] != 30]
+    res_gap = reconcile_ledger(actual_rows=base_rows, expected_rows=gap_rows)
+    assert res_gap["status"] == "REFERENCE_FIXTURE_INVALID"
+    assert any("discontinuous or missing months" in err for err in res_gap["errors"])
+
 
 def test_f07_excess_withdrawal_description_matches_arithmetic(fixture_data):
     """F-07: Descriptive metadata in excess_withdrawal_case must not drift from actual arithmetic.
@@ -521,3 +535,47 @@ def test_f09_contractual_waiver_naming_convention():
     assert "rmd_statutory" not in gen_content
     assert "statutory waiver provisions" not in gen_content
     assert "rmd_waiver" in gen_content
+
+
+def test_conditional_provenance_rules():
+    """Verify that external reference benchmark requires commit SHA while internal development reference allows None."""
+    from datetime import date
+    from pydantic import ValidationError
+    from app.core.reference_model_metadata import ReferenceModelMetadata, ReferenceSource
+
+    # Internal reference: commit=None is valid
+    internal = ReferenceModelMetadata(
+        classification="mentoramp_simplified_development_reference",
+        source=ReferenceSource(
+            provider="MentorAmp Development Team",
+            library="mentoramp-actuarial-reference",
+            model="MYGA_SIMPLIFIED_DEVELOPMENT_REFERENCE",
+            release="v1.0",
+            commit=None,
+            retrieved_on=date(2026, 10, 18),
+            documentation_urls=("https://example.com",),
+        ),
+        compared_outputs=("account_value_eom",),
+        excluded_uses=("pricing",),
+        limitations=("internal only",),
+    )
+    assert internal.source.commit is None
+
+    # External benchmark: commit=None MUST raise ValidationError
+    with pytest.raises(ValidationError) as exc_info:
+        ReferenceModelMetadata(
+            classification="external_development_benchmark",
+            source=ReferenceSource(
+                provider="External Team",
+                library="external-lib",
+                model="EXTERNAL_BENCHMARK",
+                release="v1.0",
+                commit=None,
+                retrieved_on=date(2026, 10, 18),
+                documentation_urls=("https://example.com",),
+            ),
+            compared_outputs=("account_value_eom",),
+            excluded_uses=("pricing",),
+            limitations=("external benchmark",),
+        )
+    assert "An external development benchmark must have a pinned commit SHA." in str(exc_info.value)

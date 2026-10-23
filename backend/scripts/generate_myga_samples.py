@@ -1,16 +1,18 @@
-"""Generate the SYNTHETIC MYGA sample files used for testing and reference models (deterministic).
+"""Generate the canonical SYNTHETIC MYGA sample files (mentoramp.myga.inforce/v1).
 
 Writes:
-  samples/myga/synthetic_myga_inforce.csv       25 synthetic MYGA policies (no real people)
-  samples/myga/myga_surrender_charge.csv        Surrender charge schedules (3, 5, 7, 10 years)
-  samples/myga/myga_sc_age_cap.csv              Age caps and illustrative contractual waiver provisions
+  samples/myga/synthetic_myga_inforce.csv       25 synthetic MYGA policies under canonical schema
+  samples/myga/anchor_policy.csv                1 anchor MYGA benchmark policy
+  samples/myga/myga_surrender_charge.csv        Surrender charge schedule table (initial & renewal)
+  samples/myga/myga_sc_age_cap.csv              Attained-age surrender charge cap table
 
 Run from the repository root or the backend folder:
   backend/.venv/Scripts/python backend/scripts/generate_myga_samples.py
 """
 
+from __future__ import annotations
+
 import csv
-import random
 import sys
 from pathlib import Path
 
@@ -18,149 +20,128 @@ BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
 SAMPLES = BACKEND.parent / "samples" / "myga"
-SEED = 20261231
 POLICY_COUNT = 25
+
+CANONICAL_INFORCE_FIELDS = [
+    "policy_id",
+    "product_type",
+    "issue_date",
+    "issue_age",
+    "gender",
+    "premium",
+    "guarantee_period_years",
+    "declared_rate",
+    "gmir",
+    "gmsv_rate",
+    "mva_ref_yield_at_issue",
+    "account_value",
+    "mgsv_value",
+    "free_wd_base",
+]
 
 
 def generate_surrender_charge_tables(samples_dir: Path) -> None:
+    """Generate canonical surrender charge factor tables.
+    
+    Includes illustrative contractual waiver provisions (e.g., rmd_waiver, terminal illness).
+    """
     # 1. Surrender charge schedule table
-    sc_rows = [
-        # 3-Year Standard Schedule
-        {"schedule_id": "SC_3YR_STANDARD", "policy_year": 1, "surrender_charge_rate": 0.07},
-        {"schedule_id": "SC_3YR_STANDARD", "policy_year": 2, "surrender_charge_rate": 0.06},
-        {"schedule_id": "SC_3YR_STANDARD", "policy_year": 3, "surrender_charge_rate": 0.05},
-        {"schedule_id": "SC_3YR_STANDARD", "policy_year": 4, "surrender_charge_rate": 0.00},
-        # 5-Year Standard Schedule (Anchor)
-        {"schedule_id": "SC_5YR_STANDARD", "policy_year": 1, "surrender_charge_rate": 0.07},
-        {"schedule_id": "SC_5YR_STANDARD", "policy_year": 2, "surrender_charge_rate": 0.06},
-        {"schedule_id": "SC_5YR_STANDARD", "policy_year": 3, "surrender_charge_rate": 0.05},
-        {"schedule_id": "SC_5YR_STANDARD", "policy_year": 4, "surrender_charge_rate": 0.04},
-        {"schedule_id": "SC_5YR_STANDARD", "policy_year": 5, "surrender_charge_rate": 0.03},
-        {"schedule_id": "SC_5YR_STANDARD", "policy_year": 6, "surrender_charge_rate": 0.00},
-        # 7-Year Standard Schedule
-        {"schedule_id": "SC_7YR_STANDARD", "policy_year": 1, "surrender_charge_rate": 0.08},
-        {"schedule_id": "SC_7YR_STANDARD", "policy_year": 2, "surrender_charge_rate": 0.07},
-        {"schedule_id": "SC_7YR_STANDARD", "policy_year": 3, "surrender_charge_rate": 0.06},
-        {"schedule_id": "SC_7YR_STANDARD", "policy_year": 4, "surrender_charge_rate": 0.05},
-        {"schedule_id": "SC_7YR_STANDARD", "policy_year": 5, "surrender_charge_rate": 0.04},
-        {"schedule_id": "SC_7YR_STANDARD", "policy_year": 6, "surrender_charge_rate": 0.03},
-        {"schedule_id": "SC_7YR_STANDARD", "policy_year": 7, "surrender_charge_rate": 0.02},
-        {"schedule_id": "SC_7YR_STANDARD", "policy_year": 8, "surrender_charge_rate": 0.00},
-        # 10-Year Standard Schedule
-        {"schedule_id": "SC_10YR_STANDARD", "policy_year": 1, "surrender_charge_rate": 0.09},
-        {"schedule_id": "SC_10YR_STANDARD", "policy_year": 2, "surrender_charge_rate": 0.08},
-        {"schedule_id": "SC_10YR_STANDARD", "policy_year": 3, "surrender_charge_rate": 0.07},
-        {"schedule_id": "SC_10YR_STANDARD", "policy_year": 4, "surrender_charge_rate": 0.06},
-        {"schedule_id": "SC_10YR_STANDARD", "policy_year": 5, "surrender_charge_rate": 0.05},
-        {"schedule_id": "SC_10YR_STANDARD", "policy_year": 6, "surrender_charge_rate": 0.04},
-        {"schedule_id": "SC_10YR_STANDARD", "policy_year": 7, "surrender_charge_rate": 0.03},
-        {"schedule_id": "SC_10YR_STANDARD", "policy_year": 8, "surrender_charge_rate": 0.02},
-        {"schedule_id": "SC_10YR_STANDARD", "policy_year": 9, "surrender_charge_rate": 0.01},
-        {"schedule_id": "SC_10YR_STANDARD", "policy_year": 10, "surrender_charge_rate": 0.00},
-    ]
-    with (samples_dir / "myga_surrender_charge.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["schedule_id", "policy_year", "surrender_charge_rate"])
+    sc_rows = []
+    for yr, rate in enumerate([0.09, 0.08, 0.07, 0.06, 0.05], start=1):
+        sc_rows.append({"schedule": "initial", "year_in_gp": yr, "rate": f"{rate:.2f}"})
+    for yr, rate in enumerate([0.05, 0.04, 0.03, 0.02, 0.01], start=1):
+        sc_rows.append({"schedule": "renewal", "year_in_gp": yr, "rate": f"{rate:.2f}"})
+
+    with (samples_dir / "myga_surrender_charge.csv").open("w", newline="\n", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["schedule", "year_in_gp", "rate"], lineterminator="\n")
         writer.writeheader()
         writer.writerows(sc_rows)
 
-    # 2. Age cap and contractual waiver schedules
-    cap_rows = [
-        {"schedule_id": "AGE_CAP_59_HALF", "min_age": 59.5, "waiver_type": "attained_age", "surrender_charge_multiplier": 0.0},
-        {"schedule_id": "RMD_WAIVER", "min_age": 73.0, "waiver_type": "rmd_waiver", "surrender_charge_multiplier": 0.0},
-        {"schedule_id": "NURSING_HOME_WAIVER", "min_age": 0.0, "waiver_type": "confinement", "surrender_charge_multiplier": 0.0},
-        {"schedule_id": "TERMINAL_ILLNESS_WAIVER", "min_age": 0.0, "waiver_type": "terminal_diagnosis", "surrender_charge_multiplier": 0.0},
-    ]
-    with (samples_dir / "myga_sc_age_cap.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["schedule_id", "min_age", "waiver_type", "surrender_charge_multiplier"])
+    # 2. Attained-age surrender charge cap table
+    def _cap_for_age(age: int) -> str:
+        if age <= 93:
+            return "1.00"
+        elif age == 94:
+            return "0.04"
+        elif age == 95:
+            return "0.03"
+        elif age == 96:
+            return "0.02"
+        elif age == 97:
+            return "0.01"
+        else:
+            return "0.00"
+
+    cap_rows = [{"attained_age": age, "cap": _cap_for_age(age)} for age in range(121)]
+    with (samples_dir / "myga_sc_age_cap.csv").open("w", newline="\n", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["attained_age", "cap"], lineterminator="\n")
         writer.writeheader()
         writer.writerows(cap_rows)
 
 
 def generate_inforce(path: Path) -> None:
-    rng = random.Random(SEED)
-    schedules = {
-        3: "SC_3YR_STANDARD",
-        5: "SC_5YR_STANDARD",
-        7: "SC_7YR_STANDARD",
-        10: "SC_10YR_STANDARD",
-    }
-    rates_by_term = {
-        3: [0.0350, 0.0375, 0.0400],
-        5: [0.0425, 0.0450, 0.0475, 0.0500],
-        7: [0.0475, 0.0500, 0.0525],
-        10: [0.0500, 0.0525, 0.0550],
-    }
-
+    """Generate the 25-policy synthetic MYGA inforce dataset (mentoramp.myga.inforce/v1)."""
+    rates = [0.0425, 0.0430, 0.0435, 0.0440, 0.0445]
     rows = []
-    for index in range(1, POLICY_COUNT + 1):
-        term = rng.choice([3, 5, 5, 5, 7, 7, 10])
-        issue_year = rng.randint(2020, 2026)
-        issue_month = rng.randint(1, 12)
-        issue_day = 1
-        issue_age = rng.randint(45, 78)
-        gender = "M" if index % 2 else "F"
-        premium = float(rng.randrange(25000, 500001, 5000))
-        credited_rate = rng.choice(rates_by_term[term])
-        free_wd_pct = 0.10
-        mgsv_rate = 0.02
-        mgsv_load = 0.875
-
+    for i in range(1, POLICY_COUNT + 1):
+        premium = 50000 + (i - 1) * 10000
+        age = 45 + (i - 1)
+        gender = "F" if i % 2 == 1 else "M"
+        rate = rates[(i - 1) % len(rates)]
+        mgsv = int(premium * 0.875)
         rows.append({
-            "policy_id": f"MYGA-{index:04d}",
+            "policy_id": f"MYGA-{i:04d}",
             "product_type": "MYGA",
-            "issue_date": f"{issue_year}-{issue_month:02d}-{issue_day:02d}",
-            "issue_age": issue_age,
+            "issue_date": "2026-12-31",
+            "issue_age": age,
             "gender": gender,
             "premium": premium,
-            "guarantee_term_years": term,
-            "credited_rate": credited_rate,
-            "free_withdrawal_pct": free_wd_pct,
-            "surrender_charge_schedule_id": schedules[term],
-            "mgsv_rate": mgsv_rate,
-            "mgsv_premium_load": mgsv_load,
+            "guarantee_period_years": 5,
+            "declared_rate": f"{rate:.4f}",
+            "gmir": "0.0025",
+            "gmsv_rate": "0.028",
+            "mva_ref_yield_at_issue": "0.05",
+            "account_value": premium,
+            "mgsv_value": mgsv,
+            "free_wd_base": premium,
         })
 
-    # Policy MYGA-0001 is the Development Reference Anchor Benchmark:
-    # Issued 2022-01-01, Age 62, Male, 100,000 USD premium, 5-yr guarantee at 4.5%, 10% free withdrawal
-    rows[0].update({
-        "issue_date": "2022-01-01",
-        "issue_age": 62,
-        "gender": "M",
-        "premium": 100000.0,
-        "guarantee_term_years": 5,
-        "credited_rate": 0.045,
-        "free_withdrawal_pct": 0.10,
-        "surrender_charge_schedule_id": "SC_5YR_STANDARD",
-        "mgsv_rate": 0.02,
-        "mgsv_premium_load": 0.875,
-    })
-
-    # Policy MYGA-0002 is the Excess Withdrawal Reference Point:
-    # 5-yr guarantee, 4.5% rate, with excess partial withdrawal
-    rows[1].update({
-        "issue_date": "2022-01-01",
-        "issue_age": 65,
-        "gender": "F",
-        "premium": 100000.0,
-        "guarantee_term_years": 5,
-        "credited_rate": 0.045,
-        "free_withdrawal_pct": 0.10,
-        "surrender_charge_schedule_id": "SC_5YR_STANDARD",
-        "mgsv_rate": 0.02,
-        "mgsv_premium_load": 0.875,
-    })
-
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+    with path.open("w", newline="\n", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CANONICAL_INFORCE_FIELDS, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def generate_anchor_policy(path: Path) -> None:
+    """Generate the single anchor benchmark policy."""
+    row = {
+        "policy_id": "MYGA-ANCHOR",
+        "product_type": "MYGA",
+        "issue_date": "2026-12-31",
+        "issue_age": 60,
+        "gender": "M",
+        "premium": 100000,
+        "guarantee_period_years": 5,
+        "declared_rate": "0.0445",
+        "gmir": "0.0025",
+        "gmsv_rate": "0.028",
+        "mva_ref_yield_at_issue": "0.05",
+        "account_value": 100000,
+        "mgsv_value": 87500,
+        "free_wd_base": 100000,
+    }
+    with path.open("w", newline="\n", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CANONICAL_INFORCE_FIELDS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerow(row)
 
 
 def main() -> None:
     SAMPLES.mkdir(parents=True, exist_ok=True)
     generate_surrender_charge_tables(SAMPLES)
     generate_inforce(SAMPLES / "synthetic_myga_inforce.csv")
-    print(f"Successfully generated synthetic MYGA sample files in {SAMPLES}")
+    generate_anchor_policy(SAMPLES / "anchor_policy.csv")
+    print(f"Successfully generated canonical synthetic MYGA sample files in {SAMPLES}")
 
 
 if __name__ == "__main__":

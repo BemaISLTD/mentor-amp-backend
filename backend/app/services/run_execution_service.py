@@ -383,7 +383,13 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                         "lookup_keys_json": json.dumps(row.get("lookup_keys"), sort_keys=True, default=str),
                         "error_message": row.get("error_message"),
                     })
-            stored = store.write_rows(run.id, artifact_type, encoded)
+            stored = store.write_rows(
+                run.id,
+                artifact_type,
+                encoded,
+                attempt_number=attempt.attempt_number,
+                schema_version=IDENTITY_NEUTRAL_SCHEMA,
+            )
             db.add(RunArtifact(
                 run_id=run.id,
                 attempt_number=attempt.attempt_number,

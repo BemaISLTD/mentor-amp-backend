@@ -559,24 +559,49 @@ def _validate_inforce(row: ImportSession, rows: list[dict[str, Any]],
     _required_and_types(rows, COMMON_INFORCE_FIELDS, issues)
     columns = set(rows[0]) if rows else set()
     products_present: set[str] = set()
+    schema_ver = (row.options or {}).get("schema_version") or (row.options or {}).get("input_schema_version")
     for number, item in enumerate(rows, start=1):
         product_type = str(item.get("product_type") or "").strip().upper()
         item["product_type"] = product_type
-        defn = get_product_inforce_definition(product_type)
+        defn = get_product_inforce_definition(product_type, schema_ver)
         if defn is None:
             if product_type:
-                issues.append(_issue(
-                    "error", "INVALID_PRODUCT_TYPE",
-                    f"Unsupported product_type '{product_type}'.",
-                    number, "product_type", product_type,
-                ))
+                if schema_ver and get_product_inforce_definition(product_type) is not None:
+                    issues.append(_issue(
+                        "error", "INFORCE_SCHEMA_VERSION_NOT_SUPPORTED",
+                        f"Schema version '{schema_ver}' is not supported for product '{product_type}'.",
+                        number, "schema_version", schema_ver,
+                    ))
+                else:
+                    issues.append(_issue(
+                        "error", "INVALID_PRODUCT_TYPE",
+                        f"Unsupported product_type '{product_type}'.",
+                        number, "product_type", product_type,
+                    ))
             continue
         products_present.add(product_type)
 
-        # Apply column aliases if alias was mapped
+        # Apply and canonicalize column aliases before validation and fingerprinting
         for alias, canonical in defn.aliases.items():
-            if canonical not in item and alias in item:
+            if alias in item and canonical in item:
+                alias_val = item[alias]
+                canon_val = item[canonical]
+                disagrees = False
+                try:
+                    disagrees = not math.isclose(float(alias_val), float(canon_val), abs_tol=1e-9)
+                except (ValueError, TypeError):
+                    disagrees = str(alias_val).strip() != str(canon_val).strip()
+                if disagrees:
+                    issues.append(_issue(
+                        "error", "ALIAS_CONFLICT",
+                        f"Field '{canonical}' ({canon_val}) and alias '{alias}' ({alias_val}) have conflicting values.",
+                        number, canonical, canon_val,
+                    ))
+                # Remove alias duplicate so canonical row contains only canonical column
+                del item[alias]
+            elif alias in item and canonical not in item:
                 item[canonical] = item[alias]
+                del item[alias]
 
         product_fields = {
             field: kind for field, kind in defn.fields.items()
@@ -617,7 +642,7 @@ def _validate_inforce(row: ImportSession, rows: list[dict[str, Any]],
         if defn.validate_row:
             defn.validate_row(number, item, issues)
     for product_type in sorted(products_present):
-        defn = get_product_inforce_definition(product_type)
+        defn = get_product_inforce_definition(product_type, schema_ver)
         if defn:
             for field in defn.fields:
                 alias_present = any(alias in columns for alias, canon in defn.aliases.items() if canon == field)
@@ -640,7 +665,7 @@ def _validate_inforce(row: ImportSession, rows: list[dict[str, Any]],
             issues.append(_issue("warning", "RANGE_WARNING", "issue_age is outside 0–120.",
                                  number, "issue_age", age))
         product_type = str(item.get("product_type") or "").upper()
-        defn = get_product_inforce_definition(product_type)
+        defn = get_product_inforce_definition(product_type, schema_ver)
         amount_fields = defn.amount_fields if defn else ("premium",)
         for field in amount_fields:
             value = item.get(field)

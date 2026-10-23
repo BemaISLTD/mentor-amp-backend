@@ -39,3 +39,38 @@ backend/mentoramp_backup_*.zip
 
 # Frontend is maintained as a separate Git repository
 /MentorAmp-frontend/
+
+# Temporary review packages, audit logs, and local artifacts
+*.zip
+*.patch
+*.lnk
+*.log
+*.tmp
+.disposable_pgdata/
+/authoritative documents/
+/noah_m2b_correction_review/
+/noah_m2b_review/
+latest_user_prompt.md
+alembic_head.txt
+alembic_heads.txt
+git_diff_stat.txt
+git_head_sha.txt
+git_status.txt
+git_log.txt
+git_diff_against_main.patch
+noah_m2b_correction_instructions.txt
+pytest_full_output.txt
+pytest_full_raw_output.txt
+pytest_postgresql_output.txt
+pytest_postgresql_raw_output.txt
+myga_reference_reconciliation_output.txt
+decrement_isolation_test_output.txt
+schema_version_test_output.txt
+artifact_provenance_test_output.txt
+lifelib_status.txt
+mentor_amp_frontend_update.pdf
+MentorAmp_Phase_0_Samuel_Ayinla_Task_Document.md
+MentorAmp_Phase_0_TODO.md
+MENTORAMP_CONTINUATION_HANDOFF.md
+frontend_api_reference.md
+frontend_integration_guide.md

@@ -263,4 +263,9 @@ def build_run_data(
             int(outputs.get("max_traced_policies") or 0),
         ),
         parameters=dict(configuration.get("parameters") or {}),
+        decrement_methodology=(
+            configuration.get("decrement_methodology")
+            or (configuration.get("parameters") or {}).get("decrement_methodology")
+            or (configuration.get("model_version") or {}).get("methodology")
+        ),
     )

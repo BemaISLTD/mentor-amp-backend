@@ -540,6 +540,21 @@ class _PolicyCalculator:
 
     # -- main loop -------------------------------------------------------------------------
     def run(self) -> PolicyResult:
+        token = None
+        dec_method = getattr(self.data, "decrement_methodology", None)
+        if dec_method is None and getattr(self.data, "parameters", None):
+            dec_method = self.data.parameters.get("decrement_methodology")
+        if dec_method is not None:
+            from app.products.myga_lite.decrements import set_execution_decrement_methodology
+            token = set_execution_decrement_methodology(dec_method)
+        try:
+            return self._calculate()
+        finally:
+            if token is not None:
+                from app.products.myga_lite.decrements import reset_execution_decrement_methodology
+                reset_execution_decrement_methodology(token)
+
+    def _calculate(self) -> PolicyResult:
         try:
             for month in range(1, self.data.horizon_months + 1):
                 self.month = month

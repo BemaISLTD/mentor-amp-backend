@@ -20,7 +20,7 @@ class ReferenceSource(BaseModel):
     library: str = Field(min_length=1)
     model: str = Field(min_length=1)
     release: str = Field(min_length=1)
-    commit: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    commit: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{40}$")
     retrieved_on: date
     documentation_urls: tuple[str, ...] = Field(min_length=1)
     generated_by: str | None = None
@@ -51,6 +51,9 @@ class ReferenceModelMetadata(BaseModel):
             raise ValueError("An external reference model cannot be required at runtime.")
         if self.production_dependency:
             raise ValueError("An external reference model cannot be a production dependency.")
+        if self.classification == "external_development_benchmark":
+            if not self.source.commit:
+                raise ValueError("An external development benchmark must have a pinned commit SHA.")
         return self
 
     def as_configuration(self) -> dict:

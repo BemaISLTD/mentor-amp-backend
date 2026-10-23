@@ -7,6 +7,13 @@ development oracles and are not imported or executed by the application.
 import math
 
 from app.core.formula_engine.formulas import register_function
+from app.products.myga_lite.decrements import (
+    DecrementMethodology,
+    IllustrativeBestEstimateDecrements,
+    get_current_decrement_methodology,
+    reset_decrement_methodology,
+    set_decrement_methodology,
+)
 
 PRODUCT_CODE = "MYGA"
 PRODUCT_NAME = "Five-Year Multi-Year Guaranteed Annuity"
@@ -20,6 +27,7 @@ DEFAULT_DECLARED_RATE = 0.0445
 DEFAULT_GMIR = 0.0025
 DEFAULT_GMSV_RATE = 0.028
 DEFAULT_MVA_REFERENCE_YIELD = 0.05
+# Validation lower bound for illustrative contractual nonforfeiture assumption in MentorAmp development models
 MIN_GMSV_RATE = 0.0015
 
 
@@ -143,10 +151,15 @@ def account_value_close(account_value_before_credit: float, credited_rate: float
     return float(account_value_before_credit) * (1.0 + float(credited_rate)) ** (1.0 / 12.0)
 
 
+def interest_credited(account_value_close: float, account_value_before_credit: float) -> float:
+    """Monthly dollar interest credited to account value."""
+    return float(account_value_close) - float(account_value_before_credit)
+
+
 def mgsv_close(
     mgsv_open: float, withdrawal: float, contract_charge_annual: float, gmsv_rate: float,
 ) -> float:
-    """Month-end statutory floor after gross withdrawal and monthly contract charge."""
+    """Month-end contractual nonforfeiture floor (MGSV) after gross withdrawal and monthly contract charge."""
     if not math.isfinite(float(gmsv_rate)) or gmsv_rate < MIN_GMSV_RATE:
         raise ValueError("GMSV rate must be at least 0.15%")
     base = max(0.0, float(mgsv_open) - float(withdrawal) - float(contract_charge_annual) / 12.0)
@@ -210,17 +223,29 @@ def market_value_adjustment(
 def surrender_value(
     account_value_close: float, market_value_adjustment: float, surrender_charge: float,
 ) -> float:
-    """Contractual surrender amount before applying the statutory floor."""
+    """Contractual surrender amount before applying the contractual nonforfeiture floor."""
     return float(account_value_close) + float(market_value_adjustment) - float(surrender_charge)
 
 
 def surrender_benefit(surrender_value: float, mgsv_close: float) -> float:
-    """Cash surrender benefit after applying the statutory minimum as a lower bound."""
+    """Cash surrender benefit after applying the contractual nonforfeiture floor as a lower bound."""
     return max(float(surrender_value), float(mgsv_close))
 
 
 def death_benefit(account_value_close: float, surrender_benefit: float) -> float:
-    """Death benefit, never below account value or cash surrender benefit."""
+    """Death benefit calculation.
+
+    STATUS: NEEDS ACTUARIAL PRODUCT OWNER DECISION.
+
+    Current development baseline uses Option B: max(account_value_close, surrender_benefit).
+    Options under review for Actuarial Product Owner decision:
+      - Option A: death_benefit = account_value_close
+      - Option B: death_benefit = max(account_value_close, surrender_benefit)
+      - Option C: explicit APO-specified contractual rule
+
+    This formula must not be represented as an approved or final actuarial rule until
+    formally approved by the Actuarial Product Owner.
+    """
     return max(float(account_value_close), float(surrender_benefit))
 
 
@@ -229,33 +254,24 @@ def death_benefit(account_value_close: float, surrender_benefit: float) -> float
 # helpers expand the multi-output decrement and ledger stages for MentorAmp's one-output-per-
 # formula execution contract.
 def statutory_floor_rate(five_year_cmt: float) -> float:
-    """Model #805 corridor: rounded CMT less 1.25%, bounded by 0.15% and 3%."""
+    """Illustrative contractual nonforfeiture corridor: rounded CMT less 1.25%, bounded by 0.15% and 3%."""
     rounded = round(float(five_year_cmt) / 0.0005) * 0.0005
     return min(0.03, max(0.0015, rounded - 0.0125))
 
 
 def monthly_mortality(mortality_rate_annual: float) -> float:
-    """Convert annual mortality to an equivalent monthly probability."""
-    rate = min(1.0, max(0.0, float(mortality_rate_annual)))
-    return 1.0 - (1.0 - rate) ** (1.0 / 12.0)
+    """Convert annual mortality to an equivalent monthly probability via methodology provider."""
+    return get_current_decrement_methodology().get_monthly_mortality(mortality_rate_annual)
 
 
 def gmir_lapse_factor(gmir: float) -> float:
-    """Illustrative fixed-annuity lapse multiplier selected from the GMIR band (illustrative best-estimate, not VM-22 prescribed)."""
-    if gmir <= 0.01:
-        return 1.25
-    if gmir <= 0.025:
-        return 1.0
-    return 0.70
+    """Dynamic lapse multiplier from GMIR via methodology provider."""
+    return get_current_decrement_methodology().get_gmir_lapse_factor(gmir)
 
 
 def base_lapse_rate(policy_year: float, guarantee_period_years: float) -> float:
-    """One percent in-period lapse and a repeating 75% post-expiry shock year."""
-    year = int(policy_year)
-    period = int(guarantee_period_years)
-    if period < 1:
-        raise ValueError("guarantee period must be positive")
-    return 0.75 if year > period and (year - 1) % period == 0 else 0.01
+    """Baseline duration lapse rate via methodology provider."""
+    return get_current_decrement_methodology().get_base_lapse_rate(policy_year, guarantee_period_years)
 
 
 def charge_schedule(guarantee_period_index: float) -> str:
@@ -307,23 +323,20 @@ def annual_lapse_rate(
     dynamic_lapse_rate: float,
     mva_lapse_factor_at: float,
 ) -> float:
-    """Total annual lapse clamped to the 0.5%-90% modeling range."""
-    value = (
-        float(base_lapse_rate) * float(gmir_lapse_factor)
-        + float(dynamic_lapse_rate) * float(mva_lapse_factor_at)
+    """Total annual lapse via methodology provider."""
+    return get_current_decrement_methodology().get_annual_lapse_rate(
+        base_lapse_rate, gmir_lapse_factor, dynamic_lapse_rate, mva_lapse_factor_at
     )
-    return min(0.90, max(0.005, value))
 
 
 def monthly_lapse_rate(annual_lapse_rate: float) -> float:
-    """Convert annual lapse to an equivalent monthly probability."""
-    value = min(1.0, max(0.0, float(annual_lapse_rate)))
-    return 1.0 - (1.0 - value) ** (1.0 / 12.0)
+    """Convert annual lapse to an equivalent monthly probability via methodology provider."""
+    return get_current_decrement_methodology().get_monthly_lapse_rate(annual_lapse_rate)
 
 
 def annuitization_rate(renewal_window: float) -> float:
-    """Illustrative one-percent election rate during the renewal window only."""
-    return 0.01 if renewal_window >= 0.5 else 0.0
+    """Annuitization election rate via methodology provider."""
+    return get_current_decrement_methodology().get_annuitization_rate(renewal_window)
 
 
 def inforce_open(
@@ -562,6 +575,7 @@ _SUPPORT_FUNCTIONS = [
     ("net_cash_flow", net_cash_flow),
     ("discount_factor", discount_factor),
     ("pv_liability_outgo", pv_liability_outgo),
+    ("interest_credited", interest_credited),
 ]
 
 _SUPPORT_EXPRESSIONS = {
@@ -598,6 +612,7 @@ _SUPPORT_EXPRESSIONS = {
     "net_cash_flow": "premium_cash_flow - liability_outgo",
     "discount_factor": "(1 + annual_discount_rate)^(-projection_month/12)",
     "pv_liability_outgo": "liability_outgo * discount_factor",
+    "interest_credited": "av_close - av_before_credit",
 }
 
 
@@ -625,7 +640,7 @@ _FUNCTIONS = [
      "Carries the policy account balance forward month by month."),
     ("mgsv_open", mgsv_open,
      "mgsv_open = input floor in month 1; otherwise prior mgsv_close",
-     "Carries the statutory floor forward independently from account value."),
+     "Carries the contractual nonforfeiture floor forward independently from account value."),
     ("free_withdrawal_available", free_withdrawal_available,
      "free_available = annual allowance reset less withdrawals used",
      "Tracks the annual value exempt from both charge and MVA."),
@@ -637,7 +652,7 @@ _FUNCTIONS = [
      "Credits one month of effective annual interest."),
     ("mgsv_close", mgsv_close,
      "mgsv_close = max(0, mgsv_open - withdrawal - annual_charge/12) * (1 + gmsv_rate)^(1/12)",
-     "Accumulates the statutory floor after gross withdrawal deduction."),
+     "Accumulates the contractual nonforfeiture floor after gross withdrawal deduction."),
     ("surrender_charge_rate", surrender_charge_rate,
      "charge_rate = 0 in renewal window; otherwise min(schedule_rate, age_cap)",
      "Applies the duration schedule and attained-age cap."),
@@ -658,7 +673,7 @@ _FUNCTIONS = [
      "Combines the account value, MVA, and charge in contractual order."),
     ("surrender_benefit", surrender_benefit,
      "surrender_benefit = max(surrender_value, mgsv_close)",
-     "Applies the statutory floor after MVA and charge."),
+     "Applies the contractual nonforfeiture floor after MVA and charge."),
     ("death_benefit", death_benefit,
      "death_benefit = max(av_close, surrender_benefit)",
      "Prevents the death benefit from falling below account or surrender value."),
@@ -824,9 +839,11 @@ _SUPPORT_FORMULA_DEPS = [
     ("net_cash_flow", ["premium_cash_flow", "liability_outgo"]),
     ("discount_factor", ["discount_rate_annual", "projection_month"]),
     ("pv_liability_outgo", ["liability_outgo", "discount_factor"]),
+    ("interest_credited", ["account_value_close", "account_value_before_credit"]),
 ]
 
 _USD_SUPPORT = {
+    "interest_credited",
     "death_claims", "surrender_claims", "annuitization_transfer", "maturity_benefit",
     "maintenance_expense", "premium_cash_flow", "acquisition_commission",
     "gross_withdrawal", "free_withdrawal_allowance", "chargeable_withdrawal",
@@ -865,7 +882,7 @@ VARIABLES.append({
     "description": "Present value of future illustrative liability outgo.",
 })
 
-for _scenario_name in ("market_rate", "mva_ref_yield", "discount_rate_annual"):
+for _scenario_name in ("market_rate", "mva_ref_yield", "discount_rate_annual", "annual_maintenance_expense", "expense_inflation_rate", "commission_rate"):
     next(item for item in VARIABLES if item["name"] == _scenario_name)["allow_scenario_override"] = True
 
 _PUBLISHED_END_OF_PERIOD = {
