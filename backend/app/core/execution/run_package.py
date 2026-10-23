@@ -266,6 +266,5 @@ def build_run_data(
         decrement_methodology=(
             configuration.get("decrement_methodology")
             or (configuration.get("parameters") or {}).get("decrement_methodology")
-            or (configuration.get("model_version") or {}).get("methodology")
         ),
     )
