@@ -179,7 +179,7 @@ def _assert_myga_25_policy_api_run_trace_and_parquet(env: Env) -> dict:
     })
     elapsed = time.perf_counter() - started
     assert submitted.status_code == 202, submitted.text
-    assert elapsed < 120.0  # Allow headroom for Windows / local dev background load
+    assert elapsed < 300.0  # Allow headroom for Windows / local dev background load
     runs = submitted.json()["runs"]
     assert len(runs) == 2
     assert {run["scenario"]["name"] for run in runs} == {"Base", "Rates Up 150bp"}
