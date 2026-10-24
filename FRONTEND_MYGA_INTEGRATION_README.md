@@ -1,23 +1,30 @@
 # MentorAmp Frontend Integration Guide — MYGA Governed Valuation Engine
 
-This guide details everything the frontend team (Samuel) needs to consume and integrate the newly delivered **5-Year Multi-Year Guarantee Annuity (MYGA)** product workflow.
+| Metadata | Details |
+|---|---|
+| **Target Audience** | Sam Yung (Lead Frontend Engineer) |
+| **From / Reviewer** | Samuel Ayinla (Technical Lead / Core Backend Architecture) |
+| **Product** | 5-Year Multi-Year Guarantee Annuity (MYGA) |
+| **Backend Release** | Milestone 2B (M2B) Merge-Ready Delivery |
+| **API Base Path** | `/v1` |
+| **Backend HEAD SHA** | `5e48606c98b2ae4895cf76d5e9ccf0901bfbd501` |
 
 ---
 
 ## 1. Executive Summary & Flow Overview
 
-MYGA integrates into MentorAmp's existing governed platform workflow. There are **no separate, unversioned, or custom run endpoints** for MYGA. The execution flow follows the exact same 5 stages as SPIA:
+MYGA integrates directly into MentorAmp's existing governed platform workflow. There are **no separate, unversioned, or custom run endpoints** for MYGA. The execution flow follows the exact same 5 stages as SPIA:
 
 ```mermaid
 flowchart LR
-    A["1. Product Discovery<br/>(GET /v1/system/status)"] --> B["2. Data Manager<br/>(Upload & Review)"]
+    A["1. Product Discovery<br/>(GET /v1/system/status)"] --> B["2. Data Manager<br/>(Upload & Approve)"]
     B --> C["3. Projection Set<br/>(Config & Validate)"]
     C --> D["4. Run Execution<br/>(POST /v1/run-sets)"]
-    D --> E["5. Results & Lineage<br/>(Results, Trace, Parquet)"]
+    D --> E["5. Results & Trace<br/>(Summary, Trace, Parquet)"]
 ```
 
 > [!IMPORTANT]
-> **Illustrative Status:** All MYGA runs, summaries, and output schemas carry `illustrative: true`. The frontend must surface this badge across the UI. This model does not make statutory CARVM compliance claims.
+> **Illustrative Status:** All MYGA runs, summaries, and output schemas carry `illustrative: true`. The frontend must surface this badge across the UI. This model uses contractual nonforfeiture floors and illustrative assumptions; it does not claim statutory NAIC Model #805 or VM-22 certifications.
 
 ---
 
@@ -45,7 +52,7 @@ Check available products and engine backends on startup or project load.
     "execution_backend": "declarative_graph",
     "engine_version": "v1.0"
   },
-  "time": "2026-10-22T13:30:00Z"
+  "time": "2026-10-24T03:30:00Z"
 }
 ```
 
@@ -54,12 +61,13 @@ Check available products and engine backends on startup or project load.
 
 ---
 
-## 3. Data Manager: Ingestion & Schemas
+## 3. Data Manager: Ingestion, Schemas & Dual-Control Approval
 
 MYGA requires 4 dataset categories. Each dataset follows the governed lifecycle:
 `Upload Source` $\rightarrow$ `Preview & Map` $\rightarrow$ `Validate` $\rightarrow$ `Commit` $\rightarrow$ `Approve`.
 
 ### A. In-force Policies (`liability_inforce`)
+- **Canonical Schema Identifier:** `mentoramp.myga.inforce/v1`
 
 | Column Name | Type | Unit / Format | Description | Validation Rules |
 | :--- | :--- | :--- | :--- | :--- |
@@ -72,25 +80,26 @@ MYGA requires 4 dataset categories. Each dataset follows the governed lifecycle:
 | `guarantee_period_years` | Integer | Years | Guarantee term | Must be `5` for 5-Year MYGA |
 | `declared_rate` | Float | Decimal annual | Guaranteed credited rate | e.g., `0.045` ($4.50\%$) |
 | `gmir` | Float | Decimal annual | Guaranteed minimum interest rate | Policy minimum floor (e.g., `0.0025`) |
-| `gmsv_rate` | Float | Decimal annual | Nonforfeiture floor accumulation rate | Must be $\ge 0.0015$ ($15\text{ bps}$) |
+| `gmsv_rate` | Float | Decimal annual | Contractual floor crediting rate | Must be $\ge 0.0015$ ($15\text{ bps}$) |
 | `mva_ref_yield_at_issue`| Float | Decimal annual | Baseline reference yield for MVA | Benchmark yield at issue (e.g., `0.050`) |
 | `account_value` | Float | USD | Opening account value | $\ge 0$, finite float |
 | `mgsv_value` | Float | USD | Opening contractual floor value | Initial $87.5\%$ premium load |
 | `free_wd_base` | Float | USD | Annual free withdrawal allowance base | Typically equals opening AV |
 
 > [!NOTE]
-> **Legacy Field Aliasing:** If inforce files use `guarantee_term_years` or `credited_rate`, the Data Manager mapping profile can map them to `guarantee_period_years` and `declared_rate`.
+> **Harmonized Aliasing:** If user inforce files use `guarantee_term_years` or `credited_rate`, the Data Manager mapping profile can map them to `guarantee_period_years` and `declared_rate`.
+> **Strict Versioning:** Omitting schema version defaults to `v1`. Supplying an unknown version (e.g. `v99`) fails immediately with `INFORCE_SCHEMA_VERSION_NOT_SUPPORTED`.
 
 ### B. Mortality Assumption Table (`assumption_table`)
 - **Table Name:** `SYNTH_MORT_GOMPERTZ_2026`
 - **Columns:** `age` (integer), `gender` (`M`/`F`), `qx` (float annual mortality probability).
 
 ### C. Factor Tables (`factor_table`)
-Two factor tables are attached for MYGA:
-1. **Surrender Charges (`myga_surrender_charge.csv`):**
+Two factor tables are required for MYGA:
+1. **Surrender Charges (`myga_surrender_charge`):**
    - Columns: `schedule` (`"initial"` or `"renewal"`), `year_in_gp` (integer 1–5), `rate` (float, e.g., `0.09` for $9\%$).
-2. **Age Caps (`myga_sc_age_cap.csv`):**
-   - Columns: `issue_age` (integer), `max_charge` (float maximum allowable charge, stepping down at older ages).
+2. **Age Caps (`myga_sc_age_cap`):**
+   - Columns: `attained_age` (integer), `cap` (float maximum allowable charge, stepping down at older ages).
 
 ### D. Economic Scenarios (`scenario`)
 - **Columns:** `scenario_name`, `target_variable`, `operation`, `value`, `applies_from_period`, `applies_to_period`.
@@ -98,72 +107,51 @@ Two factor tables are attached for MYGA:
   - `market_rate`: Re-investment market rate (affects renewal rates & dynamic lapses). In "Rates Up 150bp", shocked by +150bp (to 5.95%).
   - `mva_ref_yield`: Prevailing CMT reference yield (drives MVA factor). In "Rates Up 150bp", shocked by +150bp (to 6.50%).
   - `discount_rate_annual`: Discount rate used for reserve present-value calculations (remains constant at `0.045` in "Rates Up 150bp", isolating reinvestment/MVA yield shifts from liability discount basis).
-  - `withdrawal`: Monthly gross withdrawal dollar override (default `0.0`). Debited from AV at BOM; net policyholder benefit and insurer outgo reflect 10% free allowance thresholding, surrender charge on excess, and MVA.
+  - `withdrawal`: Monthly beginning-of-month policyholder withdrawal (defaults to 0).
+
+### E. Dual-Control Approval Rules
+- An uploader cannot approve their own dataset (`409 SELF_APPROVAL_FORBIDDEN`).
+- Datasets must be approved by a second user with `reviewer` or `admin` role before they can be pinned to a projection set.
 
 ---
 
-## 4. Governed Data Manager API Endpoints
+## 4. Model Version Governance & Actuarial Decisions
 
-### 1. Create Import Session
-`POST /v1/projects/{project_id}/import-sessions`
-```json
-{
-  "category": "liability_inforce",
-  "name": "2026 Q4 MYGA Inforce"
-}
+### Lifecycle Transitions
 ```
-
-### 2. Upload Source File
-`POST /v1/import-sessions/{session_id}/file` (Multipart form-data with `file`)
-
-### 3. Preview & Column Mapping
-`GET /v1/import-sessions/{session_id}/preview`
-
-### 4. Validate Ingested Records
-`POST /v1/import-sessions/{session_id}/validate`
-```json
-{
-  "mapping_profile_id": "<optional_profile_id>",
-  "mapping_fields": [
-    {"source_column": "PolicyID", "target_field": "policy_id"},
-    {"source_column": "GrossPremium", "target_field": "premium"}
-  ]
-}
+draft ──[validate]──> validated ──[approve]──> approved ──[publish]──> published (immutable)
+  │                      │
+  └──[reject]            └──[reject]
 ```
-*Returns validation issues, error counts, and rejected rows (e.g. `GMSV_RATE_BELOW_MINIMUM`, `NEGATIVE_AMOUNT`).*
-
-### 5. Commit Validated Dataset
-`POST /v1/import-sessions/{session_id}/commit`
-
-### 6. Actuarial Approval Gate
-`POST /v1/datasets/{dataset_id}/review`
-```json
-{
-  "action": "approve",
-  "review_reason": "Verified contract fields and 2.80% GMSV rate against product spec."
-}
-```
-*(Requires `actuary`, `reviewer`, or `admin` platform role).*
+- **Independent Approval:** A user who modified a version cannot approve it (`409 SELF_APPROVAL_FORBIDDEN`). Requires `models:approve` permission.
+- **Whole-Model Immutability:** Published versions cannot be altered, rolled back, or deleted.
+- **Actuarial Note on Death Benefit:**
+  - Code marker: `STATUS: NEEDS ACTUARIAL PRODUCT OWNER DECISION`
+  - Active Implementation: Option A (Account Value post beginning-of-month withdrawal).
+  - Alternative Options Documented: Option B ($\max(\text{AV}, \text{CSV})$) and Option C ($\max(\text{AV}, \text{MGSV})$).
 
 ---
 
-## 5. Projection Set Setup
-
-Projection Sets bind the approved model version with inforce, tables, and scenarios.
+## 5. Projection Set Configuration
 
 ### Endpoint
 `POST /v1/projects/{project_id}/projection-sets`
 
-### Request Payload
+### Request Body
 ```json
 {
-  "name": "MYGA 5-Year Valuation Set",
-  "description": "Base and Rates Up 150bp valuation run",
-  "model_version_id": "<myga_model_version_uuid>",
-  "inforce_file_ids": ["<approved_inforce_dataset_uuid>"],
-  "assumption_table_ids": ["<mortality_dataset_uuid>"],
-  "factor_table_ids": ["<surrender_charge_dataset_uuid>", "<age_cap_dataset_uuid>"],
-  "scenario_ids": ["<base_scenario_uuid>", "<rates_up_scenario_uuid>"],
+  "name": "MYGA Illustrative Base and Rates Up",
+  "model_version_id": "<model_version_uuid>",
+  "inforce_file_ids": ["<inforce_uuid>"],
+  "assumption_table_ids": ["<mortality_table_uuid>"],
+  "factor_table_ids": [
+    "<surrender_charge_uuid>",
+    "<sc_age_cap_uuid>"
+  ],
+  "scenario_ids": [
+    "<base_scenario_uuid>",
+    "<rates_up_scenario_uuid>"
+  ],
   "valuation_date": "2026-12-31",
   "horizon_months": 480,
   "time_step": "monthly",
@@ -185,48 +173,40 @@ Projection Sets bind the approved model version with inforce, tables, and scenar
     "mode": "selected_policies",
     "policy_ids": ["MYGA-0001"]
   },
-  "parameters": {}
+  "parameters": {
+    "decrement_methodology": "best_estimate"
+  }
 }
 ```
 
-### Preflight Validation Check
-`POST /v1/projection-sets/{id}/validate`
-- Verifies input closure, formula graph acyclicity, and table parameter compatibility.
-- Status must return `"validated"` before run submission.
+### Parameter: `decrement_methodology`
+- `"best_estimate"`: Standard actuarial decrements (mortality, surrender, annuitization, maturity).
+- `"zero_decrements"`: Zero decrements benchmark (pure policyholder account value rollforward).
 
 ---
 
-## 6. Run Execution & Monitoring
+## 6. Run Execution & Controls
 
 ### 1. Submit Run Set
 `POST /v1/run-sets`
 ```json
 {
   "project_id": "<project_uuid>",
-  "name": "MYGA E2E Valuation Batch",
-  "notes": "Full portfolio valuation",
+  "name": "MYGA Valuation Run Set",
+  "notes": "25-policy portfolio valuation",
   "projection_set_ids": ["<projection_set_uuid>"],
   "scenario_ids": ["<base_scenario_uuid>", "<rates_up_scenario_uuid>"]
 }
 ```
-**Status Response:** `202 Accepted`
 
 ### 2. Poll Run Progress
 `GET /v1/runs/{run_id}`
 - Status states: `pending` $\rightarrow$ `running` $\rightarrow$ `success` (or `failed`, `cancelled`, `partial_success`).
-- Progress payload:
-  ```json
-  {
-    "status": "running",
-    "progress": {
-      "done": 12,
-      "total": 25,
-      "percent": 48.0,
-      "unit": "policies",
-      "eta_seconds": 15
-    }
-  }
-  ```
+- Progress: `progress.done`, `progress.total`, `progress.percent`.
+
+### 3. Run Controls
+- **Cancel:** `POST /v1/runs/{id}/cancel` (valid when `can_cancel === true`).
+- **Retry:** `POST /v1/runs/{id}/retry` (valid when `can_retry === true`). Retried run links via `retried_from_run_id`.
 
 ---
 
@@ -255,62 +235,73 @@ All 12 MYGA output variables have dimension `Policy x Scenario x Projection Mont
 {
   "run_id": "<uuid>",
   "status": "success",
+  "illustrative": true,
   "headline": {
-    "metric": "reserve",
-    "value": 4163674.90,
+    "variable": "reserve",
+    "value": 4163674.90181,
     "unit": "USD"
   },
   "totals": {
-    "liability_outgo": { "value": 5298179.06, "unit": "USD" },
-    "net_cash_flow": { "value": -3298179.06, "unit": "USD" }
+    "liability_outgo": { "value": 5298179.05845, "unit": "USD" },
+    "net_cash_flow": { "value": -3298179.05845, "unit": "USD" }
   },
-  "failed_policy_count": 0,
-  "elapsed_seconds": 14.8
+  "failed_policy_count": 0
 }
 ```
+
+### Frozen Regression Benchmarks (25-Policy Block)
+- **Base Scenario:**
+  * Prospective Reserve: **$4,163,674.90**
+  * Undiscounted Outgo: **$5,298,179.06**
+- **Rates Up 150bp Scenario:**
+  * Prospective Reserve: **$4,201,201.55**
+  * Undiscounted Outgo: **$5,358,149.66**
+- **Anchor Policy `MYGA-0001` Month 30 Surrender Benefit:** **$51,979.60**
 
 ---
 
 ## 8. Calculation Lineage & Trace Explorer
 
-For any traced policy and month, fetch the hierarchical calculation DAG.
-
 ### Endpoint
 `GET /v1/runs/{run_id}/trace?policy_id=MYGA-0001&month=30&variable=surrender_benefit&depth=8`
 
 ### Tree Structure (`root.children`)
-The frontend receives a nested tree (not a flat list) demonstrating the unbroken nonforfeiture chain:
+The frontend receives a nested tree demonstrating the unbroken nonforfeiture chain:
 
 ```
-surrender_benefit ($96,829.85) [max(surrender_value, mgsv_close)]
- ├── surrender_value ($96,829.85) [AV + MVA - SC]
- │    ├── account_value_close ($107,229.09)
- │    ├── market_value_adjustment (-$3,627.64) [capped by SC]
- │    │    ├── surrender_excess ($96,737.09)
- │    │    │    └── free_withdrawal_available ($10,492.00)
- │    │    └── mva_ref_yield (0.0650)
- │    └── surrender_charge ($6,771.60)
- │         └── surrender_charge_rate (0.07)
- └── mgsv_close ($89,585.05) [NAIC Model #805 2.80% floor]
+surrender_benefit ($51,979.60) [max(surrender_value, mgsv_close)]
+ ├── surrender_value ($51,979.60) [AV + MVA - SC]
+ │    ├── account_value_close ($53,421.15)
+ │    ├── market_value_adjustment ($0.00) [bounded by -SC and +SC]
+ │    │    ├── surrender_excess ($51,979.60)
+ │    │    │    └── free_withdrawal_available ($0.00)
+ │    │    └── mva_ref_yield (0.050)
+ │    └── surrender_charge ($1,441.55)
+ │         └── surrender_charge_rate (0.07) [from table myga_surrender_charge]
+ └── mgsv_close ($46,820.13) [Contractual 87.5% premium floor accumulated at gmsv_rate]
 ```
 
 ---
 
-## 9. Parquet Storage & Artifact Exports
+## 9. Parquet Storage & Artifact Provenance
 
-Each successful run produces an immutable, identity-neutral `.parquet` dataset in the artifact store.
+Each run stores immutable Parquet artifacts under attempt-scoped storage paths:
+`runs/{run_id}/attempts/{attempt_number}/artifacts/{artifact_type}.parquet`
 
 - **Listing Run Artifacts:** `GET /v1/runs/{run_id}/artifacts`
 - **Downloading Parquet Export:** `GET /v1/runs/{run_id}/artifacts/{artifact_id}/download`
-- **Integrity Validation:** Frontend displays the SHA-256 fingerprint from the artifact record.
+- **CSV Export:** `GET /v1/runs/{run_id}/export.csv`
+  * Reads `X-MentorAmp-Complete` header (`true` or `false`).
 
 ---
 
-## 10. Summary Checklist for Frontend (Samuel)
+## 10. Summary Checklist for Sam
 
-- [ ] **System Status:** Verify `products` contains `"MYGA"`.
-- [ ] **Data Manager:** In Inforce Import, display required MYGA columns (`guarantee_period_years`, `declared_rate`, `gmsv_rate`, etc.).
-- [ ] **Review Actions:** Display the "Approve / Reject" button for datasets when user role is `actuary`, `reviewer`, or `admin`.
-- [ ] **Projection Setup:** Allow selecting MYGA model version, attaching 2 factor tables (charges and age caps), and setting trace mode to `selected_policies`.
-- [ ] **Run Evidence:** Surface the run package fingerprint, manifest fingerprint, and execution steps using the existing `RunEvidencePanel`.
-- [ ] **Trace Explorer:** Render nested `root.children` for `surrender_benefit`.
+- [ ] **System Status:** Wire `GET /v1/system/status` to show `MYGA` dynamically in product selectors.
+- [ ] **Data Manager:** Implement the 4 tabs (`liability_inforce`, `assumption_table`, `factor_table`, `scenario`).
+- [ ] **Dual-Control UI:** Prevent self-approval of datasets; show "Awaiting Reviewer Approval".
+- [ ] **Model Governance:** Implement Validate, Approve (with author segregation), Reject (with reason modal), and Publish buttons. Show Actuarial Decision Alert on `death_benefit`.
+- [ ] **Projection Setup:** Wire Factor Tables multi-select and `decrement_methodology` parameter dropdown.
+- [ ] **Execution Center:** Implement Cancel and Retry buttons based on `can_cancel` and `can_retry`.
+- [ ] **Results Explorer:** Render the `Illustrative` badge, handle `partial_success` with confirmation modal, and verify against golden values ($4,163,674.90 Base reserve).
+- [ ] **Trace Explorer:** Wire recursive tree renderer to display the nonforfeiture calculation chain.
