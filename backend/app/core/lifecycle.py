@@ -11,6 +11,7 @@ DRAFT = "draft"
 NEEDS_REVIEW = "needs_review"
 VALIDATED = "validated"
 APPROVED = "approved"
+PUBLISHED = "published"
 REJECTED = "rejected"
 SUPERSEDED = "superseded"
 LEGACY_UNVALIDATED = "legacy_unvalidated"
@@ -22,7 +23,7 @@ INPUT_STATUSES: tuple[str, ...] = (
 # Inforce files, assumption tables, factor tables and scenarios a run may use.
 RUNNABLE_INPUT_STATUSES = frozenset({VALIDATED, APPROVED})
 # Model versions and their formulas a run may use.
-RUNNABLE_MODEL_STATUSES = frozenset({VALIDATED, APPROVED})
+RUNNABLE_MODEL_STATUSES = frozenset({VALIDATED, APPROVED, PUBLISHED})
 RUNNABLE_FORMULA_STATUSES = frozenset({VALIDATED, APPROVED})
 # Projection Sets: needs_review means "validated with warnings only"; warnings do not block.
 RUNNABLE_PROJECTION_SET_STATUSES = frozenset({VALIDATED, NEEDS_REVIEW})

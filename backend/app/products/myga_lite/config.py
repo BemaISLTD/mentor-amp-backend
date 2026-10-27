@@ -887,14 +887,21 @@ for _scenario_name in ("market_rate", "mva_ref_yield", "discount_rate_annual", "
 
 _PUBLISHED_END_OF_PERIOD = {
     "account_value_close", "mgsv_close", "surrender_benefit", "death_benefit", "reserve",
+    "surrender_charge_rate",
 }
 PUBLISHED_OUTPUTS = [
-    {"variable_name": name, "display_name": name.replace("_", " ").title(), "unit": "USD",
+    {"variable_name": name, "display_name": name.replace("_", " ").title(),
+     "unit": next(item["unit"] for item in VARIABLES if item["name"] == name),
      "dimension": "Policy x scenario x projection month",
-     "aggregation": "end_of_period" if name in _PUBLISHED_END_OF_PERIOD else "sum",
+     "aggregation": (
+         "beginning_of_period" if name == "account_value_open"
+         else "end_of_period" if name in _PUBLISHED_END_OF_PERIOD else "sum"
+     ),
      "description": f"Illustrative MYGA {name.replace('_', ' ')}."}
     for name in (
-        "account_value_close", "mgsv_close", "surrender_benefit", "death_benefit",
+        "account_value_open", "account_value_close", "interest_credited", "premium_cash_flow",
+        "gross_withdrawal", "surrender_charge_rate", "surrender_charge_on_withdrawal",
+        "net_withdrawal_benefit", "mgsv_close", "surrender_benefit", "death_benefit",
         "death_claims", "surrender_claims", "annuitization_transfer", "maturity_benefit",
         "maintenance_expense", "liability_outgo", "net_cash_flow", "reserve",
     )

@@ -81,8 +81,10 @@ def ids(env):
     try:
         project_response = client.get("/v1/projects/")
         assert project_response.status_code == 200, project_response.text
-        project = next(p for p in project_response.json()["projects"]
-                       if p["name"].startswith("MentorAmp Demo"))
+        project = next(
+            p for p in project_response.json()["projects"]
+            if p["name"] == env["seed"].PROJECT_NAME
+        )
         projection_set = client.get(f"/v1/projects/{project['id']}/projection-sets").json()["projection_sets"][0]
         submitted = client.post("/v1/run-sets", json={
             "project_id": project["id"], "name": "Test Run Set",

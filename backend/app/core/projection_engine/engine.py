@@ -20,6 +20,9 @@ from datetime import date
 from typing import Any
 
 from app.core.dependency_engine.graph import topological_sort
+from app.core.formula_engine.dsl import (
+    FormulaDslError, FormulaEvaluationError, evaluate_expression, extract_dependencies,
+)
 from app.core.projection_engine.run_data import (
     FormulaSpec,
     PolicyRecord,
@@ -177,6 +180,7 @@ class _PolicyCalculator:
         self.context: dict[str, Any] = {}
         self.resolved: dict[str, _Resolution] = {}
         self.computed: dict[str, float] = {}
+        self.previous_values: dict[str, Any] = {}
 
     # -- context ---------------------------------------------------------------------------
     def _build_context(self, month: int) -> dict[str, Any]:
@@ -439,16 +443,27 @@ class _PolicyCalculator:
 
     # -- formulas --------------------------------------------------------------------------
     def _run_formula(self, formula: FormulaSpec) -> None:
-        func = self.functions.get(formula.function_ref)
-        if func is None:
-            raise EngineError(
-                "invalid_formula",
-                f"Function '{formula.function_ref}' is not registered.",
-                formula.output_variable, self.month,
-            )
         inputs = {dependency: self.resolve(dependency) for dependency in formula.dependencies}
         try:
-            value = func(**inputs)
+            if formula.function_ref == "dsl" or formula.function_ref.startswith("dsl:"):
+                if not formula.expression_text:
+                    raise FormulaEvaluationError("DSL formula has no expression text.")
+                prior_names = extract_dependencies(formula.expression_text).prior_dependencies
+                prior_inputs = {
+                    name: self.previous_values[name]
+                    for name in prior_names
+                    if name in self.previous_values
+                }
+                value = evaluate_expression(formula.expression_text, inputs, prior_inputs)
+            else:
+                func = self.functions.get(formula.function_ref)
+                if func is None:
+                    raise EngineError(
+                        "invalid_formula",
+                        f"Function '{formula.function_ref}' is not registered.",
+                        formula.output_variable, self.month,
+                    )
+                value = func(**inputs)
         except ZeroDivisionError as exc:
             raise EngineError(
                 "division_by_zero", f"Division by zero in '{formula.name}'.",
@@ -456,6 +471,11 @@ class _PolicyCalculator:
             ) from exc
         except EngineError:
             raise
+        except FormulaDslError as exc:
+            raise EngineError(
+                "invalid_formula", f"'{formula.name}' DSL evaluation failed: {exc.message}",
+                formula.output_variable, self.month,
+            ) from exc
         except Exception as exc:  # noqa: BLE001 - any formula failure is reported, not raised
             raise EngineError(
                 "invalid_formula", f"'{formula.name}' failed: {exc}",
@@ -466,10 +486,13 @@ class _PolicyCalculator:
             self._check_value(spec, value)
         self.computed[formula.output_variable] = value
         self.history[formula.output_variable].append(value)
+        trace_inputs = dict(inputs)
+        if formula.function_ref == "dsl" or formula.function_ref.startswith("dsl:"):
+            trace_inputs.update({f"prior({name})": value for name, value in prior_inputs.items()})
         self._trace(
             variable_name=formula.output_variable,
             formula_id=formula.id,
-            input_values=dict(inputs),
+            input_values=trace_inputs,
             output_value={"value": value},
             source_type="formula",
         )
@@ -563,6 +586,22 @@ class _PolicyCalculator:
                 self.computed = {}
                 for formula in self.data.formulas:
                     self._run_formula(formula)
+                # A value referenced only through prior(name) is deliberately absent from
+                # the same-period formula DAG. Resolve it after the period completes so raw
+                # inputs/manual/scenario values, as well as formula outputs, are available
+                # to the following period.
+                prior_values = {}
+                for formula in self.data.formulas:
+                    if formula.function_ref == "dsl" or formula.function_ref.startswith("dsl:"):
+                        for name in extract_dependencies(
+                            formula.expression_text or ""
+                        ).prior_dependencies:
+                            prior_values[name] = self.resolve(name)
+                self.previous_values = {
+                    **{name: item.value for name, item in self.resolved.items()},
+                    **self.computed,
+                    **prior_values,
+                }
                 self.result.months_computed = month
             valuation = self._valuation()
             self._series_checks()

@@ -19,6 +19,7 @@ from app.db.models.audit_log import AuditLog  # noqa: F401
 from app.db.models.run_artifact import RunArtifact, RunManifest  # noqa: F401
 from app.db.models.product import AssetPosition, Product, ProductMapping  # noqa: F401
 from app.db.models.run_package import RunAttempt, RunPackage  # noqa: F401
+from app.db.models.reconciliation import ExpectedResultSet, ReconciliationReport  # noqa: F401
 from app.db.models.project_member import ProjectMember  # noqa: F401
 from app.db.models.model_variable import ModelVariableDefinition  # noqa: F401
 from app.db.models.governance import (  # noqa: F401

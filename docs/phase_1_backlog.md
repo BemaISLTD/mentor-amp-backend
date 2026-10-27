@@ -12,8 +12,8 @@ it is considered complete.
 
 | Area | Verified state | Status |
 | --- | --- | --- |
-| Tests | Original test modules were empty placeholders | **Current evidence:** 364 application tests pass (24 opt-in skips without PostgreSQL); all 23 selected PostgreSQL migration, concurrency, SPIA, and MYGA workflow tests pass separately; the earlier 269-test native Windows correction gate remains recorded |
-| Seed data | No seed script existed | Complete for illustrative SPIA demo; broader product and workflow seed remains open |
+| Tests | Original test modules were empty placeholders | **Current evidence:** 486 application tests pass (24 opt-in skips without PostgreSQL); PostgreSQL gates use disposable test databases only; the earlier native Windows correction gate remains recorded |
+| Seed data | No seed script existed | Complete for illustrative SPIA and 25-policy 5-Year MYGA demos; the requested MYGA-10001 reference assets remain unavailable |
 | Authentication/RBAC | No auth dependency or user/RBAC models existed | **Complete:** JWT and the administrator, actuary, model developer, reviewer, and read-only permission matrix are enforced |
 | API versioning | Public routers were mounted at root | **Complete:** routers now use `/v1` |
 | Error contract | Default FastAPI `detail` responses were used | **Complete:** standardized error envelope added |
@@ -23,7 +23,8 @@ it is considered complete.
 | Run controls | Runs could not be cancelled or retried | **Complete:** pending/running cancellation and frozen-configuration retry are exposed through the canonical run API |
 | Large outputs | Runner previously wrote outputs and traces to PostgreSQL | **Complete for local execution:** Parquet artifacts replace the removed legacy tables; production object storage remains open |
 | Run manifests | Runs did not snapshot inputs/configuration | **Complete:** immutable version snapshot added |
-| Reconciliation | No comparison service or API existed | **Complete:** deterministic on-demand comparison over immutable artifacts |
+| Reconciliation | No comparison service or API existed | **Complete for available fixtures:** governed expected-result ingestion, tolerance reconciliation, cell-level evidence, aggregate-year comparison, and reviewer disposition are public APIs |
+| Formula Studio | Registry exposed only server-owned Python functions | **Complete for the M3 backend contract:** safe DSL validation/execution, preview, persisted tests, dependency analysis, version diff, governed lifecycle, and rollback are implemented |
 
 ## 1. Environment, Recovery, and Testing
 
@@ -31,18 +32,25 @@ it is considered complete.
   - Build coverage for database connectivity, migrations, model constraints,
     validation, authentication/authorization, API behavior, engine behavior,
     and golden policies.
-  - Current reliable named-container evidence: 364 passed, 24 skipped, exit
+  - Current reliable named-container evidence: 486 passed, 24 skipped, exit
     code 0. Exact SPIA and MYGA golden values and trace references are asserted.
-  - All 23 selected PostgreSQL migration, concurrency, SPIA, and MYGA workflow
-    tests pass with exit code 0 on a disposable PostgreSQL 15 database. Running cancellation,
+  - All 21 PostgreSQL migration, concurrency, SPIA, and MYGA workflow tests pass
+    with exit code 0 on a disposable PostgreSQL 15 database. Running cancellation,
     all-policy failure, and post-write execution failure each reach a terminal
     state and can be retried.
   - The native Windows suite passes 269 tests with 18 PostgreSQL-only skips.
     The shared Neon database was not migrated or seeded.
-- **[IMPROVE] Database Seeding Scripts — IN PROGRESS**
-  - `scripts/seed_demo.py` idempotently creates synthetic SPIA users, project,
-    inputs, scenarios, model, and a validated projection set. Broader product
-    and workflow seed data remains open.
+- **[IMPROVE] Database Seeding Scripts — COMPLETE FOR SPIA AND 5-YEAR MYGA**
+  - `scripts/seed_demo.py` idempotently creates separate synthetic SPIA and
+    5-Year MYGA projects. The MYGA seed publishes the model through independent
+    approval, approves mortality/factor/scenario/in-force datasets, and validates
+    the two-scenario projection set so it is ready to run.
+  - The assigned `synthetic_myga_inforce_10001.csv` and
+    `expected_reference_myga_10001.csv` assets are absent. No actuarial expected
+    values are fabricated; MYGA-10001 seeding and its exact 60-row acceptance
+    check remain blocked on the supplied reference package. When supplied under
+    `samples/myga/`, the seeder registers both idempotently and selects the
+    reference in-force for the 60-month demo projection.
 - **[IMPROVE] Governed Upload Recovery — COMPLETE FOR LOCAL ARTIFACT STORAGE**
   - Every upload is retained as an immutable raw artifact with its SHA-256
     fingerprint and persistent import-session history.
@@ -77,11 +85,14 @@ it is considered complete.
     designed. Permanent project deletion is not exposed.
   - Normal project reads and dashboards hide archived projects; authorized
     project reads can opt in with `include_archived=true`.
-- **[BUILD] File Record Viewers — COMPLETE FOR IN-FORCE FILES**
+- **[BUILD] File Record Viewers — COMPLETE**
   - `GET /v1/imports/inforce/{file_id}/records` returns stable, paginated rows
     with file metadata and a maximum page size of 200.
   - Filtering is restricted to `policy_id` and columns declared by the file,
     using allowlisted text and numeric operators.
+  - Assumption and factor tables expose stable paginated/searchable record APIs
+    at `/v1/inputs/assumptions/{id}/records` and
+    `/v1/inputs/factors/{id}/records`.
 - **[BUILD] Dashboard Contract — COMPLETE**
   - `GET /v1/dashboard/stats` returns project-scoped product, latest or
     requested asset snapshot, run, and in-force file statistics.
@@ -137,14 +148,25 @@ it is considered complete.
     rejected rows, actors, raw/canonical fingerprints, and import events remain
     queryable. Legacy `/v1/imports/*` writes are deprecated one-shot wrappers over
     the same lifecycle.
-- **[BUILD] Model Versioning — COMPLETE FOR VERSIONING; APPROVAL DEFERRED**
+- **[BUILD] Model Versioning — COMPLETE FOR CURRENT FORMULA STUDIO SCOPE**
   - Whole-model versions track parent, sequence, configuration, change summary,
     actor, publication, and archival metadata; child formula groups, formulas,
     dependencies, variable definitions, and published outputs clone from a parent.
-  - Public self-publishing to approved is removed until an independent model
-    approval workflow is designed. Existing published/approved model versions
-    and their attached formulas are immutable; semantic changes require a new
-    version.
+  - Validation records a definition fingerprint; an independent user with
+    `models:approve` must approve it before publication. Published/approved model
+    versions and their attached formulas are immutable; semantic changes require
+    a new version. Governed rollback activates a prior approved/published version
+    and records immutable audit evidence.
+
+- **[BUILD] Formula Studio Backend — COMPLETE FOR M3 CONTRACT**
+  - The controlled AST DSL allows only documented arithmetic, comparison,
+    conditional, prior-value, and numeric functions; attribute access, imports,
+    comprehensions, arbitrary calls, and runtime code execution are rejected.
+  - Formula metadata and test cases persist with the model version. APIs cover
+    syntax/variable validation, preview, test execution, creation in mutable
+    versions, dependency impact, structured version comparison, and rollback.
+  - DSL formulas execute through the shared projection engine and produce normal
+    trace evidence; registered Python formulas remain a controlled plug-in path.
 
 ## 4. Actuarial Execution and Large Data
 
@@ -184,6 +206,11 @@ it is considered complete.
 - **[BUILD] Reconciliation Service — COMPLETE**
   - Compare prior/current output datasets and return reserve bridges and exact
     variance components.
+  - Expected-result sets can be registered from JSON or CSV with canonical alias
+    normalization and deterministic fingerprints. Completed run artifacts can be
+    reconciled at policy-month and aggregate-year levels with explicit absolute
+    and relative tolerances, cell failures, source-to-output checks, and audited
+    reviewer disposition.
 
 - **[BUILD] Native Actuarial Reference Model — COMPLETE THROUGH OPTIONAL SPIA COMMUTATION**
   - A MentorAmp-owned SPIA model covers single and joint lives, all five core
@@ -331,6 +358,19 @@ Before an item moves to complete, record:
 - Products/assets tests: `backend/tests/integration/test_products_api.py`
 - Dashboard API: `backend/app/api/dashboard.py`
 - Dashboard tests: `backend/tests/integration/test_dashboard_api.py`
+- Formula DSL and Formula Studio APIs: `backend/app/core/formula_engine/dsl.py`,
+  `backend/app/api/formulas.py`, `backend/app/api/modeling.py`
+- Formula Studio tests: `backend/tests/unit/test_formula_dsl.py`,
+  `backend/tests/integration/test_formula_studio_api.py`
+- Expected-result and reconciliation APIs: `backend/app/api/expected_results.py`,
+  `backend/app/services/reconciliation_service.py`
+- Expected-result/reconciliation tests:
+  `backend/tests/integration/test_expected_result_reconciliation.py`
+- Multi-product demo seed test:
+  `backend/tests/integration/test_seed_demo_multi_product.py`
+- Frontend M3 contract:
+  `docs/build/FORMULA_STUDIO_RECONCILIATION_FRONTEND_CONTRACT.md`
 - Verification command: `pytest tests/unit tests/integration -q`; PostgreSQL
   verification uses `MENTORAMP_TEST_POSTGRES_URL` pointing only to a disposable
-  database whose name contains `test`.
+  database whose name contains `test`. Latest full Docker verification:
+  **486 passed, 24 skipped**; PostgreSQL-specific verification: **21 passed**.

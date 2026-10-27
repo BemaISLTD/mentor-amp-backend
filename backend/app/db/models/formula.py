@@ -1,9 +1,9 @@
 """Formula registry — catalog of all calculation formulas in the engine."""
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.database import Base
@@ -58,6 +58,11 @@ class FormulaRegistry(Base):
     explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
     unit: Mapped[str | None] = mapped_column(String(50), nullable=True)
     illustrative: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    effective_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    owner_user_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    test_cases: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
 
     # Relationship to dependencies
     dependencies = relationship(

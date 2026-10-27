@@ -28,6 +28,7 @@ from app.core import lifecycle
 from app.core.execution import run_package
 from app.core.execution.fingerprints import SUPPORTED_INFORCE_FINGERPRINT_SCHEMES, scenario_fingerprint
 from app.core.formula_engine.formulas import FORMULA_FUNCTIONS, FORMULA_REGISTRY
+from app.core.formula_engine.dsl import FormulaDslError, extract_dependencies
 from app.core.projection_engine.engine import OVERRIDE_OPERATIONS, EngineError, order_formulas
 from app.core.projection_engine.run_data import VariableSpec
 from app.db.models.assumption import AssumptionSet, AssumptionTable
@@ -125,7 +126,16 @@ def check_model(db: Session, project_id: str, projection_set: ProjectionSet) -> 
     if not result.formulas:
         result.problems.append(Problem("NO_FORMULAS", "The model version has no formulas."))
     for formula in result.formulas:
-        if formula.function_ref not in FORMULA_FUNCTIONS:
+        is_dsl = formula.function_ref == "dsl" or formula.function_ref.startswith("dsl:")
+        if is_dsl:
+            try:
+                extract_dependencies(formula.expression_text or "")
+            except FormulaDslError as error:
+                result.problems.append(Problem(
+                    "DSL_EXPRESSION_INVALID",
+                    f"Formula '{formula.name}' has an invalid DSL expression: {error.message}",
+                ))
+        elif formula.function_ref not in FORMULA_FUNCTIONS:
             result.problems.append(Problem(
                 "FUNCTION_NOT_REGISTERED",
                 f"Formula '{formula.name}' uses unregistered function '{formula.function_ref}'.",
@@ -430,6 +440,8 @@ def _is_number(value: Any) -> bool:
 # =============================================================================
 
 def _implementation(function_ref: str) -> dict[str, Any] | None:
+    if function_ref == "dsl" or function_ref.startswith("dsl:"):
+        return {"type": "mentoramp_formula_dsl", "version": "1"}
     registration = FORMULA_REGISTRY.get(function_ref)
     return registration.identity() if registration else None
 

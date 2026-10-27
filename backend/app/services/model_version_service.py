@@ -7,6 +7,9 @@ from sqlalchemy.orm import Session
 
 from app.core.audit import record_audit
 from app.core.model_fingerprint import compute_model_definition_fingerprint
+from app.core.formula_engine.dsl import FormulaDslError, extract_dependencies
+from app.core.projection_engine.engine import order_formulas
+from app.services.model_definition import to_formula_spec
 from app.core.model_lifecycle import (
     APPROVED,
     DRAFT,
@@ -166,6 +169,8 @@ def _clone_version_children(db: Session, parent: ModelVersion, target: ModelVers
             status="draft", created_by=actor_id, updated_by=actor_id, model_version_id=target.id,
             group_id=group_ids.get(source.group_id), expression_text=source.expression_text,
             explanation=source.explanation, unit=source.unit, illustrative=source.illustrative,
+            effective_date=source.effective_date, owner_user_id=source.owner_user_id,
+            test_cases=list(source.test_cases or []),
         )
         db.add(copy)
         db.flush()
@@ -279,6 +284,7 @@ def publish_version(db: Session, version_id: str, user: Any) -> dict[str, Any]:
         db.flush()
 
     row.is_current = True
+    row.status = PUBLISHED
     row.published_by = user.id
     row.published_at = now_utc()
     row.updated_by = user.id
@@ -490,6 +496,205 @@ def reject_version(db: Session, version_id: str, user: Any, reason: str | None =
         entity_type="model_version", entity_id=row.id,
         before_state=before, after_state=_version_state(row),
         context={"reason": clean_reason},
+    )
+    db.commit()
+    db.refresh(row)
+    return serialize_version(row)
+
+
+def dependency_analysis(
+    db: Session, version_id: str, variable: str | None = None
+) -> dict[str, Any]:
+    formulas = db.query(FormulaRegistry).filter(
+        FormulaRegistry.model_version_id == version_id,
+        FormulaRegistry.deleted_at.is_(None),
+    ).order_by(FormulaRegistry.output_variable).all()
+    ordered = order_formulas([to_formula_spec(row) for row in formulas])
+    execution_order = [row.output_variable for row in ordered]
+    dependencies: dict[str, set[str]] = {}
+    for row in formulas:
+        names = {item.depends_on_variable for item in row.dependencies}
+        if row.function_ref == "dsl" or row.function_ref.startswith("dsl:"):
+            try:
+                names.update(extract_dependencies(row.expression_text or "").prior_dependencies)
+            except FormulaDslError:
+                pass
+        dependencies[row.output_variable] = names
+
+    upstream: set[str] = set()
+
+    def collect_upstream(name: str) -> None:
+        for dependency in dependencies.get(name, set()):
+            if dependency not in upstream:
+                upstream.add(dependency)
+                collect_upstream(dependency)
+
+    if variable:
+        collect_upstream(variable)
+
+    reverse: dict[str, set[str]] = {}
+    for output, names in dependencies.items():
+        for name in names:
+            reverse.setdefault(name, set()).add(output)
+    downstream: set[str] = set()
+    pending = list(reverse.get(variable, set())) if variable else []
+    while pending:
+        name = pending.pop()
+        if name in downstream:
+            continue
+        downstream.add(name)
+        pending.extend(reverse.get(name, set()))
+
+    ordered_upstream = [name for name in execution_order if name in upstream]
+    ordered_upstream.extend(sorted(upstream - set(ordered_upstream)))
+    return {
+        "model_version_id": version_id,
+        "variable": variable,
+        "execution_order": execution_order,
+        "upstream_dependencies": ordered_upstream,
+        "downstream_impacted": [name for name in execution_order if name in downstream],
+    }
+
+
+def _changed_fields(before: Any, after: Any, fields: tuple[str, ...]) -> dict[str, Any]:
+    return {
+        field: {"before": getattr(before, field), "after": getattr(after, field)}
+        for field in fields
+        if getattr(before, field) != getattr(after, field)
+    }
+
+
+def _collection_diff(
+    before_rows: list[Any], after_rows: list[Any], key: str, fields: tuple[str, ...]
+) -> dict[str, Any]:
+    before = {getattr(row, key): row for row in before_rows}
+    after = {getattr(row, key): row for row in after_rows}
+    shared = sorted(before.keys() & after.keys())
+    modified = []
+    for name in shared:
+        changes = _changed_fields(before[name], after[name], fields)
+        if changes:
+            modified.append({"key": name, "before": {f: getattr(before[name], f) for f in fields},
+                             "after": {f: getattr(after[name], f) for f in fields},
+                             "changes": changes})
+    return {
+        "added": sorted(after.keys() - before.keys()),
+        "removed": sorted(before.keys() - after.keys()),
+        "modified": modified,
+    }
+
+
+def compare_versions(db: Session, version_id: str, other_version_id: str) -> dict[str, Any]:
+    before = db.get(ModelVersion, version_id)
+    after = db.get(ModelVersion, other_version_id)
+    if before is None or before.deleted_at is not None or after is None or after.deleted_at is not None:
+        raise not_found("One or both model versions were not found.")
+    if before.model_id != after.model_id:
+        raise ServiceError(422, "MODEL_VERSION_MODEL_MISMATCH", "Model versions must belong to the same model.")
+    formula_fields = ("expression_text", "function_ref", "unit", "explanation")
+    before_formulas = db.query(FormulaRegistry).filter(
+        FormulaRegistry.model_version_id == before.id, FormulaRegistry.deleted_at.is_(None)
+    ).all()
+    after_formulas = db.query(FormulaRegistry).filter(
+        FormulaRegistry.model_version_id == after.id, FormulaRegistry.deleted_at.is_(None)
+    ).all()
+    formula_diff = _collection_diff(
+        before_formulas, after_formulas, "output_variable", formula_fields
+    )
+    before_by_output = {row.output_variable: row for row in before_formulas}
+    after_by_output = {row.output_variable: row for row in after_formulas}
+    modified_by_name = {item["key"]: item for item in formula_diff["modified"]}
+    for name in sorted(before_by_output.keys() & after_by_output.keys()):
+        before_deps = sorted(dep.depends_on_variable for dep in before_by_output[name].dependencies)
+        after_deps = sorted(dep.depends_on_variable for dep in after_by_output[name].dependencies)
+        item = modified_by_name.get(name)
+        if item is None and before_deps != after_deps:
+            item = {
+                "key": name,
+                "before": {field: getattr(before_by_output[name], field) for field in formula_fields},
+                "after": {field: getattr(after_by_output[name], field) for field in formula_fields},
+                "changes": {},
+            }
+            formula_diff["modified"].append(item)
+            modified_by_name[name] = item
+        if item is None:
+            continue
+        item["before"]["dependencies"] = before_deps
+        item["after"]["dependencies"] = after_deps
+        if before_deps != after_deps:
+            item["changes"]["dependencies"] = {"before": before_deps, "after": after_deps}
+    formula_diff["modified"].sort(key=lambda item: item["key"])
+    before_variables = db.query(ModelVariableDefinition).filter(
+        ModelVariableDefinition.model_version_id == before.id
+    ).all()
+    after_variables = db.query(ModelVariableDefinition).filter(
+        ModelVariableDefinition.model_version_id == after.id
+    ).all()
+    before_outputs = db.query(ModelPublishedOutput).filter(
+        ModelPublishedOutput.model_version_id == before.id
+    ).all()
+    after_outputs = db.query(ModelPublishedOutput).filter(
+        ModelPublishedOutput.model_version_id == after.id
+    ).all()
+    return {
+        "model_version_id": before.id,
+        "other_version_id": after.id,
+        "metadata_changes": _changed_fields(
+            before, after, ("basis", "methodology", "configuration", "status")
+        ),
+        "formula_changes": formula_diff,
+        "variable_changes": _collection_diff(
+            before_variables, after_variables, "variable_name",
+            ("display_name", "description", "kind", "data_type", "unit", "required",
+             "default_value", "source", "allow_scenario_override", "version"),
+        ),
+        "published_output_changes": _collection_diff(
+            before_outputs, after_outputs, "variable_name",
+            ("display_name", "unit", "dimension", "aggregation", "description", "sort_order"),
+        ),
+    }
+
+
+def rollback_version(db: Session, version_id: str, user: Any) -> dict[str, Any]:
+    row = db.query(ModelVersion).filter(
+        ModelVersion.id == version_id, ModelVersion.deleted_at.is_(None)
+    ).with_for_update().first()
+    if row is None:
+        raise not_found(f"Model version '{version_id}' not found.")
+    model = db.get(Model, row.model_id)
+    access.require_project_access(db, user, model.project_id, write=True)
+    require_active_project(db, model.project_id)
+    if row.status not in {APPROVED, PUBLISHED, SUPERSEDED}:
+        raise ServiceError(
+            409, "MODEL_VERSION_NOT_ACTIVATABLE",
+            f"Only approved, published, or superseded model versions can be activated; current status is '{row.status}'.",
+        )
+    prior = db.query(ModelVersion).filter(
+        ModelVersion.model_id == row.model_id,
+        ModelVersion.is_current.is_(True),
+        ModelVersion.id != row.id,
+    ).with_for_update().all()
+    before = _version_state(row)
+    for current in prior:
+        current.is_current = False
+        if current.status == PUBLISHED:
+            current.status = SUPERSEDED
+        current.updated_by = user.id
+    if prior:
+        # Satisfy the partial unique index before promoting the rollback target.
+        db.flush()
+    row.is_current = True
+    if row.status == SUPERSEDED:
+        row.status = PUBLISHED
+    row.updated_by = user.id
+    model.status = "active"
+    model.updated_by = user.id
+    db.flush()
+    record_audit(
+        db, actor_user_id=user.id, action="model_version.rollback_activated",
+        entity_type="model_version", entity_id=row.id,
+        before_state=before, after_state=_version_state(row),
+        context={"replaced_current_version_ids": [item.id for item in prior]},
     )
     db.commit()
     db.refresh(row)

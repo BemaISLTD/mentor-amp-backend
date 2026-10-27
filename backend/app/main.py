@@ -10,6 +10,7 @@ from app.api.data_manager import router as data_manager_router
 from app.api.dependencies import get_current_user, require_permissions
 from app.api.errors import register_exception_handlers
 from app.api.execution import router as execution_router
+from app.api.expected_results import router as expected_results_router
 from app.api.formulas import router as formulas_router
 from app.api.governance import (
     router as experimental_governance_router,
@@ -101,6 +102,7 @@ app.include_router(inputs_router, prefix=API_PREFIX)
 app.include_router(scenarios_router, prefix=API_PREFIX)
 app.include_router(projection_sets_router, prefix=API_PREFIX)
 app.include_router(execution_router, prefix=API_PREFIX)
+app.include_router(expected_results_router, prefix=API_PREFIX)
 app.include_router(analysis_router, prefix=API_PREFIX)
 app.include_router(run_steps_router, prefix=API_PREFIX)
 # Metadata-only future capabilities are intentionally unavailable under /v1 and omitted

@@ -27,6 +27,7 @@ from app.db.models.formula import FormulaRegistry
 from app.db.models.model_variable import ModelVariableDefinition
 from app.db.models.modeling import Model, ModelPublishedOutput, ModelVersion
 from app.db.models.projection import ProjectionSet
+from app.db.models.variable import VariableRegistry
 from app.models.schemas import FormulaDefinition
 
 from .wp1_support import Env
@@ -105,7 +106,7 @@ def test_publish_requires_independent_approval(env):
     assert pub_res.status_code == 200
     pub_json = pub_res.json()
     assert pub_json["is_current"] is True
-    assert pub_json["status"] == "approved"
+    assert pub_json["status"] == "published"
     assert pub_json["published_by"] == ids["admin"]
     assert pub_json["published_at"] is not None
 
@@ -289,6 +290,20 @@ def test_material_mutations_invalidate_validation(env):
         dependencies=[],
     )
     with env.Session() as db:
+        db.add(VariableRegistry(
+            name="test_output_var", display_name="Test output", data_type="number",
+            source_type="formula", source={"type": "formula"}, lookup_keys=[],
+            required=False, product_applicability=["spia_lite"],
+            basis_applicability=["GAAP"], version="v1",
+            created_by=ids["admin"], updated_by=ids["admin"],
+        ))
+        db.add(ModelVariableDefinition(
+            model_version_id=v_id, variable_name="test_output_var",
+            display_name="Test output", kind="formula", data_type="number",
+            required=False, source={"type": "formula"}, version="v1",
+            created_by=ids["admin"], updated_by=ids["admin"],
+        ))
+        db.flush()
         register(db, new_formula, ids["admin"])
     _assert_invalidated(v_id)
 

@@ -1,5 +1,7 @@
 """Models, model versions, formula groups and formula detail (contract §E.2, §E.5)."""
 
+import uuid
+from datetime import date
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -9,6 +11,14 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import authorize_path, get_current_user
 from app.db.database import get_db
 from app.db.models.user import User
+from app.db.models.formula import FormulaRegistry
+from app.db.models.model_variable import ModelVariableDefinition
+from app.db.models.modeling import FormulaGroup
+from app.db.models.variable import VariableRegistry
+from app.models.schemas import FormulaDefinition
+from app.core.formula_engine.registry import register as register_formula
+from app.core.model_lifecycle import require_mutable_model_version
+from app.services.common import ServiceError
 from app.services import access, catalog_service, model_version_service, variable_definition_service
 
 router = APIRouter(tags=["models"])
@@ -83,6 +93,26 @@ class PublishedOutputUpdate(BaseModel):
     aggregation: str | None = Field(None, max_length=20)
     description: str | None = None
     sort_order: int | None = None
+
+
+class ModelFormulaCreate(BaseModel):
+    id: str | None = None
+    name: str = Field(min_length=1, max_length=255)
+    output_variable: str = Field(min_length=1, max_length=255)
+    function_ref: str = Field("dsl", min_length=1, max_length=255)
+    dependencies: list[str] | None = None
+    category: str = ""
+    product_applicability: list[str] = Field(default_factory=list)
+    basis_applicability: list[str] = Field(default_factory=list)
+    version: str = "v1"
+    group_id: str | None = None
+    expression_text: str | None = Field(None, max_length=10_000)
+    explanation: str | None = None
+    unit: str | None = Field(None, max_length=50)
+    illustrative: bool = False
+    effective_date: date | None = None
+    owner_user_id: str | None = None
+    test_cases: list[dict[str, Any]] = Field(default_factory=list)
 
 
 
@@ -214,6 +244,35 @@ def publish_model_version(
     return model_version_service.publish_version(db, model_version_id, user)
 
 
+@router.post("/model-versions/{model_version_id}/rollback")
+def rollback_model_version(
+    model_version_id: str, user: VersionReviewer, db: Session = Depends(get_db)
+):
+    return model_version_service.rollback_version(db, model_version_id, user)
+
+
+@router.get("/model-versions/{model_version_id}/dependency-analysis")
+def model_version_dependency_analysis(
+    model_version_id: str,
+    user: VersionReader,
+    variable: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    del user
+    return model_version_service.dependency_analysis(db, model_version_id, variable)
+
+
+@router.get("/model-versions/{model_version_id}/compare/{other_version_id}")
+def compare_model_versions(
+    model_version_id: str,
+    other_version_id: str,
+    user: VersionReader,
+    db: Session = Depends(get_db),
+):
+    access.require_object_access(db, user, "model_version", other_version_id)
+    return model_version_service.compare_versions(db, model_version_id, other_version_id)
+
+
 @router.get("/model-versions/{model_version_id}/structure")
 def model_version_structure(model_version_id: str, user: VersionReader, db: Session = Depends(get_db)):
     del user
@@ -230,6 +289,77 @@ def published_outputs(model_version_id: str, user: VersionReader, db: Session = 
 def formula_groups(model_version_id: str, user: VersionReader, db: Session = Depends(get_db)):
     del user
     return catalog_service.formula_groups(db, model_version_id)
+
+
+@router.post(
+    "/model-versions/{model_version_id}/formulas",
+    response_model=FormulaDefinition,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_model_version_formula(
+    model_version_id: str,
+    payload: ModelFormulaCreate,
+    user: VersionWriter,
+    db: Session = Depends(get_db),
+):
+    require_mutable_model_version(db, model_version_id)
+    defined_output = db.query(ModelVariableDefinition).filter(
+        ModelVariableDefinition.model_version_id == model_version_id,
+        ModelVariableDefinition.variable_name == payload.output_variable,
+    ).first()
+    registered_output = db.query(VariableRegistry).filter(
+        VariableRegistry.name == payload.output_variable,
+        VariableRegistry.deleted_at.is_(None),
+    ).first()
+    if defined_output is None or registered_output is None:
+        raise ServiceError(
+            422, "FORMULA_OUTPUT_NOT_DEFINED",
+            f"Output variable '{payload.output_variable}' is not defined in this model version.",
+        )
+    if payload.owner_user_id and db.get(User, payload.owner_user_id) is None:
+        raise ServiceError(
+            422, "FORMULA_OWNER_NOT_FOUND",
+            f"Formula owner '{payload.owner_user_id}' does not exist.",
+        )
+    existing = db.query(FormulaRegistry).filter(
+        FormulaRegistry.model_version_id == model_version_id,
+        FormulaRegistry.output_variable == payload.output_variable,
+        FormulaRegistry.deleted_at.is_(None),
+    ).first()
+    if existing:
+        raise ServiceError(
+            409, "FORMULA_OUTPUT_EXISTS",
+            f"A formula for output '{payload.output_variable}' already exists in this model version.",
+        )
+    group = None
+    if payload.group_id:
+        group = db.query(FormulaGroup).filter(
+            FormulaGroup.id == payload.group_id,
+            FormulaGroup.model_version_id == model_version_id,
+        ).first()
+        if group is None:
+            raise ServiceError(422, "INVALID_FORMULA_GROUP", "Formula group is not in this model version.")
+    else:
+        group = db.query(FormulaGroup).filter(
+            FormulaGroup.model_version_id == model_version_id
+        ).order_by(FormulaGroup.sort_order, FormulaGroup.name).first()
+        if group is None:
+            group = FormulaGroup(
+                model_version_id=model_version_id,
+                name="General",
+                description="Default Formula Studio group",
+                lineage_state="local",
+                version_label="v1",
+                sort_order=0,
+            )
+            db.add(group)
+            db.flush()
+    values = payload.model_dump(exclude={"id"})
+    values["id"] = payload.id or str(uuid.uuid4())
+    values["model_version_id"] = model_version_id
+    values["group_id"] = group.id
+    values["dependencies"] = payload.dependencies or []
+    return register_formula(db, FormulaDefinition(**values), user.id)
 
 
 @router.get("/formulas/{formula_id}/detail")

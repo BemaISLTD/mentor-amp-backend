@@ -7,7 +7,8 @@ Invariants:
    - ModelVersion calculation-affecting fields: block_name, profile_name, basis, methodology,
      configuration, illustrative, notes
    - Formula definitions: output_variable, function_ref, sorted dependencies, expression_text,
-     version, category, basis_applicability, product_applicability
+     version, category, basis/product applicability, unit, explanation, effective date,
+     governed owner, and test cases
    - Variable definitions: variable_name, kind, data_type, unit, required, default_value,
      source rule, allow_scenario_override, version
    - Published outputs: variable_name, display_name, unit, dimension, aggregation
@@ -85,6 +86,11 @@ def build_canonical_model_definition(db: Session, model_version_id: str) -> dict
             "basis_applicability": sorted(formula.basis_applicability or []),
             "dependencies": dep_vars,
             "illustrative": bool(formula.illustrative),
+            "explanation": formula.explanation or "",
+            "unit": formula.unit or "",
+            "effective_date": formula.effective_date.isoformat() if formula.effective_date else None,
+            "owner_user_id": formula.owner_user_id,
+            "test_cases": list(formula.test_cases or []),
         })
 
     # 3. Model variable definitions
@@ -160,6 +166,11 @@ def compute_canonical_fingerprint_from_components(
             "basis_applicability": sorted(f.get("basis_applicability") or []),
             "dependencies": deps,
             "illustrative": bool(f.get("illustrative")),
+            "explanation": f.get("explanation") or "",
+            "unit": f.get("unit") or "",
+            "effective_date": f.get("effective_date"),
+            "owner_user_id": f.get("owner_user_id"),
+            "test_cases": list(f.get("test_cases") or []),
         })
 
     sorted_vars = sorted(variables, key=lambda v: v.get("variable_name") or "")

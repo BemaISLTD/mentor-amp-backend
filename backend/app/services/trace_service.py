@@ -120,7 +120,21 @@ class _TreeBuilder:
             if depth <= 0:
                 node["truncated"] = bool(inputs)
             else:
-                node["children"] = [self.node(name, month, depth - 1) for name in inputs]
+                children = []
+                for name in inputs:
+                    if name.startswith("prior(") and name.endswith(")"):
+                        prior_name = name[6:-1]
+                        prior_month = month - 1
+                        if prior_month >= 1:
+                            children.append(self.node(prior_name, prior_month, depth - 1))
+                        else:
+                            children.append(self._base(
+                                prior_name, prior_month, "prior_default",
+                                (row.input_values or {}).get(name),
+                            ))
+                    else:
+                        children.append(self.node(name, month, depth - 1))
+                node["children"] = children
             return node
 
         if key in self.index.valuation:
@@ -205,7 +219,7 @@ def trace_tree(
         db,
         run,
         policy_id=policy_id,
-        months=list({month, month + 1, max(month, 1)}),
+        months=list({month, month + 1, max(month - 1, 0), max(month, 1)}),
     )
     if not rows:
         traced = _traced_policy_ids(db, run)
@@ -255,6 +269,10 @@ def dependents(
         inputs = row.input_values or {}
         if row.source_type == "formula" and row.projection_month == month and variable in inputs:
             found.append({"variable": row.variable_name, "kind": "formula", "month": month,
+                          "value": unwrap_value(row.output_value), "formula_id": row.formula_id})
+        elif (row.source_type == "formula" and row.projection_month == month + 1
+              and f"prior({variable})" in inputs):
+            found.append({"variable": row.variable_name, "kind": "formula", "month": month + 1,
                           "value": unwrap_value(row.output_value), "formula_id": row.formula_id})
         elif (row.source_type == "prior_output" and row.projection_month == month + 1
               and inputs.get("of_variable") == variable):

@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.projection_engine.run_data import FormulaSpec, VariableSpec
+from app.core.formula_engine.dsl import FormulaDslError, extract_dependencies
 from app.db.models.formula import FormulaRegistry
 from app.db.models.model_variable import ModelVariableDefinition
 
@@ -88,6 +89,13 @@ def variable_closure_rows(
     for formula in formulas:
         wanted.add(formula.output_variable)
         wanted.update(dep.depends_on_variable for dep in formula.dependencies)
+        if formula.function_ref == "dsl" or formula.function_ref.startswith("dsl:"):
+            try:
+                wanted.update(extract_dependencies(formula.expression_text or "").prior_dependencies)
+            except FormulaDslError:
+                # Model validation reports the syntax failure; closure loading reports missing
+                # definitions without trying to execute invalid source.
+                pass
     found: dict[str, ModelVariableDefinition] = {}
     missing: set[str] = set()
     pending = sorted(wanted)

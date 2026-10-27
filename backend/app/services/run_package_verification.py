@@ -22,6 +22,7 @@ from typing import Any
 from app.core.execution import run_package
 from app.core.execution.run_package import RunPackageError
 from app.core.formula_engine.formulas import FORMULA_REGISTRY, implementation_fingerprint
+from app.core.formula_engine.dsl import FormulaDslError, extract_dependencies
 from app.db.models.run import Run
 from app.db.models.run_package import RunPackage
 from app.services import build_info
@@ -81,6 +82,19 @@ def verify_implementations(configuration: dict[str, Any]) -> dict[str, Callable[
     for entry in configuration.get("formulas") or []:
         ref = entry["function_ref"]
         frozen = entry.get("implementation") or {}
+        if ref == "dsl" or ref.startswith("dsl:"):
+            expected = {"type": "mentoramp_formula_dsl", "version": "1"}
+            try:
+                extract_dependencies(entry.get("expression_text") or "")
+            except FormulaDslError as error:
+                mismatched.append({
+                    "function_ref": ref, "expected": expected,
+                    "actual": {"error": error.message},
+                })
+                continue
+            if frozen != expected:
+                mismatched.append({"function_ref": ref, "expected": frozen, "actual": expected})
+            continue
         registration = FORMULA_REGISTRY.get(ref)
         if registration is None:
             missing.append(ref)

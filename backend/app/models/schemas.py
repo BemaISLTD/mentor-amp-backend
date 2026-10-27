@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
@@ -95,6 +95,14 @@ class FormulaDefinition(BaseModel):
     status: Literal["draft", "active", "deprecated", "needs_review", "validated", "approved"] = "draft"
     test_case_ids: list[str] = Field(default_factory=list)
     model_version_id: Optional[str] = None
+    expression_text: Optional[str] = None
+    explanation: Optional[str] = None
+    unit: Optional[str] = None
+    group_id: Optional[str] = None
+    illustrative: bool = False
+    effective_date: Optional[date] = None
+    owner_user_id: Optional[str] = None
+    test_cases: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class FormulaDatabase(BaseModel):

@@ -79,6 +79,19 @@ def assumption_table(
     return catalog_service.table_detail(db, table_id, "assumption", limit, offset)
 
 
+@router.get("/inputs/assumptions/{table_id}/records")
+def assumption_records(
+    table_id: str,
+    user: AssumptionReader,
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    search: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    del user
+    return catalog_service.table_records(db, table_id, "assumption", limit, offset, search)
+
+
 @router.get("/inputs/factor-tables/{table_id}")
 def factor_table(
     table_id: str,
@@ -89,3 +102,16 @@ def factor_table(
 ):
     del user
     return catalog_service.table_detail(db, table_id, "factor", limit, offset)
+
+
+@router.get("/inputs/factors/{table_id}/records")
+def factor_records(
+    table_id: str,
+    user: FactorReader,
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    search: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    del user
+    return catalog_service.table_records(db, table_id, "factor", limit, offset, search)

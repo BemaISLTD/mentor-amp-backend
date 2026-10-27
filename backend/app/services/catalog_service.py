@@ -6,6 +6,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.formula_engine.formulas import FORMULA_FUNCTIONS
+from app.core.formula_engine.dsl import FormulaDslError, extract_dependencies
 from app.core.projection_engine.engine import EngineError, order_formulas
 from app.core.projection_engine.run_data import VariableSpec
 from app.db.models.assumption import AssumptionSet, AssumptionTable
@@ -245,12 +246,33 @@ def model_version_checks(
     model_version_id: str | None = None,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
-    registered = [row for row in formulas if row.function_ref in FORMULA_FUNCTIONS]
+    registered = []
+    dsl_errors: list[str] = []
+    prior_dependencies: list[str] = []
+    for row in formulas:
+        if row.function_ref in FORMULA_FUNCTIONS:
+            registered.append(row)
+        elif row.function_ref == "dsl" or row.function_ref.startswith("dsl:"):
+            try:
+                info = extract_dependencies(row.expression_text or "")
+                stored = sorted(dep.depends_on_variable for dep in row.dependencies)
+                if stored != info.dependencies:
+                    dsl_errors.append(
+                        f"{row.output_variable}: stored dependencies do not match the expression"
+                    )
+                else:
+                    registered.append(row)
+                prior_dependencies.extend(info.prior_dependencies)
+            except FormulaDslError as exc:
+                dsl_errors.append(f"{row.output_variable}: {exc.message}")
     checks.append({
         "code": "functions_registered",
         "label": "Every formula has a registered implementation",
         "status": "pass" if formulas and len(registered) == len(formulas) else "fail",
-        "message": f"{len(registered)} of {len(formulas)} registered",
+        "message": (
+            f"Invalid DSL: {'; '.join(dsl_errors)}" if dsl_errors
+            else f"{len(registered)} of {len(formulas)} executable"
+        ),
     })
     try:
         order_formulas([to_formula_spec(row) for row in formulas])
@@ -262,7 +284,7 @@ def model_version_checks(
     version_id = model_version_id or next((row.model_version_id for row in formulas if row.model_version_id), None)
     names = set(definitions_for(db, version_id)) if version_id else set()
     dependencies = [dep.depends_on_variable for row in formulas for dep in row.dependencies]
-    missing = sorted({name for name in dependencies if name not in names})
+    missing = sorted({name for name in dependencies + prior_dependencies if name not in names})
     checks.append({
         "code": "dependencies_registered",
         "label": "Every dependency is defined for this model version",
@@ -523,6 +545,9 @@ def formula_detail(db: Session, formula_id: str) -> dict[str, Any]:
         "version": row.version,
         "status": row.status,
         "illustrative": bool(row.illustrative),
+        "effective_date": row.effective_date.isoformat() if row.effective_date else None,
+        "owner_user_id": row.owner_user_id,
+        "test_cases": list(row.test_cases or []),
         "group": (
             {"id": group.id, "name": group.name, "lineage_state": group.lineage_state,
              "version_label": group.version_label}
@@ -541,12 +566,7 @@ def formula_detail(db: Session, formula_id: str) -> dict[str, Any]:
             "source": f"{group.name} {group.version_label}" if group else "—",
             "inherited_by": [],
         },
-        "tests": {
-            "available": False,
-            "passing": 0,
-            "total": 0,
-            "message": "Formula tests arrive in M3 with the actuarial reference cases.",
-        },
+        "tests": {"available": bool(row.test_cases), "total": len(row.test_cases or [])},
         "trace": {"available": traced, "latest_run_id": latest_run.id if latest_run else None},
     }
 
@@ -826,6 +846,34 @@ def table_detail(db: Session, table_id: str, kind: str, limit: int, offset: int)
         "total": len(rows),
         "limit": limit,
         "offset": offset,
+    }
+
+
+def table_records(
+    db: Session, table_id: str, kind: str, limit: int, offset: int, search: str | None = None
+) -> dict[str, Any]:
+    table = db.get(AssumptionTable if kind == "assumption" else FactorTable, table_id)
+    if table is None:
+        raise not_found(f"Table '{table_id}' not found.")
+    rows = list(table.data or [])
+    columns: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in columns:
+                columns.append(key)
+    query = (search or "").strip().casefold()
+    if query:
+        rows = [
+            row for row in rows
+            if any(query in str(value).casefold() for value in row.values() if value is not None)
+        ]
+    return {
+        "table_id": table.id,
+        "total": len(rows),
+        "limit": limit,
+        "offset": offset,
+        "columns": columns,
+        "records": rows[offset:offset + limit],
     }
 
 
