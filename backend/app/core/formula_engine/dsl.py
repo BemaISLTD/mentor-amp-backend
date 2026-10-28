@@ -54,6 +54,13 @@ class DependencyInfo:
     functions_used: list[str]
 
 
+@dataclass(frozen=True)
+class CompiledDslExpression:
+    expression_text: str
+    tree: ast.Expression
+    dependency_info: DependencyInfo
+
+
 _BINARY_OPERATORS = {
     ast.Add: lambda left, right: left + right,
     ast.Sub: lambda left, right: left - right,
@@ -226,16 +233,26 @@ class _DependencyExtractor(ast.NodeVisitor):
             self.visit(keyword.value)
 
 
-def extract_dependencies(expression_text: str) -> DependencyInfo:
-    """Validate an expression and return its deterministic dependency metadata."""
+def compile_expression(expression_text: str) -> CompiledDslExpression:
+    """Validate syntax once, extract dependencies once, and return frozen compiled expression."""
     tree = _parse(expression_text)
     extractor = _DependencyExtractor()
     extractor.visit(tree)
-    return DependencyInfo(
+    info = DependencyInfo(
         dependencies=sorted(extractor.dependencies),
         prior_dependencies=sorted(extractor.prior_dependencies),
         functions_used=sorted(extractor.functions_used),
     )
+    return CompiledDslExpression(
+        expression_text=expression_text,
+        tree=tree,
+        dependency_info=info,
+    )
+
+
+def extract_dependencies(expression_text: str) -> DependencyInfo:
+    """Validate an expression and return its deterministic dependency metadata."""
+    return compile_expression(expression_text).dependency_info
 
 
 def validate_expression(expression_text: str) -> DependencyInfo:
@@ -387,14 +404,23 @@ class _Evaluator:
         raise FormulaEvaluationError(f"Function '{name}' is not supported.", **_location(node))
 
 
+def evaluate_compiled(
+    compiled: CompiledDslExpression,
+    inputs: Mapping[str, Any],
+    prior_inputs: Mapping[str, Any] | None = None,
+) -> Any:
+    """Evaluate a pre-compiled AST expression against explicit current/prior input mappings."""
+    result = _Evaluator(inputs, prior_inputs or {}).evaluate(compiled.tree)
+    if not isinstance(result, (int, float, bool)):
+        raise FormulaEvaluationError("Formula result must be numeric or boolean.")
+    return result
+
+
 def evaluate_expression(
     expression_text: str,
     inputs: Mapping[str, Any],
     prior_inputs: Mapping[str, Any] | None = None,
 ) -> Any:
-    """Validate and evaluate an expression against explicit current/prior input mappings."""
-    tree = _parse(expression_text)
-    result = _Evaluator(inputs, prior_inputs or {}).evaluate(tree)
-    if not isinstance(result, (int, float, bool)):
-        raise FormulaEvaluationError("Formula result must be numeric or boolean.")
-    return result
+    """Validate, compile, and evaluate an expression against explicit current/prior input mappings."""
+    compiled = compile_expression(expression_text)
+    return evaluate_compiled(compiled, inputs, prior_inputs)

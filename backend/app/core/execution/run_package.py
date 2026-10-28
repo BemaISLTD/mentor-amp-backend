@@ -188,15 +188,25 @@ def verify_envelope(
 
 
 def formula_spec(entry: Mapping[str, Any]) -> FormulaSpec:
+    compiled = None
+    expr = entry.get("expression_text")
+    fref = entry.get("function_ref") or ""
+    if expr and (fref == "dsl" or fref.startswith("dsl:")):
+        from app.core.formula_engine.dsl import compile_expression
+        try:
+            compiled = compile_expression(expr)
+        except Exception:
+            pass
     return FormulaSpec(
         id=entry["id"],
         name=entry["name"],
         output_variable=entry["output_variable"],
-        function_ref=entry["function_ref"],
+        function_ref=fref,
         dependencies=tuple(entry.get("dependencies") or ()),
-        expression_text=entry.get("expression_text"),
+        expression_text=expr,
         version=entry.get("version") or "v1",
         illustrative=bool(entry.get("illustrative")),
+        compiled_expression=compiled,
     )
 
 

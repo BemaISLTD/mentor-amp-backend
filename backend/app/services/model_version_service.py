@@ -511,20 +511,23 @@ def dependency_analysis(
     ).order_by(FormulaRegistry.output_variable).all()
     ordered = order_formulas([to_formula_spec(row) for row in formulas])
     execution_order = [row.output_variable for row in ordered]
-    dependencies: dict[str, set[str]] = {}
+    same_step_deps: dict[str, set[str]] = {}
+    prior_deps: dict[str, set[str]] = {}
     for row in formulas:
         names = {item.depends_on_variable for item in row.dependencies}
+        priors: set[str] = set()
         if row.function_ref == "dsl" or row.function_ref.startswith("dsl:"):
             try:
-                names.update(extract_dependencies(row.expression_text or "").prior_dependencies)
+                priors = set(extract_dependencies(row.expression_text or "").prior_dependencies)
             except FormulaDslError:
                 pass
-        dependencies[row.output_variable] = names
+        same_step_deps[row.output_variable] = names
+        prior_deps[row.output_variable] = priors
 
     upstream: set[str] = set()
 
     def collect_upstream(name: str) -> None:
-        for dependency in dependencies.get(name, set()):
+        for dependency in same_step_deps.get(name, set()):
             if dependency not in upstream:
                 upstream.add(dependency)
                 collect_upstream(dependency)
@@ -533,7 +536,7 @@ def dependency_analysis(
         collect_upstream(variable)
 
     reverse: dict[str, set[str]] = {}
-    for output, names in dependencies.items():
+    for output, names in same_step_deps.items():
         for name in names:
             reverse.setdefault(name, set()).add(output)
     downstream: set[str] = set()
@@ -551,6 +554,8 @@ def dependency_analysis(
         "model_version_id": version_id,
         "variable": variable,
         "execution_order": execution_order,
+        "same_step_dependencies": sorted(same_step_deps.get(variable, set())) if variable else {k: sorted(v) for k, v in same_step_deps.items()},
+        "prior_dependencies": sorted(prior_deps.get(variable, set())) if variable else {k: sorted(v) for k, v in prior_deps.items()},
         "upstream_dependencies": ordered_upstream,
         "downstream_impacted": [name for name in execution_order if name in downstream],
     }

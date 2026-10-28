@@ -1016,3 +1016,132 @@ def test_execution_error_after_written_results_can_retry_on_postgres(
     with Session() as db:
         assert db.query(RunArtifact).filter_by(run_id=run_id).count() > 0
     _assert_terminal_run_can_retry(Session, run_id, user_id, "failed")
+
+
+# =============================================================================
+# M3 Expected Results & Reconciliation Immutability Triggers (Sections 5, 7, 8)
+# =============================================================================
+
+def test_m3_migration_downgrade_and_upgrade_on_postgres(pg):
+    """M3 migration downgrade one revision (e5b2c9a1d408) and upgrade back to head."""
+    engine, config = pg
+    reset(engine)
+    command.upgrade(config, "head")
+    assert current(engine) == [HEAD]
+
+    # Downgrade 1 revision to e5b2c9a1d408
+    command.downgrade(config, "e5b2c9a1d408")
+    assert current(engine) == ["e5b2c9a1d408"]
+
+    # Upgrade back to head
+    command.upgrade(config, HEAD)
+    assert current(engine) == [HEAD]
+
+
+def test_m3_expected_results_and_reconciliation_immutability_triggers_on_postgres(pg):
+    """M3 PostgreSQL triggers: refusal of content UPDATE, refusal of report calculation UPDATE, and FK RESTRICT."""
+    engine, config = pg
+    reset(engine)
+    command.upgrade(config, "head")
+
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        # 1. Create a dummy project and user
+        proj_id = str(uuid.uuid4())
+        user_id = str(uuid.uuid4())
+        db.execute(text("""
+            INSERT INTO users (id, email, password_hash, full_name, is_active)
+            VALUES (:uid, 'tester@example.com', 'dummyhash', 'Test User', true)
+        """), {"uid": user_id})
+        db.execute(text("""
+            INSERT INTO projects (id, name, description, status, created_by, updated_by)
+            VALUES (:pid, 'Test Project', 'M3 Postgres Test', 'active', :uid, :uid)
+        """), {"pid": proj_id, "uid": user_id})
+
+        # 2. Insert ExpectedResultSet
+        exp_id = str(uuid.uuid4())
+        db.execute(text("""
+            INSERT INTO expected_result_sets (
+                id, project_id, name, product_code, version_label, source_reference,
+                granularity, row_count, columns_detected, rows_data, fingerprint, status, created_by
+            ) VALUES (
+                :id, :pid, 'Bench 1', 'spia_lite', 'v1', 'test',
+                'policy_month', 1, '["reserve"]', '[{"policy_id": "P1", "reserve": 100}]'::jsonb,
+                'fp1234567890', 'validated', :uid
+            )
+        """), {"id": exp_id, "pid": proj_id, "uid": user_id})
+        db.commit()
+
+        # 3. Test Trigger: UPDATE to expected_result_sets content must be REFUSED
+        with pytest.raises(DBAPIError) as exc_info:
+            db.execute(text("""
+                UPDATE expected_result_sets
+                SET rows_data = '[{"policy_id": "P1", "reserve": 999}]'::jsonb
+                WHERE id = :id
+            """), {"id": exp_id})
+            db.commit()
+        db.rollback()
+        assert "immutable" in str(exc_info.value).lower() or "expected_result" in str(exc_info.value).lower()
+
+        # 4. Create Run and ReconciliationReport
+        run_id = str(uuid.uuid4())
+        db.execute(text("""
+            INSERT INTO runs (
+                id, project_id, name, projection_key, status, illustrative, valuation_date, horizon_months, triggered_by
+            ) VALUES (
+                :rid, :pid, 'Run 1', 'key1', 'success', false, '2026-01-01', 12, :uid
+            )
+        """), {"rid": run_id, "pid": proj_id, "uid": user_id})
+
+        rep_id = str(uuid.uuid4())
+        db.execute(text("""
+            INSERT INTO reconciliation_reports (
+                id, project_id, run_id, expected_result_set_id, level, abs_tol, rel_tol,
+                status, summary, failures, created_by
+            ) VALUES (
+                :id, :pid, :rid, :eid, 'policy_month', 0.01, 0.0001,
+                'PASS', '{"cells_checked": 1}'::jsonb, '[]'::jsonb, :uid
+            )
+        """), {"id": rep_id, "pid": proj_id, "rid": run_id, "eid": exp_id, "uid": user_id})
+        db.commit()
+
+        # 5. Test FK RESTRICT: DELETE of ExpectedResultSet referenced by report must be REFUSED
+        with pytest.raises(DBAPIError) as exc_info:
+            db.execute(text("DELETE FROM expected_result_sets WHERE id = :id"), {"id": exp_id})
+            db.commit()
+        db.rollback()
+        assert "foreign key" in str(exc_info.value).lower() or "restrict" in str(exc_info.value).lower()
+
+        # 6. Test Trigger: UPDATE to reconciliation_reports calculation evidence must be REFUSED
+        with pytest.raises(DBAPIError) as exc_info:
+            db.execute(text("""
+                UPDATE reconciliation_reports
+                SET status = 'FAIL'
+                WHERE id = :id
+            """), {"id": rep_id})
+            db.commit()
+        db.rollback()
+        assert "immutable" in str(exc_info.value).lower() or "calculation" in str(exc_info.value).lower()
+
+        # 7. Test: UPDATE to reviewer disposition fields is ALLOWED
+        db.execute(text("""
+            UPDATE reconciliation_reports
+            SET disposition_status = 'approved',
+                disposition_notes = 'Reviewed and approved by actuary',
+                disposition_by = :uid,
+                disposition_at = NOW(),
+                disposition_history = '[{"to_status": "approved"}]'::jsonb
+            WHERE id = :id
+        """), {"id": rep_id, "uid": user_id})
+        db.commit()
+
+        # Verify disposition updated
+        row = db.execute(text("SELECT disposition_status FROM reconciliation_reports WHERE id = :id"), {"id": rep_id}).one()
+        assert row[0] == "approved"
+
+        # 8. Test Trigger: DELETE of reconciliation_reports must be REFUSED
+        with pytest.raises(DBAPIError) as exc_info:
+            db.execute(text("DELETE FROM reconciliation_reports WHERE id = :id"), {"id": rep_id})
+            db.commit()
+        db.rollback()
+        assert "immutable" in str(exc_info.value).lower() or "delete" in str(exc_info.value).lower()

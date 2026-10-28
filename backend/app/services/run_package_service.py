@@ -528,10 +528,31 @@ def collect(
         build = build_identity()
     except BuildIdentityUnavailable as error:
         problems.append(Problem("BUILD_IDENTITY_UNAVAILABLE", str(error)))
+    from app.core.model_fingerprint import compute_model_definition_fingerprint
+    version, owning_model = model.version, model.model
+    model_def_fp = compute_model_definition_fingerprint(db, version.id)
+    if version.status in (lifecycle.APPROVED, lifecycle.PUBLISHED):
+        if version.approved_fingerprint and version.approved_fingerprint != model_def_fp:
+            problems.append(Problem(
+                "MODEL_APPROVAL_STALE",
+                f"Model version '{version.version_label}' definition was modified after approval; re-approval required.",
+            ))
+    all_formulas_approved = all(row.status in (lifecycle.VALIDATED, lifecycle.APPROVED) for row in model.formulas)
+    is_governed = bool(
+        version.status in (lifecycle.APPROVED, lifecycle.PUBLISHED)
+        and projection_set.status in ("validated", "approved")
+        and all_formulas_approved
+        and not problems
+    )
+    governance_mode = "governed" if is_governed else "sandbox"
+    if (projection_set.parameters or {}).get("governance_mode") == "governed" and not is_governed:
+        problems.append(Problem(
+            "GOVERNED_RUN_REQUIREMENTS_NOT_MET",
+            "Governed run requires an approved/published model version and validated/approved formulas.",
+        ))
+
     if problems:
         return None, None, problems
-
-    version, owning_model = model.version, model.model
     configuration: dict[str, Any] = {
         "project": {"id": project.id},
         "projection_set": {
@@ -552,6 +573,11 @@ def collect(
             # Immutable model-specific provenance and calculation settings. This is part
             # of the executable configuration fingerprint, not mutable governance state.
             "configuration": dict(version.configuration or {}),
+            "model_definition_fingerprint": model_def_fp,
+            "validation_fingerprint": version.validation_fingerprint,
+            "approved_fingerprint": version.approved_fingerprint,
+            "governance_mode": governance_mode,
+            "is_governed": is_governed,
         },
         "valuation_date": iso(projection_set.valuation_date),
         "horizon_months": projection_set.horizon_months,
@@ -612,6 +638,11 @@ def collect(
         "build": build,
     }
     governance = {
+        "governance_mode": governance_mode,
+        "is_governed": is_governed,
+        "model_definition_fingerprint": model_def_fp,
+        "validation_fingerprint": version.validation_fingerprint,
+        "approved_fingerprint": version.approved_fingerprint,
         "projection_set": {
             "status": projection_set.status,
             "validated_at": (projection_set.validation or {}).get("validated_at"),

@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import DateTime, Float, ForeignKey, Integer, JSON, String, Text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.database import Base
 
@@ -38,6 +38,13 @@ class ExpectedResultSet(Base):
     created_by: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    approved_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    superseded_by_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("expected_result_sets.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
@@ -55,8 +62,15 @@ class ReconciliationReport(Base):
         String(36), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True
     )
     expected_result_set_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("expected_result_sets.id", ondelete="SET NULL"), nullable=True
+        String(36), ForeignKey("expected_result_sets.id", ondelete="RESTRICT"), nullable=True
     )
+    level: Mapped[str] = mapped_column(String(30), default="policy_month", nullable=False)
+    variables_requested: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    expected_result_fingerprint: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    expected_result_version: Mapped[str] = mapped_column(String(30), default="v1", nullable=False)
+    timing_convention_snapshot: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    granularity_snapshot: Mapped[str] = mapped_column(String(30), default="policy_month", nullable=False)
+
     policy_id_filter: Mapped[str | None] = mapped_column(String(255), nullable=True)
     abs_tol: Mapped[float] = mapped_column(Float, default=1e-2, nullable=False)
     rel_tol: Mapped[float] = mapped_column(Float, default=1e-4, nullable=False)
@@ -67,6 +81,7 @@ class ReconciliationReport(Base):
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     disposition_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    disposition_history: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     summary: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     failures: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     created_by: Mapped[str | None] = mapped_column(

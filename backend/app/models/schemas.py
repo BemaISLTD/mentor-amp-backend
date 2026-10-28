@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import uuid
+
 from datetime import date, datetime
+import math
 from typing import Any, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # =============================================================================
@@ -81,8 +84,47 @@ class VariableDefinition(BaseModel):
     status: Literal["valid", "invalid", "missing_dependency", "circular_reference"] = "valid"
 
 
+class FormulaTestCase(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    prior_inputs: dict[str, Any] = Field(default_factory=dict)
+    expected_output: float
+    abs_tol: float = Field(0.0, ge=0.0)
+
+    @field_validator("expected_output")
+    @classmethod
+    def validate_finite_output(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("expected_output must be finite")
+        return v
+
+    @field_validator("inputs", "prior_inputs")
+    @classmethod
+    def validate_inputs(cls, v: dict[str, Any]) -> dict[str, Any]:
+        if len(v) > 100:
+            raise ValueError("Too many inputs in test case (max 100).")
+        for k, val in v.items():
+            if isinstance(val, (int, float)) and not math.isfinite(val):
+                raise ValueError(f"Value for '{k}' must be finite.")
+        return v
+
+
+class FormulaUpdateRequest(BaseModel):
+    name: Optional[str] = Field(None, max_length=255)
+    expression_text: Optional[str] = Field(None, max_length=10_000)
+    dependencies: Optional[list[str]] = None
+    function_ref: Optional[str] = None
+    explanation: Optional[str] = Field(None, max_length=5_000)
+    unit: Optional[str] = Field(None, max_length=50)
+    illustrative: Optional[bool] = None
+    effective_date: Optional[date] = None
+    owner_user_id: Optional[str] = None
+    test_cases: Optional[list[FormulaTestCase]] = Field(None, max_length=50)
+    description: Optional[str] = Field(None, max_length=5_000)
+
+
 class FormulaDefinition(BaseModel):
-    id: str
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     name: str
     output_variable: str
     function_ref: str

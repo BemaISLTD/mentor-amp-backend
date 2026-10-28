@@ -72,7 +72,7 @@ class ReconcileRequest(BaseModel):
 
 
 class DispositionRequest(BaseModel):
-    disposition_status: Literal["approved", "exception_noted", "rejected"]
+    disposition_status: Literal["approved", "approved_with_exception", "exception_noted", "rejected"]
     disposition_notes: str | None = None
 
 
@@ -98,6 +98,9 @@ async def upload_expected_results(
     db: Session = Depends(get_db),
 ):
     _require_expected_writer(db, user, project_id)
+    cl = request.headers.get("content-length")
+    if cl and int(cl) > 10 * 1024 * 1024:
+        raise ServiceError(422, "PAYLOAD_TOO_LARGE", "Expected results upload exceeds maximum 10 MB limit.")
     content_type = request.headers.get("content-type", "")
     if content_type.startswith("multipart/form-data"):
         form = await request.form()
@@ -147,10 +150,8 @@ def get_expected_results(
     include_rows: bool = Query(True),
     db: Session = Depends(get_db),
 ):
+    access.require_object_access(db, user, "expected_result_set", expected_result_id)
     row = db.get(ExpectedResultSet, expected_result_id)
-    if row is None:
-        raise not_found("Expected result set not found.")
-    access.require_project_access(db, user, row.project_id)
     return reconciliation_service.expected_view(row, include_rows=include_rows)
 
 
@@ -176,10 +177,8 @@ def get_reconciliation(
     user: Annotated[User, Depends(get_current_user)],
     db: Session = Depends(get_db),
 ):
+    access.require_object_access(db, user, "reconciliation_report", reconciliation_id)
     row = db.get(ReconciliationReport, reconciliation_id)
-    if row is None:
-        raise not_found("Reconciliation report not found.")
-    access.require_project_access(db, user, row.project_id)
     return reconciliation_service.report_view(row)
 
 
@@ -190,10 +189,8 @@ def set_reconciliation_disposition(
     user: Annotated[User, Depends(get_current_user)],
     db: Session = Depends(get_db),
 ):
+    access.require_object_access(db, user, "reconciliation_report", reconciliation_id)
     row = db.get(ReconciliationReport, reconciliation_id)
-    if row is None:
-        raise not_found("Reconciliation report not found.")
-    access.require_project_access(db, user, row.project_id)
     roles = {role.name for role in user.roles}
     if "models:approve" not in _permissions(user) and "admin" not in roles:
         raise ServiceError(403, "RECONCILIATION_REVIEW_FORBIDDEN", "Reviewer permission is required.")

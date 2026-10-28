@@ -21,7 +21,8 @@ from typing import Any
 
 from app.core.dependency_engine.graph import topological_sort
 from app.core.formula_engine.dsl import (
-    FormulaDslError, FormulaEvaluationError, evaluate_expression, extract_dependencies,
+    FormulaDslError, FormulaEvaluationError, evaluate_expression, evaluate_compiled,
+    compile_expression, extract_dependencies,
 )
 from app.core.projection_engine.run_data import (
     FormulaSpec,
@@ -34,7 +35,7 @@ from app.core.valuation import illustrative_reserve
 
 # Identifies the calculation semantics of this engine. Change it whenever a change to the engine
 # could alter results: a run package frozen under one engine version is refused by another.
-ENGINE_VERSION = "m1-cpu-1"
+ENGINE_VERSION = "m3-cpu-dsl-1"
 
 CONTEXT_FIELDS = (
     "projection_month",
@@ -175,6 +176,13 @@ class _PolicyCalculator:
             for spec in data.valuation_variables()
             if spec.source.get("rate")
         }
+        self.compiled_dsl: dict[str, Any] = {}
+        for f in data.formulas:
+            if f.function_ref == "dsl" or f.function_ref.startswith("dsl:"):
+                if getattr(f, "compiled_expression", None) is not None:
+                    self.compiled_dsl[f.output_variable] = f.compiled_expression
+                elif f.expression_text:
+                    self.compiled_dsl[f.output_variable] = compile_expression(f.expression_text)
         # per-month state
         self.month = 0
         self.context: dict[str, Any] = {}
@@ -446,15 +454,19 @@ class _PolicyCalculator:
         inputs = {dependency: self.resolve(dependency) for dependency in formula.dependencies}
         try:
             if formula.function_ref == "dsl" or formula.function_ref.startswith("dsl:"):
-                if not formula.expression_text:
-                    raise FormulaEvaluationError("DSL formula has no expression text.")
-                prior_names = extract_dependencies(formula.expression_text).prior_dependencies
+                compiled = self.compiled_dsl.get(formula.output_variable)
+                if compiled is None:
+                    if not formula.expression_text:
+                        raise FormulaEvaluationError("DSL formula has no expression text.")
+                    compiled = compile_expression(formula.expression_text)
+                    self.compiled_dsl[formula.output_variable] = compiled
+                prior_names = compiled.dependency_info.prior_dependencies
                 prior_inputs = {
                     name: self.previous_values[name]
                     for name in prior_names
                     if name in self.previous_values
                 }
-                value = evaluate_expression(formula.expression_text, inputs, prior_inputs)
+                value = evaluate_compiled(compiled, inputs, prior_inputs)
             else:
                 func = self.functions.get(formula.function_ref)
                 if func is None:
@@ -593,10 +605,13 @@ class _PolicyCalculator:
                 prior_values = {}
                 for formula in self.data.formulas:
                     if formula.function_ref == "dsl" or formula.function_ref.startswith("dsl:"):
-                        for name in extract_dependencies(
-                            formula.expression_text or ""
-                        ).prior_dependencies:
-                            prior_values[name] = self.resolve(name)
+                        compiled = self.compiled_dsl.get(formula.output_variable)
+                        if compiled is None and formula.expression_text:
+                            compiled = compile_expression(formula.expression_text)
+                            self.compiled_dsl[formula.output_variable] = compiled
+                        if compiled is not None:
+                            for name in compiled.dependency_info.prior_dependencies:
+                                prior_values[name] = self.resolve(name)
                 self.previous_values = {
                     **{name: item.value for name, item in self.resolved.items()},
                     **self.computed,

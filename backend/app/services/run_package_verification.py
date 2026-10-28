@@ -66,6 +66,13 @@ def verify_build(configuration: dict[str, Any]) -> dict[str, Any]:
         raise RunPackageError("BUILD_IDENTITY_UNAVAILABLE", str(error)) from error
     mismatches = build_info.build_mismatches(configuration.get("build") or {}, current)
     if mismatches:
+        if "engine_version" in mismatches:
+            raise RunPackageError(
+                "ENGINE_VERSION_MISMATCH",
+                "The run was frozen under a different engine version than this worker runs "
+                f"({mismatches['engine_version']['expected']} != {mismatches['engine_version']['actual']}).",
+                {"mismatched": mismatches},
+            )
         raise RunPackageError(
             "BUILD_IDENTITY_MISMATCH",
             "The run was frozen under a different build than this worker runs "

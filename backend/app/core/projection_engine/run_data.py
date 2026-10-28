@@ -60,6 +60,7 @@ class FormulaSpec:
     expression_text: str | None = None
     version: str = "v1"
     illustrative: bool = False
+    compiled_expression: Any = None
 
 
 @dataclass

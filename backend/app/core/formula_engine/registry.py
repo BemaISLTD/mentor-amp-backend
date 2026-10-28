@@ -170,6 +170,8 @@ def register(db: Session, formula: FormulaDefinition, actor_user_id: str) -> For
         created_by=actor_user_id,
         updated_by=actor_user_id,
     )
+    if mv_id:
+        invalidate_model_validation(db, mv_id, actor_user_id)
     db.add(model)
     for dep_var in dependencies:
         model.dependencies.append(FormulaDependency(depends_on_variable=dep_var))

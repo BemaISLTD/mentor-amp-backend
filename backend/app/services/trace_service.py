@@ -206,6 +206,14 @@ class _TreeBuilder:
                 node["source"] = {"type": kind}
             return node
 
+        if month <= 0:
+            node = self._base(variable, month, "prior_default", 0.0)
+            node["source"] = {"type": "prior_default", "initial_value": True}
+            return node
+        if depth <= 0:
+            node = self._base(variable, month, "truncated", None)
+            node["truncated"] = True
+            return node
         raise not_found(f"No trace for '{variable}' at month {month}.")
 
 
@@ -215,11 +223,12 @@ def trace_tree(
 ) -> dict[str, Any]:
     run = result_run(db, run_id, include_partial)
     depth = max(0, min(depth, MAX_DEPTH))
+    months_to_load = list(range(max(0, month - depth), month + 2))
     rows = _accepted(
         db,
         run,
         policy_id=policy_id,
-        months=list({month, month + 1, max(month - 1, 0), max(month, 1)}),
+        months=months_to_load,
     )
     if not rows:
         traced = _traced_policy_ids(db, run)

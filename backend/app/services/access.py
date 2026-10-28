@@ -25,6 +25,7 @@ from app.db.models.inforce import InforceFile
 from app.db.models.modeling import Model, ModelVersion
 from app.db.models.project import Project
 from app.db.models.project_member import WRITE_ROLES, ProjectMember
+from app.db.models.reconciliation import ExpectedResultSet, ReconciliationReport
 from app.db.models.projection import ProjectionSet, RunSet
 from app.db.models.product import AssetPosition, Product
 from app.db.models.run import Run
@@ -200,6 +201,8 @@ RESOLVERS: dict[str, Callable[[Session, str], str | None]] = {
     "rollforward_job": _governed_project(RollforwardJob),
     "report": _governed_project(Report, soft_delete=True),
     "derived_dataset": _governed_project(DerivedDataset, soft_delete=True),
+    "expected_result_set": _governed_project(ExpectedResultSet),
+    "reconciliation_report": _governed_project(ReconciliationReport),
 }
 
 LABELS = {
@@ -210,6 +213,7 @@ LABELS = {
     "product": "Product", "asset_position": "Asset position",
     "rollforward_template": "Rollforward template", "rollforward_job": "Rollforward job",
     "report": "Report", "derived_dataset": "Derived dataset",
+    "expected_result_set": "Expected result set", "reconciliation_report": "Reconciliation report",
 }
 
 
