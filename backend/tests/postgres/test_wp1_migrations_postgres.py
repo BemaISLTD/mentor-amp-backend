@@ -1050,12 +1050,12 @@ def test_m3_expected_results_and_reconciliation_immutability_triggers_on_postgre
         proj_id = str(uuid.uuid4())
         user_id = str(uuid.uuid4())
         db.execute(text("""
-            INSERT INTO users (id, email, password_hash, full_name, is_active)
-            VALUES (:uid, 'tester@example.com', 'dummyhash', 'Test User', true)
+            INSERT INTO users (id, email, password_hash, full_name, is_active, created_at, updated_at)
+            VALUES (:uid, 'tester@example.com', 'dummyhash', 'Test User', true, now(), now())
         """), {"uid": user_id})
         db.execute(text("""
-            INSERT INTO projects (id, name, description, status, created_by, updated_by)
-            VALUES (:pid, 'Test Project', 'M3 Postgres Test', 'active', :uid, :uid)
+            INSERT INTO projects (id, name, description, created_by, updated_by, created_at, updated_at)
+            VALUES (:pid, 'Test Project', 'M3 Postgres Test', :uid, :uid, now(), now())
         """), {"pid": proj_id, "uid": user_id})
 
         # 2. Insert ExpectedResultSet
@@ -1063,11 +1063,13 @@ def test_m3_expected_results_and_reconciliation_immutability_triggers_on_postgre
         db.execute(text("""
             INSERT INTO expected_result_sets (
                 id, project_id, name, product_code, version_label, source_reference,
-                granularity, row_count, columns_detected, rows_data, fingerprint, status, created_by
+                granularity, row_count, columns_detected, rows_data, fingerprint, status, created_by,
+                created_at, updated_at
             ) VALUES (
                 :id, :pid, 'Bench 1', 'spia_lite', 'v1', 'test',
                 'policy_month', 1, '["reserve"]', '[{"policy_id": "P1", "reserve": 100}]'::jsonb,
-                'fp1234567890', 'validated', :uid
+                'fp1234567890', 'validated', :uid,
+                now(), now()
             )
         """), {"id": exp_id, "pid": proj_id, "uid": user_id})
         db.commit()
@@ -1087,9 +1089,9 @@ def test_m3_expected_results_and_reconciliation_immutability_triggers_on_postgre
         run_id = str(uuid.uuid4())
         db.execute(text("""
             INSERT INTO runs (
-                id, project_id, name, projection_key, status, illustrative, valuation_date, horizon_months, triggered_by
+                id, project_id, name, projection_key, status, illustrative, valuation_date, horizon_months, triggered_by, created_at
             ) VALUES (
-                :rid, :pid, 'Run 1', 'key1', 'success', false, '2026-01-01', 12, :uid
+                :rid, :pid, 'Run 1', 'key1', 'success', false, '2026-01-01', 12, :uid, now()
             )
         """), {"rid": run_id, "pid": proj_id, "uid": user_id})
 
@@ -1097,20 +1099,20 @@ def test_m3_expected_results_and_reconciliation_immutability_triggers_on_postgre
         db.execute(text("""
             INSERT INTO reconciliation_reports (
                 id, project_id, run_id, expected_result_set_id, level, abs_tol, rel_tol,
-                status, summary, failures, created_by
+                status, summary, failures, created_by, created_at
             ) VALUES (
                 :id, :pid, :rid, :eid, 'policy_month', 0.01, 0.0001,
-                'PASS', '{"cells_checked": 1}'::jsonb, '[]'::jsonb, :uid
+                'PASS', '{"cells_checked": 1}'::jsonb, '[]'::jsonb, :uid, now()
             )
         """), {"id": rep_id, "pid": proj_id, "rid": run_id, "eid": exp_id, "uid": user_id})
         db.commit()
 
-        # 5. Test FK RESTRICT: DELETE of ExpectedResultSet referenced by report must be REFUSED
+        # 5. Test FK RESTRICT / Trigger: DELETE of ExpectedResultSet referenced by report must be REFUSED
         with pytest.raises(DBAPIError) as exc_info:
             db.execute(text("DELETE FROM expected_result_sets WHERE id = :id"), {"id": exp_id})
             db.commit()
         db.rollback()
-        assert "foreign key" in str(exc_info.value).lower() or "restrict" in str(exc_info.value).lower()
+        assert "foreign key" in str(exc_info.value).lower() or "restrict" in str(exc_info.value).lower() or "immutable" in str(exc_info.value).lower()
 
         # 6. Test Trigger: UPDATE to reconciliation_reports calculation evidence must be REFUSED
         with pytest.raises(DBAPIError) as exc_info:
