@@ -121,6 +121,11 @@ class FormulaUpdateRequest(BaseModel):
     owner_user_id: Optional[str] = None
     test_cases: Optional[list[FormulaTestCase]] = Field(None, max_length=50)
     description: Optional[str] = Field(None, max_length=5_000)
+    status: Optional[Literal["draft", "active", "deprecated", "needs_review", "validated", "approved"]] = None
+    category: Optional[str] = None
+    product_applicability: Optional[list[str]] = None
+    basis_applicability: Optional[list[str]] = None
+    version: Optional[str] = None
 
 
 class FormulaDefinition(BaseModel):

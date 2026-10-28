@@ -412,7 +412,7 @@ def test_package_frozen_for_another_engine_version_is_refused(env, calculation_s
     monkeypatch.setattr(run_package_verification, "current_build_identity",
                         lambda: {**current, "engine_version": "some-later-engine"})
     env.execute(submitted)
-    assert_refused_before_calculation(env, submitted["by_scenario"]["Base"], "ENGINE_VERSION_MISMATCH", calculation_spy)
+    assert_refused_before_calculation(env, submitted["by_scenario"]["Base"], "BUILD_IDENTITY_MISMATCH", calculation_spy)
 
 
 # =============================================================================
