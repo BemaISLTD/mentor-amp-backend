@@ -333,9 +333,12 @@ def _cell_maps(
     policy_id: str | None,
     variables: list[str] | None,
     level: str,
+    run_scenario_id: str = "",
+    valid_run_scenarios: set[str] | None = None,
 ) -> tuple[dict[tuple, float], dict[tuple, float]]:
     allowed = set(variables or [])
     expected_cells: dict[tuple, float] = {}
+    valid_scenarios = valid_run_scenarios or ({run_scenario_id} if run_scenario_id else set())
 
     # Extract expected cells
     if level == "aggregate_year" and expected.granularity == "policy_month":
@@ -347,6 +350,9 @@ def _cell_maps(
         exp_aggs = _resolve_aggregations(db, run, configuration, needed_vars)
         exp_grouped: dict[tuple[str, int, str], list[tuple[int, float]]] = defaultdict(list)
         for row in expected.rows_data:
+            row_scenario = str(row.get("scenario_id") or "").strip()
+            if row_scenario and valid_scenarios and (row_scenario not in valid_scenarios):
+                continue
             row_policy = str(row.get("policy_id") or "").strip()
             if policy_id and row_policy and row_policy != policy_id:
                 continue
@@ -373,9 +379,12 @@ def _cell_maps(
             exp_policy_year[(year, var)].append(val)
 
         for (year, var), values in exp_policy_year.items():
-            expected_cells[(year, var)] = sum(values)
+            expected_cells[(run_scenario_id, year, var)] = sum(values)
     else:
         for row in expected.rows_data:
+            row_scenario = str(row.get("scenario_id") or "").strip()
+            if row_scenario and valid_scenarios and (row_scenario not in valid_scenarios):
+                continue
             row_policy = str(row.get("policy_id") or "").strip()
             if level == "policy_month" and policy_id and row_policy != policy_id:
                 continue
@@ -389,10 +398,10 @@ def _cell_maps(
                 if allowed and variable not in allowed:
                     continue
                 if level == "policy_month":
-                    key = (str(row.get("policy_id") or ""), period, variable)
+                    key = (str(row.get("policy_id") or ""), run_scenario_id, period, variable)
                     expected_cells[key] = float(value)
                 else:
-                    key = (year, variable)
+                    key = (run_scenario_id, year, variable)
                     expected_cells[key] = float(value)
 
     # Extract actual cells
@@ -408,11 +417,11 @@ def _cell_maps(
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 continue
             month = int(row["projection_month"])
-            key = (row["policy_id"], month, variable)
+            key = (row["policy_id"], run_scenario_id, month, variable)
             actual_cells[key] = float(value)
     else:
         # P0 Section 3: Aggregate-year reconciliation must use variable aggregation semantics
-        needed_vars = {key[1] for key in expected_cells}
+        needed_vars = {key[2] for key in expected_cells}
         aggregations = _resolve_aggregations(db, run, configuration, needed_vars)
 
         # Group actual rows by (policy_id, year, variable)
@@ -447,7 +456,7 @@ def _cell_maps(
 
         # Portfolio aggregate across policies
         for (year, var), values in policy_year_aggregates.items():
-            actual_cells[(year, var)] = sum(values)
+            actual_cells[(run_scenario_id, year, var)] = sum(values)
 
     return expected_cells, actual_cells
 
@@ -481,16 +490,34 @@ def reconcile(db: Session, run_id: str, payload: dict[str, Any], actor_id: str) 
             f"Expected results product '{expected.product_code}' does not match run model product '{run_product}'.",
         )
 
-    expected_timing = (expected.timing_convention or "").strip().upper()
-    run_timing = (
+    run_scenario_id = str(run.scenario_id or (configuration.get("scenario") or {}).get("id") or "").strip()
+    run_scenario_name = str((configuration.get("scenario") or {}).get("name") or "").strip()
+    valid_run_scenarios = {s for s in (run_scenario_id, run_scenario_name) if s}
+
+    # Validate scenario identity against expected result set
+    expected_scenarios = {
+        str(row.get("scenario_id")).strip()
+        for row in expected.rows_data
+        if row.get("scenario_id") not in (None, "")
+    }
+    if expected_scenarios and not (expected_scenarios & valid_run_scenarios):
+        raise ServiceError(
+            422, "EXPECTED_RESULTS_SCENARIO_MISMATCH",
+            f"Expected results scenario '{', '.join(sorted(expected_scenarios))}' does not match run scenario '{run_scenario_name or run_scenario_id}'.",
+        )
+
+    model_version_config = (configuration.get("model_version") or {}).get("configuration") or {}
+    run_timing_raw = (
         (configuration.get("model_version") or {}).get("timing_convention")
+        or model_version_config.get("timing_convention")
         or configuration.get("timing_convention")
-        or "EOM"
-    ).strip().upper()
-    if expected_timing and run_timing and expected_timing != run_timing:
+    )
+    effective_run_timing = str(run_timing_raw or "EOM").strip().upper()
+    expected_timing = str(expected.timing_convention).strip().upper() if expected.timing_convention else None
+    if expected_timing and effective_run_timing and expected_timing != effective_run_timing:
         raise ServiceError(
             422, "EXPECTED_RESULTS_TIMING_MISMATCH",
-            f"Expected timing convention '{expected.timing_convention}' does not match run timing convention '{run_timing}'.",
+            f"Expected timing convention '{expected.timing_convention}' does not match run timing convention '{effective_run_timing}'.",
         )
 
     level = payload.get("level") or "policy_month"
@@ -534,6 +561,8 @@ def reconcile(db: Session, run_id: str, payload: dict[str, Any], actor_id: str) 
         expected_cells, actual_cells = _cell_maps(
             db, run, configuration, expected, actual_rows,
             payload.get("policy_id"), requested_vars, comparison_level,
+            run_scenario_id=run_scenario_id,
+            valid_run_scenarios=valid_run_scenarios,
         )
         for key in sorted(expected_cells):
             expected_value = expected_cells[key]
@@ -570,10 +599,11 @@ def reconcile(db: Session, run_id: str, payload: dict[str, Any], actor_id: str) 
                         "rel_diff": None if not math.isfinite(rel_diff) else rel_diff,
                         "tolerance_used": tolerance,
                     }
+                    failure["scenario_id"] = run_scenario_id
                     if comparison_level == "policy_month":
-                        failure.update({"policy_id": key[0], "projection_month": key[1]})
+                        failure.update({"policy_id": key[0], "projection_month": key[2]})
                     else:
-                        failure["projection_year"] = key[0]
+                        failure["projection_year"] = key[1]
                     failures.append(failure)
 
     if checked == 0:
@@ -613,7 +643,7 @@ def reconcile(db: Session, run_id: str, payload: dict[str, Any], actor_id: str) 
         for policy, value in source_accounts.items() if policy in month_one_open
     ]
 
-    # Three-state check: PASS, FAIL, NOT_VERIFIABLE
+    account_available = bool(source_accounts and month_one_open)
     has_account_value_model = any(row["variable_name"] == "account_value_open" for row in actual_rows)
 
     if not source_records:
@@ -666,22 +696,35 @@ def reconcile(db: Session, run_id: str, payload: dict[str, Any], actor_id: str) 
         "source_to_output_check": source_check,
     }
 
-    # P1 Section 8 & 9: Freeze full scope on report
-    calc_status = "PASS" if (total_failures_count == 0 and source_check_status != "FAIL") else "FAIL"
+    # Item 1: Three-state overall reconciliation status
+    if total_failures_count > 0 or source_check_status == "FAIL":
+        overall_status = "FAIL"
+    elif source_check_status == "NOT_VERIFIABLE":
+        overall_status = "NOT_VERIFIABLE"
+    else:
+        overall_status = "PASS"
+
+    actual_run_timing_snapshot = str(run_timing_raw).strip().upper() if run_timing_raw else None
+    summary["run_timing_convention"] = actual_run_timing_snapshot
+    summary["effective_run_timing_convention"] = effective_run_timing
+    summary["expected_timing_convention"] = expected_timing
+    resolved_vars = requested_vars if requested_vars is not None else sorted(summaries.keys())
+
+    # Item 5: Freeze actual run timing (or None) and actual resolved variables compared
     report = ReconciliationReport(
         project_id=run.project_id,
         run_id=run.id,
         expected_result_set_id=expected.id,
         level=level,
-        variables_requested=requested_vars or [],
+        variables_requested=resolved_vars,
         expected_result_fingerprint=expected.fingerprint,
         expected_result_version=expected.version_label,
-        timing_convention_snapshot=expected.timing_convention or "EOM",
+        timing_convention_snapshot=actual_run_timing_snapshot,
         granularity_snapshot=expected.granularity,
         policy_id_filter=payload.get("policy_id"),
         abs_tol=abs_tol,
         rel_tol=rel_tol,
-        status=calc_status,
+        status=overall_status,
         summary=summary,
         failures=failures,
         disposition_history=[],
@@ -707,11 +750,11 @@ def disposition(
     if status not in valid_statuses:
         raise ServiceError(422, "RECONCILIATION_DISPOSITION", f"Invalid disposition status '{status}'.")
 
-    # FAIL report cannot be marked "approved"
-    if report.status == "FAIL" and status == "approved":
+    # FAIL or NOT_VERIFIABLE report cannot be marked "approved" without exception
+    if report.status in ("FAIL", "NOT_VERIFIABLE") and status == "approved":
         raise ServiceError(
             422, "RECONCILIATION_CANNOT_APPROVE_FAILED",
-            "A reconciliation report with status 'FAIL' cannot be approved without exception. Use 'approved_with_exception'.",
+            f"A reconciliation report with status '{report.status}' cannot be approved without exception. Use 'approved_with_exception'.",
         )
 
     clean_notes = (notes or "").strip()
@@ -747,3 +790,64 @@ def disposition(
     db.commit()
     db.refresh(report)
     return report_view(report)
+
+
+
+def approve_expected_set(db: Session, expected_id: str, actor_id: str) -> dict[str, Any]:
+    expected = db.get(ExpectedResultSet, expected_id)
+    if expected is None:
+        raise not_found("Expected result set not found.")
+    if expected.created_by == actor_id:
+        raise ServiceError(
+            403, "EXPECTED_RESULTS_SELF_APPROVAL_FORBIDDEN",
+            "Expected result set cannot be approved by its creator (four-eyes principle required).",
+        )
+    if expected.status == "approved":
+        raise ServiceError(409, "EXPECTED_RESULTS_ALREADY_APPROVED", "Expected result set is already approved.")
+    if expected.status == "superseded":
+        raise ServiceError(409, "EXPECTED_RESULTS_ALREADY_SUPERSEDED", "Cannot approve a superseded expected result set.")
+
+    before = expected_view(expected)
+    expected.status = "approved"
+    expected.approved_by = actor_id
+    expected.approved_at = now_utc()
+    db.flush()
+    record_audit(
+        db, actor_user_id=actor_id, action="expected_result_set.approved",
+        entity_type="expected_result_set", entity_id=expected.id,
+        before_state=before, after_state=expected_view(expected),
+    )
+    db.commit()
+    db.refresh(expected)
+    return expected_view(expected)
+
+
+def supersede_expected_set(db: Session, expected_id: str, superseded_by_id: str, actor_id: str) -> dict[str, Any]:
+    expected = db.get(ExpectedResultSet, expected_id)
+    if expected is None:
+        raise not_found("Expected result set not found.")
+    if expected.id == superseded_by_id:
+        raise ServiceError(422, "EXPECTED_RESULTS_SELF_SUPERSEDE", "An expected result set cannot supersede itself.")
+
+    superseding = db.get(ExpectedResultSet, superseded_by_id)
+    if superseding is None or superseding.project_id != expected.project_id:
+        raise not_found("Superseding expected result set not found.")
+    if superseding.product_code != expected.product_code:
+        raise ServiceError(
+            422, "EXPECTED_RESULTS_SUPERSEDE_MISMATCH",
+            f"Superseding product '{superseding.product_code}' does not match '{expected.product_code}'.",
+        )
+
+    before = expected_view(expected)
+    expected.status = "superseded"
+    expected.superseded_by_id = superseding.id
+    db.flush()
+    record_audit(
+        db, actor_user_id=actor_id, action="expected_result_set.superseded",
+        entity_type="expected_result_set", entity_id=expected.id,
+        before_state=before, after_state=expected_view(expected),
+        context={"superseded_by_id": superseding.id},
+    )
+    db.commit()
+    db.refresh(expected)
+    return expected_view(expected)

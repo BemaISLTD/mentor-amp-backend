@@ -139,3 +139,117 @@ def test_fs_gov_editing_formula_updates_fingerprint_and_governance_mode(env):
         assert conf["model_definition_fingerprint"] == fp_after
         assert gov["governance_mode"] == "sandbox"
         assert gov["is_governed"] is False
+
+
+def test_fs_gov_governed_run_fingerprint_requirements(env):
+    """Item 3: Tightened governed RunPackage fingerprint requirements.
+    - missing approved fingerprint -> governed run refused
+    - stale approved fingerprint -> governed run refused
+    - missing/stale validation fingerprint -> governed run refused
+    - all fingerprints equal executable model -> governed run accepted
+    - sandbox behavior remains available where intentionally allowed
+    """
+    from app.core.model_fingerprint import compute_model_definition_fingerprint
+    from app.db.models.modeling import ModelVersion
+    from app.db.models.projection import ProjectionSet
+    from app.db.models.run_package import RunPackage
+    from app.services import run_package_service
+
+    version_id = env.projects["A"]["version"]
+    proj_set_id = env.projects["A"]["projection_set"]
+
+    # Ensure model is validated first
+    val_res = env.client.post(f"/v1/model-versions/{version_id}/validate", headers=env.admin_headers())
+    assert val_res.status_code == 200
+
+    with env.Session() as db:
+        actual_fp = compute_model_definition_fingerprint(db, version_id)
+        version = db.get(ModelVersion, version_id)
+        pset = db.get(ProjectionSet, proj_set_id)
+        pset.parameters = {"governance_mode": "governed"}
+        db.commit()
+
+    # 1. Missing approved fingerprint -> refused
+    with env.Session() as db:
+        version = db.get(ModelVersion, version_id)
+        version.status = "approved"
+        version.validation_fingerprint = actual_fp
+        version.approved_fingerprint = None
+        db.commit()
+
+    with pytest.raises(run_package_service.PackageInvalid) as exc_info:
+        env.submit("A", ["Base"])
+    assert "GOVERNED_RUN_APPROVED_FINGERPRINT_MISSING" in str(exc_info.value) or "approved_fingerprint" in str(exc_info.value)
+
+    # 2. Stale approved fingerprint -> refused
+    with env.Session() as db:
+        version = db.get(ModelVersion, version_id)
+        version.status = "approved"
+        version.validation_fingerprint = actual_fp
+        version.approved_fingerprint = "0" * 64  # Stale
+        db.commit()
+
+    with pytest.raises(run_package_service.PackageInvalid) as exc_info:
+        env.submit("A", ["Base"])
+    assert "MODEL_APPROVAL_STALE" in str(exc_info.value) or "approval" in str(exc_info.value).lower()
+
+    # 3. Missing validation fingerprint -> refused
+    with env.Session() as db:
+        version = db.get(ModelVersion, version_id)
+        version.status = "approved"
+        version.validation_fingerprint = None
+        version.approved_fingerprint = actual_fp
+        db.commit()
+
+    with pytest.raises(run_package_service.PackageInvalid) as exc_info:
+        env.submit("A", ["Base"])
+    assert "GOVERNED_RUN_VALIDATION_FINGERPRINT_MISSING" in str(exc_info.value) or "validation_fingerprint" in str(exc_info.value)
+
+    # Stale validation fingerprint -> refused
+    with env.Session() as db:
+        version = db.get(ModelVersion, version_id)
+        version.status = "approved"
+        version.validation_fingerprint = "1" * 64  # Stale
+        version.approved_fingerprint = actual_fp
+        db.commit()
+
+    with pytest.raises(run_package_service.PackageInvalid) as exc_info:
+        env.submit("A", ["Base"])
+    assert "MODEL_VALIDATION_STALE" in str(exc_info.value) or "validation" in str(exc_info.value).lower()
+
+    # 4. All fingerprints matching executable model -> governed run accepted
+    with env.Session() as db:
+        version = db.get(ModelVersion, version_id)
+        version.status = "approved"
+        version.validation_fingerprint = actual_fp
+        version.approved_fingerprint = actual_fp
+        db.commit()
+
+    submitted = env.submit("A", ["Base"])
+    run_id = submitted["by_scenario"]["Base"]
+    with env.Session() as db:
+        package = db.query(RunPackage).filter_by(run_id=run_id).one()
+        gov = package.package["governance"]
+        assert gov["governance_mode"] == "governed"
+        assert gov["is_governed"] is True
+        assert gov["model_definition_fingerprint"] == actual_fp
+        assert gov["validation_fingerprint"] == actual_fp
+        assert gov["approved_fingerprint"] == actual_fp
+
+    # 5. Sandbox behavior remains available where intentionally allowed
+    with env.Session() as db:
+        # Corrupt the approval fingerprint, but request sandbox mode
+        version = db.get(ModelVersion, version_id)
+        version.approved_fingerprint = "0" * 64
+        pset = db.get(ProjectionSet, proj_set_id)
+        pset.parameters = {"governance_mode": "sandbox"}
+        db.commit()
+
+    sandbox_submitted = env.submit("A", ["Base"])
+    s_run_id = sandbox_submitted["by_scenario"]["Base"]
+    with env.Session() as db:
+        s_pkg = db.query(RunPackage).filter_by(run_id=s_run_id).one()
+        s_gov = s_pkg.package["governance"]
+        assert s_gov["governance_mode"] == "sandbox"
+        assert s_gov["is_governed"] is False
+

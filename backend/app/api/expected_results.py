@@ -76,6 +76,10 @@ class DispositionRequest(BaseModel):
     disposition_notes: str | None = None
 
 
+class SupersedeRequest(BaseModel):
+    superseded_by_id: str
+
+
 def _permissions(user: User) -> set[str]:
     return {permission.name for role in user.roles for permission in role.permissions}
 
@@ -153,6 +157,33 @@ def get_expected_results(
     access.require_object_access(db, user, "expected_result_set", expected_result_id)
     row = db.get(ExpectedResultSet, expected_result_id)
     return reconciliation_service.expected_view(row, include_rows=include_rows)
+
+
+@router.post("/expected-results/{expected_result_id}/approve")
+def approve_expected_results(
+    expected_result_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    access.require_object_access(db, user, "expected_result_set", expected_result_id)
+    roles = {role.name for role in user.roles}
+    if not ({"models:approve", "registries:write"} & _permissions(user)) and "admin" not in roles:
+        raise ServiceError(403, "EXPECTED_RESULTS_APPROVE_FORBIDDEN", "Approval permission is required.")
+    return reconciliation_service.approve_expected_set(db, expected_result_id, user.id)
+
+
+@router.post("/expected-results/{expected_result_id}/supersede")
+def supersede_expected_results(
+    expected_result_id: str,
+    payload: SupersedeRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    access.require_object_access(db, user, "expected_result_set", expected_result_id)
+    roles = {role.name for role in user.roles}
+    if not ({"models:approve", "registries:write", "imports:write"} & _permissions(user)) and "admin" not in roles:
+        raise ServiceError(403, "EXPECTED_RESULTS_SUPERSEDE_FORBIDDEN", "Supersede permission is required.")
+    return reconciliation_service.supersede_expected_set(db, expected_result_id, payload.superseded_by_id, user.id)
 
 
 @router.post("/runs/{run_id}/reconcile", status_code=201)

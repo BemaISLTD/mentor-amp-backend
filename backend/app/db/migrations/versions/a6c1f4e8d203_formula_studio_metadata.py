@@ -68,7 +68,7 @@ def upgrade() -> None:
         sa.Column("policy_id_filter", sa.String(255), nullable=True),
         sa.Column("abs_tol", sa.Float(), nullable=False, server_default="0.01"),
         sa.Column("rel_tol", sa.Float(), nullable=False, server_default="0.0001"),
-        sa.Column("status", sa.String(10), nullable=False),
+        sa.Column("status", sa.String(20), nullable=False),
         sa.Column("disposition_status", sa.String(30), nullable=False, server_default="pending"),
         sa.Column("disposition_notes", sa.Text(), nullable=True),
         sa.Column("disposition_by", sa.String(36), sa.ForeignKey("users.id", ondelete="SET NULL"), nullable=True),

@@ -531,25 +531,75 @@ def collect(
     from app.core.model_fingerprint import compute_model_definition_fingerprint
     version, owning_model = model.version, model.model
     model_def_fp = compute_model_definition_fingerprint(db, version.id)
-    if version.status in (lifecycle.APPROVED, lifecycle.PUBLISHED):
-        if version.approved_fingerprint and version.approved_fingerprint != model_def_fp:
+    all_formulas_approved = all(row.status in (lifecycle.VALIDATED, lifecycle.APPROVED) for row in model.formulas)
+
+    requested_mode = (projection_set.parameters or {}).get("governance_mode")
+    # Governed execution is required if explicitly requested, or if model version is approved/published and sandbox is not intentionally requested
+    is_governed_candidate = bool(
+        requested_mode == "governed" or (
+            version.status in (lifecycle.APPROVED, lifecycle.PUBLISHED)
+            and requested_mode != "sandbox"
+        )
+    )
+
+    if is_governed_candidate:
+        if version.status not in (lifecycle.APPROVED, lifecycle.PUBLISHED):
+            problems.append(Problem(
+                "GOVERNED_RUN_REQUIREMENTS_NOT_MET",
+                f"Governed run requires an approved or published model version, but '{version.version_label}' is '{version.status}'.",
+            ))
+
+        # Tightened fingerprint requirements: non-null matching approved_fingerprint and validation_fingerprint
+        if not version.approved_fingerprint:
+            problems.append(Problem(
+                "GOVERNED_RUN_APPROVED_FINGERPRINT_MISSING",
+                f"Governed run requires approved_fingerprint on model version '{version.version_label}'.",
+            ))
+        elif version.approved_fingerprint != model_def_fp:
             problems.append(Problem(
                 "MODEL_APPROVAL_STALE",
                 f"Model version '{version.version_label}' definition was modified after approval; re-approval required.",
             ))
-    all_formulas_approved = all(row.status in (lifecycle.VALIDATED, lifecycle.APPROVED) for row in model.formulas)
+
+        if not version.validation_fingerprint:
+            problems.append(Problem(
+                "GOVERNED_RUN_VALIDATION_FINGERPRINT_MISSING",
+                f"Governed run requires validation_fingerprint on model version '{version.version_label}'.",
+            ))
+        elif version.validation_fingerprint != model_def_fp:
+            problems.append(Problem(
+                "MODEL_VALIDATION_STALE",
+                f"Model version '{version.version_label}' validation fingerprint does not match executable model definition.",
+            ))
+
+        if not all_formulas_approved:
+            problems.append(Problem(
+                "GOVERNED_RUN_REQUIREMENTS_NOT_MET",
+                "Governed run requires all formulas to be validated or approved.",
+            ))
+        if projection_set.status not in ("validated", "approved"):
+            problems.append(Problem(
+                "GOVERNED_RUN_REQUIREMENTS_NOT_MET",
+                f"Governed run requires a validated or approved projection set, but '{projection_set.name}' is '{projection_set.status}'.",
+            ))
+
+    fingerprints_valid = bool(
+        version.approved_fingerprint
+        and version.validation_fingerprint
+        and version.approved_fingerprint == model_def_fp
+        and version.validation_fingerprint == model_def_fp
+    )
+
     is_governed = bool(
-        version.status in (lifecycle.APPROVED, lifecycle.PUBLISHED)
+        is_governed_candidate
+        and requested_mode != "sandbox"
+        and version.status in (lifecycle.APPROVED, lifecycle.PUBLISHED)
+        and fingerprints_valid
         and projection_set.status in ("validated", "approved")
         and all_formulas_approved
         and not problems
     )
     governance_mode = "governed" if is_governed else "sandbox"
-    if (projection_set.parameters or {}).get("governance_mode") == "governed" and not is_governed:
-        problems.append(Problem(
-            "GOVERNED_RUN_REQUIREMENTS_NOT_MET",
-            "Governed run requires an approved/published model version and validated/approved formulas.",
-        ))
 
     if problems:
         return None, None, problems

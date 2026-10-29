@@ -74,7 +74,7 @@ class ReconciliationReport(Base):
     policy_id_filter: Mapped[str | None] = mapped_column(String(255), nullable=True)
     abs_tol: Mapped[float] = mapped_column(Float, default=1e-2, nullable=False)
     rel_tol: Mapped[float] = mapped_column(Float, default=1e-4, nullable=False)
-    status: Mapped[str] = mapped_column(String(10), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
     disposition_status: Mapped[str] = mapped_column(String(30), default="pending", nullable=False)
     disposition_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     disposition_by: Mapped[str | None] = mapped_column(
