@@ -488,7 +488,9 @@ def upsert_myga_inforce(db, project, committer: User, reviewer: User) -> Inforce
     )
 
 
-def upsert_myga_expected_results(db, project, user: User) -> ExpectedResultSet | None:
+def upsert_myga_expected_results(
+    db, project, user: User, reviewer: User | None = None
+) -> ExpectedResultSet | None:
     """Register the externally supplied MYGA-10001 benchmark when the file is available."""
     path = MYGA_SAMPLES / MYGA_EXPECTED_RESULTS_FILENAME
     if not path.is_file():
@@ -506,8 +508,11 @@ def upsert_myga_expected_results(db, project, user: User) -> ExpectedResultSet |
                 "The MYGA-10001 expected-result source changed after registration; "
                 "register it as a governed new version."
             )
+        if reviewer is not None and reviewer.id != existing.created_by and existing.status != "approved":
+            reconciliation_service.approve_expected_set(db, existing.id, reviewer.id)
+            db.refresh(existing)
         return existing
-    reconciliation_service.create_expected_set(db, project.id, {
+    created = reconciliation_service.create_expected_set(db, project.id, {
         "name": "MYGA-10001 Development Reference",
         "product_code": "myga_5yr",
         "version_label": "v1",
@@ -516,6 +521,8 @@ def upsert_myga_expected_results(db, project, user: User) -> ExpectedResultSet |
         "granularity": "policy_month",
         "rows": rows,
     }, user.id)
+    if reviewer is not None and reviewer.id != user.id:
+        reconciliation_service.approve_expected_set(db, created["id"], reviewer.id)
     return db.query(ExpectedResultSet).filter(
         ExpectedResultSet.project_id == project.id,
         ExpectedResultSet.source_reference == source_reference,
@@ -789,7 +796,7 @@ def seed_myga(db, project_name: str = MYGA_PROJECT_NAME) -> dict:
     )
     db.commit()
     validated = projection_set_service.validate(db, projection_set.id, user)
-    expected_result_set = upsert_myga_expected_results(db, project, user)
+    expected_result_set = upsert_myga_expected_results(db, project, user, reviewer=reviewer)
     return {
         "user": user, "reviewer": reviewer, "project": project, "model": model,
         "version": version, "mortality": mortality, "inforce": inforce,

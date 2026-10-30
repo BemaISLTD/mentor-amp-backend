@@ -1,10 +1,14 @@
 """Generate the canonical SYNTHETIC MYGA sample files (mentoramp.myga.inforce/v1).
 
 Writes:
-  samples/myga/synthetic_myga_inforce.csv       25 synthetic MYGA policies under canonical schema
-  samples/myga/anchor_policy.csv                1 anchor MYGA benchmark policy
-  samples/myga/myga_surrender_charge.csv        Surrender charge schedule table (initial & renewal)
-  samples/myga/myga_sc_age_cap.csv              Attained-age surrender charge cap table
+  samples/myga/synthetic_myga_inforce.csv          25 synthetic MYGA policies under canonical schema
+  samples/myga/anchor_policy.csv                   1 anchor MYGA benchmark policy
+  samples/myga/myga_surrender_charge.csv           Surrender charge schedule table (initial & renewal)
+  samples/myga/myga_sc_age_cap.csv                 Attained-age surrender charge cap table
+  samples/myga/synthetic_myga_inforce_10001.csv    Single-policy reference inforce for MYGA-10001
+  samples/myga/expected_reference_myga_10001.csv   60-month expected reference ledger for MYGA-10001
+  samples/myga/synthetic_myga_inforce_100001.csv   Single-policy reference inforce for MYGA-100001 (alias)
+  samples/myga/expected_reference_myga_100001.csv  60-month expected reference ledger for MYGA-100001 (alias)
 
 Run from the repository root or the backend folder:
   backend/.venv/Scripts/python backend/scripts/generate_myga_samples.py
@@ -13,6 +17,7 @@ Run from the repository root or the backend folder:
 from __future__ import annotations
 
 import csv
+import json
 import sys
 from pathlib import Path
 
@@ -20,6 +25,7 @@ BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
 
 SAMPLES = BACKEND.parent / "samples" / "myga"
+FIXTURE_PATH = BACKEND / "tests" / "fixtures" / "myga_reference_simplified_v1.json"
 POLICY_COUNT = 25
 
 CANONICAL_INFORCE_FIELDS = [
@@ -42,7 +48,7 @@ CANONICAL_INFORCE_FIELDS = [
 
 def generate_surrender_charge_tables(samples_dir: Path) -> None:
     """Generate canonical surrender charge factor tables.
-    
+
     Includes illustrative contractual waiver provisions (e.g., rmd_waiver, terminal illness).
     """
     # 1. Surrender charge schedule table
@@ -136,11 +142,62 @@ def generate_anchor_policy(path: Path) -> None:
         writer.writerow(row)
 
 
+def generate_reference_package(samples_dir: Path, fixture_path: Path) -> None:
+    """Generate the canonical reference inforce and 60-month expected results CSVs.
+
+    Extracts the verified anchor case from myga_reference_simplified_v1.json and writes:
+    - synthetic_myga_inforce_10001.csv & expected_reference_myga_10001.csv (primary M3 benchmark)
+    - synthetic_myga_inforce_100001.csv & expected_reference_myga_100001.csv (4-zero alias)
+    """
+    if not fixture_path.is_file():
+        raise FileNotFoundError(f"Reference fixture not found: {fixture_path}")
+
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    anchor = fixture["anchor_case"]
+    expected_rows_raw = anchor["rows"]
+    if not expected_rows_raw:
+        raise ValueError("anchor_case contains no rows")
+
+    for policy_id, suffix in [("MYGA-10001", "10001"), ("MYGA-100001", "100001")]:
+        # 1. Inforce file (1 contract)
+        inforce_row = {
+            "policy_id": policy_id,
+            "product_type": "MYGA",
+            "issue_date": "2026-12-31",
+            "issue_age": anchor.get("issue_age", 62),
+            "gender": anchor.get("gender", "M"),
+            "premium": int(anchor.get("premium", 100000)),
+            "guarantee_period_years": anchor.get("guarantee_term_years", 5),
+            "declared_rate": f"{anchor.get('credited_rate', 0.045):.4f}",
+            "gmir": "0.0025",
+            "gmsv_rate": f"{anchor.get('mgsv_rate', 0.02):.4f}",
+            "mva_ref_yield_at_issue": "0.05",
+            "account_value": int(anchor.get("premium", 100000)),
+            "mgsv_value": int(anchor.get("premium", 100000) * anchor.get("mgsv_premium_load", 0.875)),
+            "free_wd_base": int(anchor.get("premium", 100000)),
+        }
+        inforce_path = samples_dir / f"synthetic_myga_inforce_{suffix}.csv"
+        with inforce_path.open("w", newline="\n", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=CANONICAL_INFORCE_FIELDS, lineterminator="\n")
+            writer.writeheader()
+            writer.writerow(inforce_row)
+
+        # 2. Expected results file (60 monthly ledger rows)
+        expected_path = samples_dir / f"expected_reference_myga_{suffix}.csv"
+        fieldnames = list(expected_rows_raw[0].keys())
+        with expected_path.open("w", newline="\n", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
+            writer.writeheader()
+            for r in expected_rows_raw:
+                writer.writerow({**r, "policy_id": policy_id})
+
+
 def main() -> None:
     SAMPLES.mkdir(parents=True, exist_ok=True)
     generate_surrender_charge_tables(SAMPLES)
     generate_inforce(SAMPLES / "synthetic_myga_inforce.csv")
     generate_anchor_policy(SAMPLES / "anchor_policy.csv")
+    generate_reference_package(SAMPLES, FIXTURE_PATH)
     print(f"Successfully generated canonical synthetic MYGA sample files in {SAMPLES}")
 
 

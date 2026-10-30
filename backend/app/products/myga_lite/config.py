@@ -919,6 +919,7 @@ MODEL = {
         "illustrative": True,
         "configuration": {
             "reference_only": True,
+            "timing_convention": "BOM_WITHDRAWAL_BEFORE_INTEREST",
             "reference_classification": "mentoramp_simplified_development_reference",
             "generated_by": "MentorAmp Development Team",
             "reference_type": "internal_development_reference",

@@ -57,7 +57,19 @@ def test_seed_01_multi_product_seed_is_idempotent_and_myga_is_runnable():
             assert db.query(Project).count() == 2
             assert db.query(Model).count() == 2
             assert db.query(ModelVersion).count() == 2
-            assert db.query(InforceFile).count() == 2
+            expected_inforce_count = (
+                3
+                if (env.seed_module.MYGA_SAMPLES / env.seed_module.MYGA_REFERENCE_INFORCE_FILENAME).is_file()
+                else 2
+            )
+            assert db.query(InforceFile).count() == expected_inforce_count
+            if first["reference_inforce"] is not None:
+                assert first["reference_inforce"].filename == env.seed_module.MYGA_REFERENCE_INFORCE_FILENAME
+                assert first["reference_inforce"].row_count == 1
+                assert first["reference_inforce"].status == "approved"
+            if first["expected_result_set"] is not None:
+                assert first["expected_result_set"].row_count == 60
+                assert first["expected_result_set"].status == "approved"
             assert db.query(InforceRecord).filter_by(file_id=first_ids["inforce"]).count() == 25
             assert db.query(AssumptionTable).filter_by(id=first_ids["mortality"]).count() == 1
             assert db.query(FactorTable).filter(FactorTable.id.in_(first_ids["factors"])).count() == 2
