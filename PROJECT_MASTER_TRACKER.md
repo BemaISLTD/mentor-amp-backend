@@ -5,12 +5,12 @@
 > This document is a **Living Requirements Traceability and Execution Ledger** derived from the project's authoritative source documents. It does **NOT** replace, supersede, or alter them.  
 > **If this ledger conflicts with an authoritative source document, the authoritative source wins until the conflict is deliberately resolved, approved, and formally documented.**
 
-**Document Version:** 2.1 (Exhaustive Governance Baseline — Option 1 Closed & M4 Task Assigned)  
-**Date:** October 30, 2026  
+**Document Version:** 2.2 (M5 Senior Review Foundation Corrections Complete — Bundle v2 Ready)  
+**Date:** November 1, 2026  
 **Status:** Working Execution Ledger — Independent Senior Review Ready  
-**Current Git Branch:** `main` (Synchronized with `feat/m3-formula-studio-reconciliation`)  
-**Latest Git Commit SHA:** `3a7b00a` / Option 1 Update  
-**Alembic Head Revision:** `b8f3d1e7c504` (Single canonical head)  
+**Current Git Branch:** `feat/m5-valuation-frameworks-dagster`  
+**Latest Git Commit SHA:** `f868a61`  
+**Alembic Head Revision:** `c9f4e2d8a615` (Single canonical head)  
 **Engine Build Identity:** `m3-cpu-dsl-1`  
 
 ---
@@ -145,7 +145,7 @@ The team has accumulated critical architectural lessons through senior review pa
 | **Week 2 / M2A** | Registries, Resolver, Dependency Metadata & Formula Studio Foundation | **VERIFIED (0.75)** | Variable/Formula registries, deterministic resolver, AST compilation. Frontend Monaco UI integration pending Sam's delivery. |
 | **Week 3 / M2B & M3** | Projection Spine, Parquet Storage, Trace/Reconciliation & MYGA | **IMPLEMENTED — PENDING SENIOR RE-REVIEW (0.65)** | MYGA product engine, multi-level reconciliation, immutability triggers, AST pre-compilation. All final merge blockers resolved (source-to-output 3-state check, scenario binding, triple-fingerprint RunPackage governance, expected-result 4-eyes approval). Canonical benchmark files `synthetic_myga_inforce_10001.csv` & `expected_reference_myga_10001.csv` generated and seeded idempotently. |
 | **Week 4 / M4** | FIA & RILA Priority Products + Multi-Segment Block | **PLANNED / ASSIGNED (0.00)** | Controlling Engineering Task Document `NOAH_M4_FIA_RILA_IMPLEMENTATION_README.md` delivered to Noah Enemali (Full-stack implementation owner). Execution gate active: general calculation mechanics & shared indexing foundation unblocked immediately; Actuarial Decision Register (15 items) undergoing Product Owner confirmation. |
-| **Week 5 / M5** | Valuation Frameworks, Rollforwards & Real Dagster Workflows | **IN PROGRESS (0.60)** | Foundations verified: basis/methodology separation, derived dataset registry (`kind='prior_output'`), configurable rollforward attribution engine, Dagster software-defined asset orchestration (8 stages), mathematical valuation primitives (discounting, NPR solver, CTE/VaR, constant-level DAC). Specific reference accounting engines gated on `ACT-DEC-01` through `ACT-DEC-09`. |
+| **Week 5 / M5** | Valuation Frameworks, Rollforwards & Real Dagster Workflows | **IN PROGRESS — FOUNDATION IMPLEMENTED / SENIOR CORRECTIONS COMPLETED (0.70)** | Foundation hardened: P0 security & dimensional resolution for derived datasets (`kind='prior_output'`), immutable PostgreSQL triggers on `derived_datasets` and `valuation_run_details`, valuation provenance sealed in `RunPackage` fingerprint, canonical `Run` subordination, Polars-backed 8-stage Dagster orchestration with deterministic failure halting (`allow_retries=False`), and Decimal rollforward continuity. Specific reference accounting engines strictly gated on `ACT-DEC-01` through `ACT-DEC-09`. |
 | **Week 6 / M6** | PySpark / GPU Scale Paths + Core Application Integration | **NOT STARTED (0.00)** | PySpark cluster execution, GPU CUDA kernel execution, execution conformance test suite ($10^{-9}$ numerical parity). |
 | **Week 7 / M7** | IDI, Variable Annuity, PRT, Life Readiness & Reporting | **NOT STARTED (0.00)** | IDI active/disabled Markov models, VA separate accounts/GLWB, PRT cohort aggregates, Life data ingestion proof without schema redesign. |
 | **Week 8 / M8** | Full Application Integration, Packaging & Minimum Security | **NOT STARTED (0.00)** | Full integration of Sam's 7 React screens, offline Electron desktop packaging (Windows `.msi`/`.exe`), offline SQLite fallback. |
