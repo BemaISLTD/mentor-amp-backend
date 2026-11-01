@@ -10,7 +10,8 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 
 BACKEND = Path(__file__).resolve().parents[2]
-HEAD = "b8f3d1e7c504"
+HEAD = "c9f4e2d8a615"
+M5_MIG1 = "b8f3d1e7c504"
 M4_HEAD = "a6c1f4e8d203"
 WP1 = "b7e4d2a9c613"
 MERGE = "a3c5e7f9b1d2"
@@ -41,7 +42,8 @@ def test_the_merge_joins_the_m1_and_dev_histories():
     assert script().get_revision("ab6d9e2f4013").down_revision == "e6a9c4d2f817"
     assert script().get_revision("d4f7a9c2e681").down_revision == "ab6d9e2f4013"
     assert script().get_revision(M4_HEAD).down_revision == "e5b2c9a1d408"
-    assert script().get_revision(HEAD).down_revision == M4_HEAD
+    assert script().get_revision(M5_MIG1).down_revision == M4_HEAD
+    assert script().get_revision(HEAD).down_revision == M5_MIG1
 
 
 def test_both_branch_heads_and_their_ancestors_are_upgraded_by_head():
