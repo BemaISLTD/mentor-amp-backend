@@ -48,6 +48,8 @@ class PriorOutputSource(BaseModel):
     type: Literal["prior_output"] = "prior_output"
     variable_name: str = ""
     offset_periods: int = 1
+    dataset_id: Optional[str] = None
+    column_name: Optional[str] = None
 
 
 class ManualSource(BaseModel):
@@ -204,6 +206,7 @@ class ProjectionContext(BaseModel):
     factor_set: Optional[str] = None
     scenario_set: Optional[str] = None
     projection_key: Optional[str] = None
+    derived_dataset_id: Optional[str] = None
 
 
 class CalculationError(BaseModel):

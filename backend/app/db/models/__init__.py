@@ -46,3 +46,6 @@ from app.db.models.user import (  # noqa: F401
     role_permissions,
     user_roles,
 )
+
+from app.db.models.valuation_detail import ValuationRunDetail  # noqa: F401
+from app.db.models.rollforward import RollforwardSummary  # noqa: F401

@@ -184,11 +184,25 @@ def resolve(
             source_table = context.scenario_id
 
         elif source_type == "prior_output":
-            offset = _get_source_attr(source, "offset_periods", 1)
-            value = _prior_period_lookup(
-                db, variable_name, context, offset, output_buffer=output_buffer
-            )
-            source_table = "run_artifacts"
+            dataset_id = _get_source_attr(source, "dataset_id") or getattr(context, "derived_dataset_id", None)
+            if dataset_id:
+                target_col = _get_source_attr(source, "column_name") or _get_source_attr(source, "variable_name", variable_name)
+                from app.services.derived_dataset_service import lookup_derived_output_value
+                value = lookup_derived_output_value(
+                    db,
+                    dataset_id=dataset_id,
+                    variable_name=target_col,
+                    policy_id=lookup_keys.get("policy_id"),
+                    projection_month=lookup_keys.get("projection_month"),
+                    scenario_id=lookup_keys.get("scenario_id"),
+                )
+                source_table = f"derived_datasets:{dataset_id}"
+            else:
+                offset = _get_source_attr(source, "offset_periods", 1)
+                value = _prior_period_lookup(
+                    db, variable_name, context, offset, output_buffer=output_buffer
+                )
+                source_table = "run_artifacts"
 
         elif source_type == "manual":
             value = _get_source_attr(source, "value")

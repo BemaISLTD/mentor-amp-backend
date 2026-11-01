@@ -12,7 +12,7 @@ from app.db.database import Base
 
 
 class Run(Base):
-    """A single projection run execution record."""
+    """A single projection or valuation run execution record."""
 
     __tablename__ = "runs"
     __table_args__ = (
@@ -85,4 +85,20 @@ class Run(Base):
     retried_from_run_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("runs.id", ondelete="RESTRICT"),
         nullable=True, index=True, unique=True,
+    )
+
+    # --- M5: canonical valuation run identity and provenance ---
+    run_type: Mapped[str] = mapped_column(
+        String(30), default="projection", nullable=False, server_default="projection"
+    )
+    basis: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    methodology: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    methodology_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    source_projection_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("runs.id", ondelete="RESTRICT"),
+        nullable=True, index=True,
+    )
+    derived_dataset_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("derived_datasets.id", ondelete="RESTRICT"),
+        nullable=True, index=True,
     )
