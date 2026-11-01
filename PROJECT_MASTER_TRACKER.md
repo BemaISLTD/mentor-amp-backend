@@ -6,6 +6,15 @@
 > **If this ledger conflicts with an authoritative source document, the authoritative source wins until the conflict is deliberately resolved, approved, and formally documented.**
 
 **Document Version:** 2.1 (Exhaustive Governance Baseline — Option 1 Closed & M4 Task Assigned)  
+
+**M4 engineering update (2026-11-01): IMPLEMENTED, PENDING SENIOR ACTUARIAL RE-REVIEW.**
+Shared indexed primitives, executable illustrative FIA/RILA declarations and the
+30-policy / 4-scenario / 72-month RILA harness now follow the existing frozen
+projection, Parquet, trace and reconciliation chain. See
+[`docs/m4/IMPLEMENTATION.md`](docs/m4/IMPLEMENTATION.md) for engineering evidence,
+limitations and ACT-M4-DEC-01..15 pending decisions. Synthetic runs are sandbox;
+this update does not constitute actuarial VERIFIED/ACCEPTED status. Option 1
+MYGA reference data and reconciliation are unchanged.
 **Date:** October 30, 2026  
 **Status:** Working Execution Ledger — Independent Senior Review Ready  
 **Current Git Branch:** `main` (Synchronized with `feat/m3-formula-studio-reconciliation`)  
