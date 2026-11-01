@@ -747,3 +747,121 @@ def freeze(
     governance = {**governance, "frozen_at": iso(now)}
     document = run_package.seal(identity, governance, configuration)
     return FrozenPackage(document=document, fingerprint=document["fingerprint"], configuration=configuration)
+
+
+def freeze_valuation_run_package(
+    db: Session,
+    project: Project,
+    run: Any,
+    user: Any,
+    *,
+    basis: str,
+    methodology: str,
+    methodology_version: str,
+    source_projection_run_id: str | None = None,
+    derived_dataset_id: str | None = None,
+    derived_dataset_fingerprint: str | None = None,
+    source_artifact_fingerprint: str | None = None,
+    discount_curve_fingerprint: str | None = None,
+    valuation_date: str | Any = None,
+    valuation_parameters: dict | None = None,
+    base_package_document: dict[str, Any] | None = None,
+) -> FrozenPackage:
+    """Freeze a canonical RunPackage for an M5 valuation run (Directives 3 & 16).
+
+    Freezes:
+    - basis
+    - methodology
+    - methodology_version
+    - source_projection_run_id
+    - derived_dataset_id
+    - derived_dataset_fingerprint
+    - source_artifact_fingerprint
+    - discount_curve_fingerprint
+    - valuation_date
+    - valuation_parameters
+    - valuation_config_fingerprint
+    into configuration['valuation'] and participates directly in the canonical
+    reproducibility fingerprint (SHA-256 canonical JSON hash of configuration).
+    """
+    import copy
+    from app.core.execution.fingerprints import fingerprint as compute_fp
+
+    if base_package_document and "configuration" in base_package_document:
+        configuration = copy.deepcopy(base_package_document["configuration"])
+    else:
+        try:
+            build = build_identity()
+        except BuildIdentityUnavailable:
+            build = {
+                "app_version": "0.1.0",
+                "engine_version": "m5-valuation-1",
+                "code_version": "development",
+                "build_fingerprint": "0" * 64,
+                "source_commit": "0" * 40,
+                "identity_source": "fallback",
+            }
+        configuration = {
+            "project": {"id": project.id, "name": getattr(project, "name", "")},
+            "run_type": "valuation",
+            "model": {"id": getattr(run, "model_id", None) or "model-default", "product_code": getattr(run, "projection_key", None) or "M5"},
+            "model_version": {
+                "id": getattr(run, "model_version_id", None) or "mv-default",
+                "version_label": "v1.0",
+                "basis": basis,
+                "methodology": methodology,
+                "methodology_version": methodology_version,
+            },
+            "valuation_date": str(valuation_date or getattr(run, "valuation_date", "2026-12-31")),
+            "horizon_months": getattr(run, "horizon_months", 120),
+            "execution_backend": "cpu",
+            "parameters": {},
+            "formulas": [],
+            "variables": [],
+            "datasets": {"inforce": [], "assumption_tables": [], "factor_tables": []},
+            "build": build,
+        }
+
+    val_params = dict(valuation_parameters or {})
+    val_config_fp = compute_fp(val_params)
+    val_date_str = str(valuation_date) if valuation_date else str(getattr(run, "valuation_date", "2026-12-31"))
+
+    valuation_block = {
+        "basis": basis,
+        "methodology": methodology,
+        "methodology_version": methodology_version,
+        "source_projection_run_id": source_projection_run_id,
+        "derived_dataset_id": derived_dataset_id,
+        "derived_dataset_fingerprint": derived_dataset_fingerprint,
+        "source_artifact_fingerprint": source_artifact_fingerprint,
+        "discount_curve_fingerprint": discount_curve_fingerprint,
+        "valuation_date": val_date_str,
+        "valuation_parameters": val_params,
+        "valuation_config_fingerprint": val_config_fp,
+    }
+    configuration["valuation"] = valuation_block
+    configuration["valuation_date"] = val_date_str
+
+    now = now_utc()
+    run_id = getattr(run, "id", str(run))
+    run_set_id = getattr(run, "run_set_id", None)
+    user_id = getattr(user, "id", str(user))
+    user_name = getattr(user, "full_name", None)
+
+    identity = {
+        "package_id": str(uuid.uuid4()),
+        "frozen_for_run_id": run_id,
+        "run_set_id": run_set_id,
+        "project_id": project.id,
+        "created_at": iso(now),
+        "created_by": {"id": user_id, "full_name": user_name},
+    }
+    governance = {
+        "governance_mode": "governed",
+        "is_governed": True,
+        "frozen_at": iso(now),
+        "valuation_basis": basis,
+        "valuation_methodology": methodology,
+    }
+    document = run_package.seal(identity, governance, configuration)
+    return FrozenPackage(document=document, fingerprint=document["fingerprint"], configuration=configuration)

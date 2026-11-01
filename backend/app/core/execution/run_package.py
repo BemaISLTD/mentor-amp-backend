@@ -178,6 +178,11 @@ def verify_envelope(
         "horizon_months": (configuration.get("horizon_months"), run.get("horizon_months")),
         "valuation_date": (configuration.get("valuation_date"), run.get("valuation_date")),
     }
+    val_block = configuration.get("valuation") or {}
+    if val_block:
+        for val_key in ("basis", "methodology", "methodology_version", "source_projection_run_id", "derived_dataset_id"):
+            if run.get(val_key) is not None:
+                index_checks[val_key] = (val_block.get(val_key), run.get(val_key))
     mismatched = {name: list(values) for name, values in index_checks.items() if values[0] != values[1]}
     if mismatched:
         raise RunPackageError(
