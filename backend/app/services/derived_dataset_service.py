@@ -24,7 +24,7 @@ from app.core.artifacts import get_artifact_store
 from app.db.models.governance import DerivedDataset
 from app.db.models.run import Run
 from app.db.models.run_artifact import RunArtifact
-from app.services.common import bad_request, conflict, not_found
+from app.services.common import ServiceError, bad_request, conflict, not_found
 
 
 def _now() -> datetime:
@@ -92,13 +92,33 @@ def promote_run_to_derived_dataset(
     col_names = df.columns
     schema_dict = {col: str(df.schema[col]) for col in col_names}
 
-    # Available dimensions
-    avail_dims = dimensions or [
-        col for col in ["policy_id", "scenario_id", "projection_month", "time_step_month", "cohort_id"]
-        if col in col_names
+    # Available canonical dimensions (Directive 2)
+    CANONICAL_DIMENSIONS = [
+        "policy_id", "coverage_id", "rider_id", "account_id",
+        "segment_id", "cohort_id", "scenario_id",
+        "projection_month", "time_step_month"
     ]
+    if dimensions is not None:
+        avail_dims = list(dimensions)
+    else:
+        avail_dims = [col for col in CANONICAL_DIMENSIONS if col in col_names]
+        for col in col_names:
+            if col.endswith("_id") and col not in avail_dims and col not in {"source_run_id", "artifact_id", "user_id"}:
+                avail_dims.append(col)
 
     version_int = int(dataset_version) if dataset_version.isdigit() else 1
+
+    # Resolve model lineage correctly (Directive 13)
+    source_model_id = None
+    source_model_version_id = None
+    if run.model_version_id:
+        from app.db.models.modeling import ModelVersion
+        mv = db.query(ModelVersion).filter(ModelVersion.id == run.model_version_id).first()
+        if mv:
+            source_model_id = mv.model_id
+            source_model_version_id = mv.id
+        else:
+            source_model_version_id = run.model_version_id
 
     dataset = DerivedDataset(
         id=str(uuid.uuid4()),
@@ -106,7 +126,8 @@ def promote_run_to_derived_dataset(
         source_run_id=run_id,
         source_run_ids=[run_id],
         source_artifact_id=artifact.id,
-        source_model_id=run.model_version_id,
+        source_model_id=source_model_id,
+        source_model_version_id=source_model_version_id,
         name=dataset_name,
         dataset_type="projection_output" if run.run_type == "projection" else "valuation_output",
         description=description,
@@ -243,42 +264,137 @@ def supersede_derived_dataset(
     return dataset
 
 
+class AmbiguousDerivedOutputError(ServiceError):
+    """Raised when dimensional lookup matches multiple rows (Directive 2)."""
+    def __init__(self, message: str, **details: Any):
+        super().__init__(400, "AMBIGUOUS_DERIVED_OUTPUT", message, details or None)
+
+
+class DerivedDatasetGovernanceError(ServiceError):
+    """Raised when governance state of derived dataset rejects consumption (Directive 1)."""
+    def __init__(self, message: str, **details: Any):
+        super().__init__(400, "DERIVED_DATASET_GOVERNANCE_ERROR", message, details or None)
+
+
 def lookup_derived_output_value(
     db: Session,
     dataset_id: str,
     variable_name: str,
+    project_id: str | None = None,
+    governed_execution: bool = True,
     policy_id: str | None = None,
+    coverage_id: str | None = None,
+    rider_id: str | None = None,
+    account_id: str | None = None,
+    segment_id: str | None = None,
+    cohort_id: str | None = None,
     projection_month: int | None = None,
     scenario_id: str | None = None,
+    **extra_dimensions: Any,
 ) -> Any:
-    """Look up a variable value from an approved derived dataset Parquet artifact."""
-    dataset = db.query(DerivedDataset).filter(DerivedDataset.id == dataset_id).first()
-    if not dataset or not dataset.storage_uri:
-        return None
+    """Look up a variable value from an approved derived dataset Parquet artifact.
+
+    Enforces Directive 1 & 2:
+    - Same-project isolation: cross-project lookups return HTTP 404 (zero IDOR leakage).
+    - Governed execution: dataset must be active, non-deleted, non-superseded, and status='approved'.
+    - Storage integrity: SHA-256 fingerprint matches stored fingerprint.
+    - Dimensional resolution: filters on policy_id, coverage_id, rider_id, account_id,
+      segment_id, cohort_id, scenario_id, projection_month/time_step_month.
+    - Ambiguity rejection: matches > 1 row raises AmbiguousDerivedOutputError (NEVER select [0]).
+    - Zero matches: returns None (missing input).
+    - Exactly 1 match: returns scalar value.
+    """
+    if project_id is not None:
+        dataset = db.query(DerivedDataset).filter(
+            DerivedDataset.id == dataset_id,
+            DerivedDataset.project_id == project_id,
+        ).first()
+        if not dataset:
+            raise not_found(f"Derived dataset '{dataset_id}' not found.")
+    else:
+        if governed_execution:
+            raise DerivedDatasetGovernanceError(
+                "Governed execution requires an active project_id context for derived dataset resolution."
+            )
+        dataset = db.query(DerivedDataset).filter(DerivedDataset.id == dataset_id).first()
+        if not dataset:
+            raise not_found(f"Derived dataset '{dataset_id}' not found.")
+
+    if dataset.deleted_at is not None:
+        raise not_found(f"Derived dataset '{dataset_id}' not found.")
+
+    if dataset.status == "superseded":
+        raise DerivedDatasetGovernanceError(
+            f"Derived dataset '{dataset_id}' is superseded and cannot be consumed in governed runs."
+        )
+
+    if governed_execution and dataset.status != "approved":
+        raise DerivedDatasetGovernanceError(
+            f"Derived dataset '{dataset_id}' has governance status '{dataset.status}'. "
+            "Governed runs only accept approved derived datasets."
+        )
+
+    if not dataset.storage_uri:
+        raise DerivedDatasetGovernanceError(f"Derived dataset '{dataset_id}' has no storage URI.")
 
     store = get_artifact_store()
     path = store.path_for_uri(dataset.storage_uri)
     if not path.exists():
-        return None
+        raise DerivedDatasetGovernanceError(
+            f"Artifact storage file for dataset '{dataset_id}' not found at '{dataset.storage_uri}'."
+        )
 
-    # Load lazy frame and filter efficiently
+    # Verify fingerprint integrity
+    if dataset.fingerprint:
+        hasher = hashlib.sha256()
+        with open(path, "rb") as f:
+            while chunk := f.read(65536):
+                hasher.update(chunk)
+        actual_sha = hasher.hexdigest()
+        if actual_sha != dataset.fingerprint:
+            raise DerivedDatasetGovernanceError(
+                f"Storage fingerprint mismatch for dataset '{dataset_id}'! "
+                f"Recorded='{dataset.fingerprint}', actual='{actual_sha}'."
+            )
+
     lf = pl.scan_parquet(path)
     col_names = lf.collect_schema().names()
     if variable_name not in col_names:
         return None
 
-    if policy_id and "policy_id" in col_names:
-        lf = lf.filter(pl.col("policy_id") == policy_id)
+    applied_filters: dict[str, Any] = {}
+    dim_candidates = {
+        "policy_id": policy_id,
+        "coverage_id": coverage_id,
+        "rider_id": rider_id,
+        "account_id": account_id,
+        "segment_id": segment_id,
+        "cohort_id": cohort_id,
+        "scenario_id": scenario_id,
+        **extra_dimensions,
+    }
+    for dim_key, dim_val in dim_candidates.items():
+        if dim_val is not None and dim_key in col_names:
+            lf = lf.filter(pl.col(dim_key) == dim_val)
+            applied_filters[dim_key] = dim_val
+
     if projection_month is not None:
         if "projection_month" in col_names:
             lf = lf.filter(pl.col("projection_month") == projection_month)
+            applied_filters["projection_month"] = projection_month
         elif "time_step_month" in col_names:
             lf = lf.filter(pl.col("time_step_month") == projection_month)
-    if scenario_id and "scenario_id" in col_names:
-        lf = lf.filter(pl.col("scenario_id") == scenario_id)
+            applied_filters["time_step_month"] = projection_month
 
     res = lf.select([variable_name]).collect()
-    if res.height == 0:
+    count = res.height
+    if count == 0:
         return None
+    if count > 1:
+        raise AmbiguousDerivedOutputError(
+            f"Ambiguous derived output: variable '{variable_name}' in dataset '{dataset_id}' "
+            f"matched {count} rows. Expected exactly 1 row. Applied filters: {applied_filters}"
+        )
+
     val = res[variable_name][0]
     return float(val) if isinstance(val, (int, float)) else val

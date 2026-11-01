@@ -197,6 +197,9 @@ class DerivedDataset(Base):
     source_model_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("models.id", ondelete="RESTRICT"), nullable=True, index=True
     )
+    source_model_version_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("model_versions.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
     product_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
     dimensions_available: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     approved_by: Mapped[str | None] = mapped_column(

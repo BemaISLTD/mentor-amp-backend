@@ -207,6 +207,11 @@ class ProjectionContext(BaseModel):
     scenario_set: Optional[str] = None
     projection_key: Optional[str] = None
     derived_dataset_id: Optional[str] = None
+    coverage_id: Optional[str] = None
+    rider_id: Optional[str] = None
+    account_id: Optional[str] = None
+    segment_id: Optional[str] = None
+    cohort_id: Optional[str] = None
 
 
 class CalculationError(BaseModel):
