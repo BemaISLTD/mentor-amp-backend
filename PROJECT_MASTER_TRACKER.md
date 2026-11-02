@@ -9,7 +9,7 @@
 **Date:** November 1, 2026  
 **Status:** Working Execution Ledger — Independent Senior Review Ready  
 **Current Git Branch:** `feat/m5-valuation-frameworks-dagster`  
-**Latest Git Commit SHA:** `f868a61`  
+**Latest Git Commit SHA:** `d52e242`  
 **Alembic Head Revision:** `c9f4e2d8a615` (Single canonical head)  
 **Engine Build Identity:** `m3-cpu-dsl-1`  
 
