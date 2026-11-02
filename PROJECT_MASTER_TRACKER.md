@@ -5,11 +5,11 @@
 > This document is a **Living Requirements Traceability and Execution Ledger** derived from the project's authoritative source documents. It does **NOT** replace, supersede, or alter them.  
 > **If this ledger conflicts with an authoritative source document, the authoritative source wins until the conflict is deliberately resolved, approved, and formally documented.**
 
-**Document Version:** 2.3 (M5 Senior Review Foundation Corrections Complete — Bundle v3 Ready)  
-**Date:** November 1, 2026  
+**Document Version:** 2.4 (M5 Senior Review Final Blockers Resolved — Bundle v4 Ready)  
+**Date:** November 2, 2026  
 **Status:** Working Execution Ledger — Independent Senior Review Ready  
 **Current Git Branch:** `feat/m5-valuation-frameworks-dagster`  
-**Latest Git Commit SHA:** `5ebe8b2`  
+**Latest Git Commit SHA:** `d3f1418`  
 **Alembic Head Revision:** `c9f4e2d8a615` (Single canonical head)  
 **Engine Build Identity:** `m3-cpu-dsl-1`  
 
@@ -794,6 +794,10 @@ ightarrow$ valuation $
 ightarrow$ reconciliation $
 ightarrow$ reporting.
 * **Exit Gate:** All 6 frameworks produce traceable results; Dagster workflow executes end-to-end with retries; reconciliation reports pass.
+* **M5 Senior Review V4 Corrections Status (November 2, 2026):**
+  - **Blocker 1 (P0 — Dagster Real DB Persistence & Real Retry):** `db=None` production path removed. All 8 pipeline operations strictly require active DB session and persist canonical `Run`, `RunPackage`, `RunArtifact`, `ValuationRunDetail`, `RollforwardSummary`, and `ReconciliationReport` rows. Governed reconciliation reconciles against approved `ExpectedResultSet` or evaluates `NOT_VERIFIABLE` (zero fake PASS). Transient infrastructure failure demonstration proves Dagster native retry (`RetryRequested`) in action.
+  - **Blocker 2 (P0 — RunPackage Trusted Provenance):** External `base_package_document` removed from submission payload semantics. Valuation provenance derived strictly from PostgreSQL source `Run`, immutable `RunPackage`, and physical Parquet `RunArtifact` on disk (or approved `DerivedDataset`). Always requires fresh immutable build identity via `build_identity()`. Zero fake defaults (`model-default`/`mv-default` rejected). Physical file existence and byte SHA-256 verified fail-closed.
+  - **Blocker 3 (P1 — Safe Alembic Downgrade c9 -> b8 with Existing Data):** Staged migration in `c9f4e2d8a615` adds nullable columns, backfills from parent `runs` table, and applies NOT NULL, foreign keys, check constraints, and b8 triggers without artificial dummy defaults. Verified on PostgreSQL with real pre-seeded data before downgrade.
 
 ---
 

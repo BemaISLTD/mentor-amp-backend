@@ -268,9 +268,12 @@ def test_tampered_package_fails_verification():
 
 
 # =============================================================================
-# Production Service Integration Tests (Directive 2)
+# Production Service Integration Tests (Directive 2 & Senior Review Blocker 2)
 # =============================================================================
 
+from datetime import date
+import hashlib
+import json
 from unittest.mock import MagicMock
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -284,10 +287,12 @@ from app.db.models.run_package import RunPackage
 from app.db.models.valuation_detail import ValuationRunDetail
 from app.db.models.governance import DerivedDataset
 from app.db.models.run_artifact import RunArtifact
-from app.services.common import ServiceError
-from app.services.build_info import BuildIdentityUnavailable
+from app.services.common import ServiceError, iso, now_utc
+from app.services.build_info import BuildIdentityUnavailable, build_identity
 from app.services.run_package_service import freeze_valuation_run_package
 from app.services.run_submission_service import submit_valuation_run
+from app.core.artifacts import get_artifact_store
+import app.core.execution.run_package as core_run_pkg
 
 
 @pytest.fixture()
@@ -320,11 +325,98 @@ def seeded_val_env(db_session_val):
     return {"session": db_session_val, "proj1": proj1, "proj2": proj2, "user": user}
 
 
+def _seed_source_projection_run(db, project_id, run_id="run-src-proj-1", status="success"):
+    store = get_artifact_store()
+    rows = [{"policy_id": "P1", "month": 1, "cash_flow": 100.0, "reserve": 5000.0}]
+    stored = store.write_rows(
+        run_id=run_id,
+        artifact_type="cash_flows",
+        rows=rows,
+        attempt_number=1,
+        schema_version="m2-v1",
+    )
+
+    src_config = {
+        "project": {"id": project_id, "name": "Valuation Project"},
+        "run_type": "projection",
+        "model": {"id": "model-spia-01", "name": "SPIA VM-22 Model", "product_code": "SPIA"},
+        "model_version": {
+            "id": "mv-spia-v1",
+            "version_label": "v1.0.0",
+            "basis": "STATUTORY",
+            "methodology": "VM22",
+            "methodology_version": "v2024.1",
+        },
+        "valuation_date": "2026-12-31",
+        "horizon_months": 12,
+        "parameters": {"spread": 50},
+        "formulas": [],
+        "variables": [],
+        "datasets": {"inforce": []},
+        "build": build_identity(),
+    }
+    src_identity = {
+        "package_id": f"pkg-{run_id}",
+        "frozen_for_run_id": run_id,
+        "project_id": project_id,
+        "created_at": iso(now_utc()),
+    }
+    src_governance = {
+        "governance_mode": "governed",
+        "is_governed": True,
+        "frozen_at": iso(now_utc()),
+    }
+    sealed = core_run_pkg.seal(src_identity, src_governance, src_config)
+
+    src_run = Run(
+        id=run_id,
+        project_id=project_id,
+        name=f"Source Projection {run_id}",
+        status=status,
+        run_type="projection",
+        model_version_id="mv-spia-v1",
+        horizon_months=12,
+        valuation_date=date(2026, 12, 31),
+        run_package_fingerprint=sealed["fingerprint"],
+    )
+    db.add(src_run)
+    db.flush()
+
+    src_pkg_row = RunPackage(
+        id=sealed["identity"]["package_id"],
+        run_id=src_run.id,
+        project_id=project_id,
+        schema_version=sealed["schema_version"],
+        fingerprint_algorithm=sealed["fingerprint_algorithm"],
+        fingerprint=sealed["fingerprint"],
+        package=sealed,
+    )
+    db.add(src_pkg_row)
+
+    src_art = RunArtifact(
+        id=f"art-cf-{run_id}",
+        run_id=src_run.id,
+        attempt_number=1,
+        artifact_type="cash_flows",
+        storage_uri=stored.uri,
+        storage_backend="local",
+        file_format="parquet",
+        schema_version="m2-v1",
+        row_count=stored.row_count,
+        checksum_sha256=stored.checksum_sha256,
+    )
+    db.add(src_art)
+    db.commit()
+    return src_run, src_pkg_row, src_art
+
+
 def test_real_service_freeze_valuation_run_package_success(seeded_val_env):
-    """Directive 2: Calling actual freeze_valuation_run_package service succeeds with valid build identity."""
+    """Directive 2 & Blocker 2: Calling freeze_valuation_run_package succeeds with verified model identity from source run."""
     db = seeded_val_env["session"]
     proj = seeded_val_env["proj1"]
     user = seeded_val_env["user"]
+    src_run, src_pkg, src_art = _seed_source_projection_run(db, proj.id)
+
     run = Run(id="run-val-actual-1", project_id=proj.id, name="Test Valuation Run")
     db.add(run)
     db.commit()
@@ -337,6 +429,7 @@ def test_real_service_freeze_valuation_run_package_success(seeded_val_env):
         basis="STATUTORY",
         methodology="VM22",
         methodology_version="v2024.1",
+        source_projection_run_id=src_run.id,
         valuation_date="2026-12-31",
         valuation_parameters={"spread_bps": 100},
     )
@@ -346,16 +439,23 @@ def test_real_service_freeze_valuation_run_package_success(seeded_val_env):
     assert pkg.configuration["valuation"]["basis"] == "STATUTORY"
     assert pkg.configuration["valuation"]["methodology"] == "VM22"
     assert pkg.configuration["valuation"]["methodology_version"] == "v2024.1"
+    assert pkg.configuration["valuation"]["source_projection_run_id"] == src_run.id
+    assert pkg.configuration["valuation"]["source_run_package_fingerprint"] == src_pkg.fingerprint
+    assert pkg.configuration["valuation"]["source_artifact_id"] == src_art.id
+    assert pkg.configuration["valuation"]["source_artifact_fingerprint"] == src_art.checksum_sha256
+    assert pkg.configuration["model"]["id"] == "model-spia-01"
+    assert pkg.configuration["model_version"]["id"] == "mv-spia-v1"
     assert pkg.configuration["valuation"]["valuation_parameters"]["spread_bps"] == 100
     assert pkg.configuration["build"]["identity_source"] in ("source_tree", "injected", "computed")
 
 
 def test_service_freeze_fails_on_missing_or_corrupt_build_identity(seeded_val_env, monkeypatch):
-    """Directive 2: Fails closed when build identity is missing or fallback."""
+    """Directive 2 & Blocker 2: Fails closed (503) when build identity is missing or fallback."""
     import app.services.run_package_service as rps
     db = seeded_val_env["session"]
     proj = seeded_val_env["proj1"]
     user = seeded_val_env["user"]
+    src_run, _, _ = _seed_source_projection_run(db, proj.id)
     run = Run(id="run-val-actual-2", project_id=proj.id)
 
     # 1. BuildIdentityUnavailable -> ServiceError(503, BUILD_IDENTITY_UNAVAILABLE)
@@ -367,6 +467,7 @@ def test_service_freeze_fails_on_missing_or_corrupt_build_identity(seeded_val_en
         freeze_valuation_run_package(
             db=db, project=proj, run=run, user=user,
             basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            source_projection_run_id=src_run.id,
         )
     assert exc_info.value.code == "BUILD_IDENTITY_UNAVAILABLE"
     assert exc_info.value.status_code == 503
@@ -385,6 +486,7 @@ def test_service_freeze_fails_on_missing_or_corrupt_build_identity(seeded_val_en
         freeze_valuation_run_package(
             db=db, project=proj, run=run, user=user,
             basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            source_projection_run_id=src_run.id,
         )
     assert exc_info2.value.code == "BUILD_IDENTITY_UNAVAILABLE"
 
@@ -396,7 +498,6 @@ def test_service_freeze_foreign_source_projection_run_fails(seeded_val_env):
     proj2 = seeded_val_env["proj2"]
     user = seeded_val_env["user"]
 
-    # Source projection run belongs to proj2
     foreign_run = Run(id="run-proj2-source", project_id=proj2.id, name="Foreign Run")
     db.add(foreign_run)
     db.commit()
@@ -457,7 +558,7 @@ def test_service_freeze_unapproved_derived_dataset_fails(seeded_val_env):
         name="draft_dataset",
         dataset_type="cash_flows",
         version_number=1,
-        status="draft",  # NOT approved
+        status="draft",
         fingerprint="b" * 64,
         created_by="user-1",
     )
@@ -502,21 +603,19 @@ def test_service_freeze_dataset_fingerprint_mismatch_fails(seeded_val_env):
             db=db, project=proj1, run=target_run, user=user,
             basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
             derived_dataset_id=approved_ds.id,
-            derived_dataset_fingerprint="f" * 64,  # mismatched fingerprint
+            derived_dataset_fingerprint="f" * 64,
         )
     assert exc_info.value.code == "FINGERPRINT_MISMATCH"
     assert exc_info.value.status_code == 400
 
 
 def test_service_freeze_reproducibility_identical_rerun(seeded_val_env):
-    """Directive 2 & 16: Identical calls to freeze_valuation_run_package produce identical package fingerprints."""
+    """Blocker 2: Identical calls to freeze_valuation_run_package produce identical package fingerprints from trusted PostgreSQL source."""
     db = seeded_val_env["session"]
     proj1 = seeded_val_env["proj1"]
     user = seeded_val_env["user"]
 
-    base_doc = {
-        "configuration": copy.deepcopy(SAMPLE_VALUATION_CONFIGURATION)
-    }
+    src_run, src_pkg, src_art = _seed_source_projection_run(db, proj1.id)
 
     run1 = Run(id="run-rerun-1", project_id=proj1.id)
     run2 = Run(id="run-rerun-2", project_id=proj1.id)
@@ -526,24 +625,28 @@ def test_service_freeze_reproducibility_identical_rerun(seeded_val_env):
         basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
         valuation_date="2026-12-31",
         valuation_parameters={"spread_bps": 125},
-        base_package_document=base_doc,
+        source_projection_run_id=src_run.id,
     )
     pkg2 = freeze_valuation_run_package(
         db=db, project=proj1, run=run2, user=user,
         basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
         valuation_date="2026-12-31",
         valuation_parameters={"spread_bps": 125},
-        base_package_document=base_doc,
+        source_projection_run_id=src_run.id,
     )
 
     assert pkg1.fingerprint == pkg2.fingerprint
+    assert pkg1.configuration["valuation"]["source_run_package_fingerprint"] == src_pkg.fingerprint
+    assert pkg1.configuration["valuation"]["source_artifact_fingerprint"] == src_art.checksum_sha256
 
 
 def test_service_submit_valuation_run_end_to_end(seeded_val_env):
-    """Directive 2: submit_valuation_run creates canonical Run, RunPackage, ValuationRunDetail, and Event."""
+    """Blocker 2: submit_valuation_run derives provenance from PostgreSQL source projection run and persists canonical DB records."""
     db = seeded_val_env["session"]
     proj1 = seeded_val_env["proj1"]
     user = seeded_val_env["user"]
+
+    src_run, src_pkg, src_art = _seed_source_projection_run(db, proj1.id)
 
     payload = {
         "project_id": proj1.id,
@@ -554,7 +657,7 @@ def test_service_submit_valuation_run_end_to_end(seeded_val_env):
         "valuation_date": "2026-12-31",
         "horizon_months": 120,
         "valuation_parameters": {"spread_bps": 125},
-        "base_package_document": {"configuration": copy.deepcopy(SAMPLE_VALUATION_CONFIGURATION)},
+        "source_projection_run_id": src_run.id,
     }
 
     result = submit_valuation_run(db, payload, user)
@@ -572,15 +675,191 @@ def test_service_submit_valuation_run_end_to_end(seeded_val_env):
     assert persisted_run.basis == "STATUTORY"
     assert persisted_run.methodology == "VM22"
     assert persisted_run.run_package_fingerprint == run_info["run_package_fingerprint"]
+    assert persisted_run.model_version_id == "mv-spia-v1"
 
     persisted_pkg = db.get(RunPackage, run_info["run_package_id"])
     assert persisted_pkg is not None
+    assert persisted_pkg.package["configuration"]["model"]["id"] == "model-spia-01"
+    assert persisted_pkg is not None
     assert persisted_pkg.run_id == run_id
     assert persisted_pkg.fingerprint == run_info["run_package_fingerprint"]
+    assert persisted_pkg.package["configuration"]["valuation"]["source_run_package_fingerprint"] == src_pkg.fingerprint
+    assert persisted_pkg.package["configuration"]["valuation"]["source_artifact_fingerprint"] == src_art.checksum_sha256
 
     persisted_detail = db.get(ValuationRunDetail, run_id)
     assert persisted_detail is not None
     assert persisted_detail.run_id == run_id
     assert str(persisted_detail.valuation_date) == "2026-12-31"
-    assert persisted_detail.basis == "STATUTORY"  # via proxy property
-    assert persisted_detail.methodology == "VM22"  # via proxy property
+    assert persisted_detail.basis == "STATUTORY"
+    assert persisted_detail.methodology == "VM22"
+
+
+def test_rejection_of_caller_supplied_base_package_or_fake_build_sha(seeded_val_env):
+    """Blocker 2: Caller-supplied base_package_document and fake build identity are rejected; build identity is always from build_identity()."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+
+    src_run, _, _ = _seed_source_projection_run(db, proj1.id)
+
+    # Caller attempts to submit fake build SHA and fake formulas via base_package_document
+    fake_caller_payload = {
+        "project_id": proj1.id,
+        "name": "Malicious Caller Submission",
+        "basis": "STATUTORY",
+        "methodology": "VM22",
+        "methodology_version": "v2024.1",
+        "valuation_date": "2026-12-31",
+        "source_projection_run_id": src_run.id,
+        "base_package_document": {
+            "configuration": {
+                "build": {
+                    "build_fingerprint": "bad" * 21 + "b",
+                    "source_commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                },
+                "formulas": [{"id": "fake_formula"}],
+            }
+        },
+    }
+
+    result = submit_valuation_run(db, fake_caller_payload, user)
+    val_pkg = db.get(RunPackage, result["run"]["run_package_id"])
+
+    # Must NOT contain fake caller build info or fake formulas
+    pkg_build = val_pkg.package["configuration"]["build"]
+    trusted_build = build_identity()
+    assert pkg_build["build_fingerprint"] == trusted_build["build_fingerprint"]
+    assert pkg_build["source_commit"] == trusted_build["source_commit"]
+    assert val_pkg.package["configuration"]["formulas"] != [{"id": "fake_formula"}]
+
+
+def test_rejection_of_tampered_source_run_package(seeded_val_env):
+    """Blocker 2: Tampering with source RunPackage causes SOURCE_PACKAGE_TAMPERED."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+
+    src_run, src_pkg, _ = _seed_source_projection_run(db, proj1.id)
+
+    # Tamper with the package configuration bypassing ORM immutability via raw SQL
+    import sqlalchemy as sa
+    tampered_package = copy.deepcopy(src_pkg.package)
+    tampered_package["configuration"]["parameters"]["tampered_key"] = "malicious"
+    db.execute(
+        sa.text("UPDATE run_packages SET package = :pkg WHERE id = :id"),
+        {"pkg": json.dumps(tampered_package), "id": src_pkg.id},
+    )
+    db.commit()
+    db.expire_all()
+
+    target_run = Run(id="run-val-tamper-target", project_id=proj1.id)
+
+    with pytest.raises(ServiceError) as exc_info:
+        freeze_valuation_run_package(
+            db=db, project=proj1, run=target_run, user=user,
+            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            source_projection_run_id=src_run.id,
+        )
+    assert exc_info.value.code == "SOURCE_PACKAGE_TAMPERED"
+    assert exc_info.value.status_code == 400
+
+
+def test_rejection_of_incomplete_source_run_status(seeded_val_env):
+    """Blocker 2: Source run with pending status fails with INVALID_SOURCE_RUN_STATUS."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+
+    src_run, _, _ = _seed_source_projection_run(db, proj1.id, run_id="run-pending-src", status="pending")
+
+    target_run = Run(id="run-val-pending-target", project_id=proj1.id)
+
+    with pytest.raises(ServiceError) as exc_info:
+        freeze_valuation_run_package(
+            db=db, project=proj1, run=target_run, user=user,
+            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            source_projection_run_id=src_run.id,
+        )
+    assert exc_info.value.code == "INVALID_SOURCE_RUN_STATUS"
+    assert exc_info.value.status_code == 400
+
+
+def test_physical_artifact_existence_and_checksum_verification(seeded_val_env):
+    """Blocker 2: Physical artifact file existence and byte SHA-256 matching are strictly enforced."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+
+    src_run, _, src_art = _seed_source_projection_run(db, proj1.id, run_id="run-art-check")
+    store = get_artifact_store()
+    path = store.path_for_uri(src_art.storage_uri)
+    assert path.exists()
+
+    # 1. Tamper with file content -> FINGERPRINT_MISMATCH
+    original_bytes = path.read_bytes()
+    path.write_bytes(original_bytes + b"corruption")
+
+    target_run1 = Run(id="run-val-art-corrupt", project_id=proj1.id)
+    with pytest.raises(ServiceError) as exc_info:
+        freeze_valuation_run_package(
+            db=db, project=proj1, run=target_run1, user=user,
+            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            source_projection_run_id=src_run.id,
+        )
+    assert exc_info.value.code == "FINGERPRINT_MISMATCH"
+    assert exc_info.value.status_code == 400
+
+    # 2. Delete file -> PHYSICAL_ARTIFACT_MISSING
+    path.unlink()
+    target_run2 = Run(id="run-val-art-missing", project_id=proj1.id)
+    with pytest.raises(ServiceError) as exc_info2:
+        freeze_valuation_run_package(
+            db=db, project=proj1, run=target_run2, user=user,
+            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            source_projection_run_id=src_run.id,
+        )
+    assert exc_info2.value.code == "PHYSICAL_ARTIFACT_MISSING"
+    assert exc_info2.value.status_code == 400
+
+
+def test_distinctness_of_source_run_package_fingerprint_vs_source_artifact_fingerprint(seeded_val_env):
+    """Blocker 2: source_run_package_fingerprint is NOT a source_artifact_fingerprint."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+
+    src_run, src_pkg, src_art = _seed_source_projection_run(db, proj1.id, run_id="run-distinct-fp")
+
+    target_run = Run(id="run-val-distinct-fp", project_id=proj1.id)
+    pkg = freeze_valuation_run_package(
+        db=db, project=proj1, run=target_run, user=user,
+        basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+        source_projection_run_id=src_run.id,
+    )
+
+    val_block = pkg.configuration["valuation"]
+    src_pkg_fp = val_block["source_run_package_fingerprint"]
+    src_art_fp = val_block["source_artifact_fingerprint"]
+
+    assert src_pkg_fp == src_pkg.fingerprint
+    assert src_art_fp == src_art.checksum_sha256
+    # The package configuration hash is fundamentally distinct from the Parquet byte checksum
+    assert src_pkg_fp != src_art_fp
+
+
+def test_rejection_of_missing_model_identity(seeded_val_env):
+    """Blocker 2: Zero fake defaults: valuation run fails closed with 400 MODEL_IDENTITY_REQUIRED when model identity cannot be established."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+
+    # Run without source run, without derived dataset, and without model_id
+    run_no_model = Run(id="run-val-no-model", project_id=proj1.id)
+
+    with pytest.raises(ServiceError) as exc_info:
+        freeze_valuation_run_package(
+            db=db, project=proj1, run=run_no_model, user=user,
+            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+        )
+    assert exc_info.value.code == "MODEL_IDENTITY_REQUIRED"
+    assert exc_info.value.status_code == 400

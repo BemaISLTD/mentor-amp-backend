@@ -272,15 +272,18 @@ def submit_valuation_run(db: Session, payload: dict[str, Any], user: Any) -> dic
         methodology=methodology,
         methodology_version=methodology_version,
         source_projection_run_id=payload.get("source_projection_run_id"),
+        source_artifact_id=payload.get("source_artifact_id"),
         derived_dataset_id=payload.get("derived_dataset_id"),
         derived_dataset_fingerprint=payload.get("derived_dataset_fingerprint"),
         source_artifact_fingerprint=payload.get("source_artifact_fingerprint"),
         discount_curve_fingerprint=payload.get("discount_curve_fingerprint"),
         valuation_date=str(val_date),
         valuation_parameters=payload.get("valuation_parameters"),
-        base_package_document=payload.get("base_package_document"),
+        model_id=payload.get("model_id"),
+        model_version_id=payload.get("model_version_id"),
     )
 
+    run.model_version_id = package.configuration["model_version"]["id"]
     run.run_package_fingerprint = package.fingerprint
     db.add(run)
     db.flush()

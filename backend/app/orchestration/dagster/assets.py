@@ -23,9 +23,11 @@ from dagster import (
     MetadataValue,
     Output,
     RetryPolicy,
+    RetryRequested,
     asset,
 )
 
+import app.db.database as db_mod
 from app.services.common import ServiceError
 from app.services.valuation_pipeline_service import (
     execute_cash_flow_aggregation,
@@ -38,8 +40,8 @@ from app.services.valuation_pipeline_service import (
     execute_rollforward_attribution,
 )
 
-# Standard retry policy ONLY for transient network/DB contention
-DEFAULT_RETRY_POLICY = RetryPolicy(max_retries=3, delay=5, backoff=None)
+# Standard retry policy for transient network/DB contention
+DEFAULT_RETRY_POLICY = RetryPolicy(max_retries=3, delay=1, backoff=None)
 
 
 class InforceConfig(Config):
@@ -48,6 +50,7 @@ class InforceConfig(Config):
 
 
 class ProjectionConfig(Config):
+    project_id: str = "proj-m5-valuation-default"
     projection_months: int = 12
     annual_credited_rate: float = 0.045
     annual_surrender_rate: float = 0.02
@@ -77,17 +80,20 @@ def inforce_data_asset(
 ) -> Output[dict[str, Any]]:
     """Ingest inforce policy block and verify schema integrity through domain service."""
     context.log.info(f"Delegating inforce ingestion to service for project '{config.project_id}'.")
-    try:
-        payload = execute_inforce_import(
-            db=None,
-            project_id=config.project_id,
-            policy_block=config.policy_block,
-        )
-    except ServiceError as e:
-        allow_retries = e.status_code >= 500
-        raise Failure(description=f"Inforce ingestion failed: {e.message}", allow_retries=allow_retries) from e
-    except Exception as e:
-        raise Failure(description=f"Unexpected inforce error: {e}", allow_retries=True) from e
+    with db_mod.SessionLocal() as db:
+        try:
+            payload = execute_inforce_import(
+                db=db,
+                project_id=config.project_id,
+                policy_block=config.policy_block,
+            )
+        except ServiceError as e:
+            allow_retries = e.status_code >= 500
+            if allow_retries:
+                raise RetryRequested(max_retries=3, seconds_to_wait=1.0) from e
+            raise Failure(description=f"Inforce ingestion failed: {e.message}", allow_retries=False) from e
+        except Exception as e:
+            raise RetryRequested(max_retries=3, seconds_to_wait=1.0) from e
 
     return Output(
         value=payload,
@@ -115,8 +121,8 @@ def validation_asset(
     context.log.info(f"Validating inforce data with fingerprint {inforce_data_asset['fingerprint']}.")
     try:
         result = execute_inforce_validation(inforce_data_asset)
+        result["project_id"] = inforce_data_asset["project_id"]
     except ServiceError as e:
-        # Deterministic validation failures MUST NOT retry
         raise Failure(description=e.message, allow_retries=False) from e
     except Exception as e:
         raise Failure(description=f"Validation error: {e}", allow_retries=False) from e
@@ -146,21 +152,25 @@ def projection_run_asset(
 ) -> Output[dict[str, Any]]:
     """Run projection simulation, persist real Parquet file, and emit persisted lineage."""
     context.log.info(f"Invoking projection service for {config.projection_months} months.")
-    try:
-        result = execute_projection_simulation(
-            db=None,
-            project_id="proj-m5-valuation-default",
-            validated_inforce=validation_asset,
-            projection_months=config.projection_months,
-            annual_credited_rate=config.annual_credited_rate,
-            annual_surrender_rate=config.annual_surrender_rate,
-            run_id=config.run_id,
-        )
-    except ServiceError as e:
-        allow_retries = e.status_code >= 500
-        raise Failure(description=f"Projection failed: {e.message}", allow_retries=allow_retries) from e
-    except Exception as e:
-        raise Failure(description=f"Unexpected projection error: {e}", allow_retries=True) from e
+    project_id = validation_asset.get("project_id", config.project_id)
+    with db_mod.SessionLocal() as db:
+        try:
+            result = execute_projection_simulation(
+                db=db,
+                project_id=project_id,
+                validated_inforce=validation_asset,
+                projection_months=config.projection_months,
+                annual_credited_rate=config.annual_credited_rate,
+                annual_surrender_rate=config.annual_surrender_rate,
+                run_id=config.run_id,
+            )
+        except ServiceError as e:
+            allow_retries = e.status_code >= 500
+            if allow_retries:
+                raise RetryRequested(max_retries=3, seconds_to_wait=1.0) from e
+            raise Failure(description=f"Projection failed: {e.message}", allow_retries=False) from e
+        except Exception as e:
+            raise RetryRequested(max_retries=3, seconds_to_wait=1.0) from e
 
     return Output(
         value=result,
@@ -187,18 +197,21 @@ def aggregation_asset(
 ) -> Output[dict[str, Any]]:
     """Aggregate flows and stocks per CAS §8 from persisted Parquet file via domain service."""
     context.log.info(f"Aggregating persisted cash flows for run {projection_run_asset['run_id']}.")
-    try:
-        result = execute_cash_flow_aggregation(
-            db=None,
-            projection_run_id=projection_run_asset["run_id"],
-            storage_uri=projection_run_asset.get("storage_uri"),
-            simulation_rows=projection_run_asset.get("simulation_rows"),
-        )
-    except ServiceError as e:
-        allow_retries = e.status_code >= 500
-        raise Failure(description=f"Aggregation failed: {e.message}", allow_retries=allow_retries) from e
-    except Exception as e:
-        raise Failure(description=f"Unexpected aggregation error: {e}", allow_retries=False) from e
+    with db_mod.SessionLocal() as db:
+        try:
+            result = execute_cash_flow_aggregation(
+                db=db,
+                projection_run_id=projection_run_asset["run_id"],
+                storage_uri=projection_run_asset.get("storage_uri"),
+                simulation_rows=projection_run_asset.get("simulation_rows"),
+            )
+        except ServiceError as e:
+            allow_retries = e.status_code >= 500
+            if allow_retries:
+                raise RetryRequested(max_retries=3, seconds_to_wait=1.0) from e
+            raise Failure(description=f"Aggregation failed: {e.message}", allow_retries=False) from e
+        except Exception as e:
+            raise Failure(description=f"Unexpected aggregation error: {e}", allow_retries=False) from e
 
     return Output(
         value=result,
@@ -225,20 +238,25 @@ def valuation_asset(
 ) -> Output[dict[str, Any]]:
     """Calculate reserve and valuation outputs via domain service without claiming VM21/VM22 compliance."""
     context.log.info(f"Evaluating foundation reserve for {config.basis} / {config.methodology}.")
-    try:
-        result = execute_foundation_valuation(
-            db=None,
-            upstream_run_id=aggregation_asset["upstream_run_id"],
-            basis=config.basis,
-            methodology=config.methodology,
-            valuation_date=config.valuation_date,
-            annual_discount_rate=config.annual_discount_rate,
-            aggregated_cash_flows=aggregation_asset["aggregated_cash_flows"],
-        )
-    except ServiceError as e:
-        raise Failure(description=f"Valuation failed: {e.message}", allow_retries=False) from e
-    except Exception as e:
-        raise Failure(description=f"Unexpected valuation error: {e}", allow_retries=False) from e
+    with db_mod.SessionLocal() as db:
+        try:
+            result = execute_foundation_valuation(
+                db=db,
+                upstream_run_id=aggregation_asset["upstream_run_id"],
+                basis=config.basis,
+                methodology=config.methodology,
+                valuation_date=config.valuation_date,
+                annual_discount_rate=config.annual_discount_rate,
+                aggregated_cash_flows=aggregation_asset["aggregated_cash_flows"],
+                project_id=aggregation_asset["project_id"],
+            )
+        except ServiceError as e:
+            allow_retries = e.status_code >= 500
+            if allow_retries:
+                raise RetryRequested(max_retries=3, seconds_to_wait=1.0) from e
+            raise Failure(description=f"Valuation failed: {e.message}", allow_retries=False) from e
+        except Exception as e:
+            raise Failure(description=f"Unexpected valuation error: {e}", allow_retries=False) from e
 
     return Output(
         value=result,
@@ -249,6 +267,8 @@ def valuation_asset(
             "present_value_reserve": MetadataValue.float(result["present_value_reserve"]),
             "discount_rate": MetadataValue.float(result["discount_rate"]),
             "compliance_status": MetadataValue.text(result["compliance_status"]),
+            "run_package_id": MetadataValue.text(result["run_package_id"]),
+            "run_package_fingerprint": MetadataValue.text(result["run_package_fingerprint"]),
             "started_at": MetadataValue.text(result["started_at"]),
             "completed_at": MetadataValue.text(result["completed_at"]),
         },
@@ -264,7 +284,7 @@ def rollforward_asset(
     valuation_asset: dict[str, Any],
     aggregation_asset: dict[str, Any],
 ) -> Output[dict[str, Any]]:
-    """Execute rollforward continuity validation via domain service."""
+    """Execute rollforward continuity validation and persist summary via domain service."""
     context.log.info("Validating accounting rollforward continuity via domain service.")
     opening = Decimal("5000.00")
     movements = {
@@ -274,17 +294,21 @@ def rollforward_asset(
     }
     ending = Decimal("6000.00")
 
-    try:
-        result = execute_rollforward_attribution(
-            opening=opening,
-            movements=movements,
-            ending=ending,
-            tolerance=Decimal("0.01"),
-        )
-    except ServiceError as e:
-        raise Failure(description=e.message, allow_retries=False) from e
-    except Exception as e:
-        raise Failure(description=f"Rollforward error: {e}", allow_retries=False) from e
+    with db_mod.SessionLocal() as db:
+        try:
+            result = execute_rollforward_attribution(
+                db=db,
+                valuation_run_id=valuation_asset["valuation_run_id"],
+                project_id=valuation_asset["project_id"],
+                opening=opening,
+                movements=movements,
+                ending=ending,
+                tolerance=Decimal("0.01"),
+            )
+        except ServiceError as e:
+            raise Failure(description=e.message, allow_retries=False) from e
+        except Exception as e:
+            raise Failure(description=f"Rollforward error: {e}", allow_retries=False) from e
 
     return Output(
         value=result,
@@ -293,6 +317,7 @@ def rollforward_asset(
             "opening_balance": MetadataValue.float(result["opening_balance"]),
             "ending_balance": MetadataValue.float(result["ending_balance"]),
             "difference": MetadataValue.float(result["difference"]),
+            "summary_id": MetadataValue.text(result["summary_id"]),
             "started_at": MetadataValue.text(result["started_at"]),
             "completed_at": MetadataValue.text(result["completed_at"]),
         },
@@ -312,20 +337,23 @@ def reconciliation_report_asset(
     """Generate three-state reconciliation report (PASS, FAIL, NOT_VERIFIABLE) via domain service."""
     context.log.info("Invoking governed reconciliation service.")
     actual_reserve = valuation_asset["present_value_reserve"]
-    try:
-        report = execute_governed_reconciliation(
-            db=None,
-            upstream_run_id=valuation_asset["upstream_run_id"],
-            actual_reserve=actual_reserve,
-            expected_benchmark=config.expected_benchmark,
-            tolerance=config.tolerance,
-        )
-    except ServiceError as e:
-        raise Failure(description=f"Reconciliation error: {e.message}", allow_retries=False) from e
-    except Exception as e:
-        raise Failure(description=f"Unexpected reconciliation error: {e}", allow_retries=False) from e
+    with db_mod.SessionLocal() as db:
+        try:
+            report = execute_governed_reconciliation(
+                db=db,
+                valuation_run_id=valuation_asset["valuation_run_id"],
+                project_id=valuation_asset["project_id"],
+                actual_reserve=actual_reserve,
+                expected_benchmark=config.expected_benchmark,
+                tolerance=config.tolerance,
+            )
+        except ServiceError as e:
+            raise Failure(description=f"Reconciliation error: {e.message}", allow_retries=False) from e
+        except Exception as e:
+            raise Failure(description=f"Unexpected reconciliation error: {e}", allow_retries=False) from e
 
     report_metadata: dict[str, Any] = {
+        "report_id": MetadataValue.text(report["report_id"]),
         "reconciliation_status": MetadataValue.text(report["status"]),
         "actual_value": MetadataValue.float(actual_reserve),
         "difference": MetadataValue.float(report["difference"]),
@@ -353,23 +381,26 @@ def reporting_asset(
 ) -> Output[dict[str, Any]]:
     """Assemble final disclosure package and persist audit export artifact via domain service."""
     context.log.info("Delegating reporting export to domain service.")
-    try:
-        package = execute_reporting_manifest(
-            db=None,
-            upstream_run_id=valuation_asset["upstream_run_id"],
-            valuation_result=valuation_asset,
-            rollforward_result=rollforward_asset,
-            reconciliation_result=reconciliation_report_asset,
-        )
-    except ServiceError as e:
-        raise Failure(description=f"Reporting failed: {e.message}", allow_retries=False) from e
-    except Exception as e:
-        raise Failure(description=f"Unexpected reporting error: {e}", allow_retries=False) from e
+    with db_mod.SessionLocal() as db:
+        try:
+            package = execute_reporting_manifest(
+                db=db,
+                valuation_run_id=valuation_asset["valuation_run_id"],
+                project_id=valuation_asset["project_id"],
+                valuation_result=valuation_asset,
+                rollforward_result=rollforward_asset,
+                reconciliation_result=reconciliation_report_asset,
+            )
+        except ServiceError as e:
+            raise Failure(description=f"Reporting failed: {e.message}", allow_retries=False) from e
+        except Exception as e:
+            raise Failure(description=f"Unexpected reporting error: {e}", allow_retries=False) from e
 
     return Output(
         value=package,
         metadata={
             "package_id": MetadataValue.text(package["package_id"]),
+            "artifact_id": MetadataValue.text(package["artifact_id"]),
             "rollforward_verified": MetadataValue.bool(package["rollforward_verified"]),
             "reconciliation_status": MetadataValue.text(package["reconciliation_status"]),
             "manifest_sha256": MetadataValue.text(package["manifest_sha256"]),

@@ -759,13 +759,15 @@ def freeze_valuation_run_package(
     methodology: str,
     methodology_version: str,
     source_projection_run_id: str | None = None,
+    source_artifact_id: str | None = None,
     derived_dataset_id: str | None = None,
     derived_dataset_fingerprint: str | None = None,
     source_artifact_fingerprint: str | None = None,
     discount_curve_fingerprint: str | None = None,
     valuation_date: str | Any = None,
     valuation_parameters: dict | None = None,
-    base_package_document: dict[str, Any] | None = None,
+    model_id: str | None = None,
+    model_version_id: str | None = None,
 ) -> FrozenPackage:
     """Freeze a canonical RunPackage for an M5 valuation run (Directives 2, 3 and 16).
 
@@ -774,9 +776,11 @@ def freeze_valuation_run_package(
     - methodology
     - methodology_version
     - source_projection_run_id
+    - source_run_package_fingerprint
+    - source_artifact_id
+    - source_artifact_fingerprint
     - derived_dataset_id
     - derived_dataset_fingerprint
-    - source_artifact_fingerprint
     - discount_curve_fingerprint
     - valuation_date
     - valuation_parameters
@@ -786,15 +790,19 @@ def freeze_valuation_run_package(
 
     Governed Invariants:
     1. Basis and methodology taxonomy strictly validated (no TAX, known pairings).
-    2. Zero build identity fallback: missing/corrupt build identity fails closed.
-    3. Provenance validation: verifies project ownership, approved status, and fingerprint
-       integrity against trusted database objects when db is provided.
+    2. Trusted provenance ONLY: lineage loaded from PostgreSQL source Run/RunPackage or
+       approved DerivedDataset; caller-supplied base packages are forbidden.
+    3. Zero fake defaults: model identity must be verified; no 'model-default' or 'mv-default'.
+    4. Physical artifact checksum and existence verified closed without swallowing errors.
+    5. Immutable build identity obtained from build_identity() for this valuation run.
     """
     import copy
     import hashlib
     import re
     from app.core.execution.fingerprints import fingerprint as compute_fp
     from app.db.models.run import Run
+    from app.db.models.run_package import RunPackage
+    from app.db.models.run_artifact import RunArtifact
     from app.core.valuation.taxonomy import (
         validate_basis,
         validate_methodology,
@@ -805,20 +813,135 @@ def freeze_valuation_run_package(
     validate_methodology(methodology)
     validate_basis_methodology_pair(basis, methodology)
 
+    if basis == "TAX":
+        raise ServiceError(400, "UNSUPPORTED_VALUATION_BASIS", "TAX basis is explicitly not supported at launch.")
+
     proj_id = getattr(project, "id", str(project)) if project else None
     run_proj_id = getattr(run, "project_id", None)
     if proj_id and run_proj_id and run_proj_id != proj_id:
         raise ServiceError(404, "RUN_NOT_FOUND", f"Run not found in project '{proj_id}'.")
 
-    # Validate source projection run if db is available
+    model_dict: dict[str, Any] | None = None
+    model_version_dict: dict[str, Any] | None = None
+    formulas: list[dict[str, Any]] = []
+    variables: list[dict[str, Any]] = []
+    datasets: dict[str, Any] = {"inforce": [], "assumption_tables": [], "factor_tables": []}
+    parameters: dict[str, Any] = {}
+    scenario: dict[str, Any] = {}
+    source_run_package_fingerprint: str | None = None
+
+    # 1. Provenance from source projection run
     if source_projection_run_id and db is not None:
         source_run = db.get(Run, source_projection_run_id)
         if source_run is None or (proj_id and source_run.project_id != proj_id):
             raise ServiceError(404, "RUN_NOT_FOUND", f"Source projection run '{source_projection_run_id}' not found in project '{proj_id}'.")
-        if not source_artifact_fingerprint and getattr(source_run, "run_package_fingerprint", None):
-            source_artifact_fingerprint = source_run.run_package_fingerprint
 
-    # Validate derived dataset provenance if db is available
+        if source_run.status not in ("completed", "success"):
+            raise ServiceError(
+                400, "INVALID_SOURCE_RUN_STATUS",
+                f"Source projection run '{source_projection_run_id}' must be in 'completed' or 'success' status (current status: {source_run.status}).",
+            )
+
+        source_pkg_record = db.query(RunPackage).filter(RunPackage.run_id == source_run.id).first()
+        if source_pkg_record is None:
+            raise ServiceError(
+                400, "SOURCE_RUN_PACKAGE_NOT_FOUND",
+                f"Source projection run '{source_projection_run_id}' does not have an immutable persisted RunPackage.",
+            )
+
+        pkg_row_dict = {
+            "id": source_pkg_record.id,
+            "run_id": source_pkg_record.run_id,
+            "project_id": source_pkg_record.project_id,
+            "fingerprint": source_pkg_record.fingerprint,
+            "schema_version": source_pkg_record.schema_version,
+            "fingerprint_algorithm": source_pkg_record.fingerprint_algorithm,
+        }
+        run_row_dict = {
+            "id": source_run.id,
+            "project_id": source_run.project_id,
+            "run_set_id": source_run.run_set_id,
+            "run_package_fingerprint": source_run.run_package_fingerprint,
+            "scenario_id": source_run.scenario_id,
+            "model_version_id": source_run.model_version_id,
+            "projection_set_id": source_run.projection_set_id,
+            "horizon_months": source_run.horizon_months,
+            "valuation_date": str(source_run.valuation_date) if source_run.valuation_date else None,
+        }
+        try:
+            run_package.verify_envelope(source_pkg_record.package, pkg_row_dict, run_row_dict)
+        except Exception as env_err:
+            raise ServiceError(
+                400, "SOURCE_PACKAGE_ENVELOPE_INVALID",
+                f"Source RunPackage envelope check failed: {env_err}",
+            )
+        try:
+            src_conf = run_package.verify(source_pkg_record.package, source_pkg_record.fingerprint)
+        except Exception as tamper_err:
+            raise ServiceError(
+                400, "SOURCE_PACKAGE_TAMPERED",
+                f"Source RunPackage integrity verification failed: {tamper_err}",
+            )
+        source_run_package_fingerprint = source_pkg_record.fingerprint
+        if "model" in src_conf:
+            model_dict = copy.deepcopy(src_conf["model"])
+        if "model_version" in src_conf:
+            model_version_dict = copy.deepcopy(src_conf["model_version"])
+        formulas = copy.deepcopy(src_conf.get("formulas", []))
+        variables = copy.deepcopy(src_conf.get("variables", []))
+        datasets = copy.deepcopy(src_conf.get("datasets", {"inforce": [], "assumption_tables": [], "factor_tables": []}))
+        parameters = copy.deepcopy(src_conf.get("parameters", {}))
+        scenario = copy.deepcopy(src_conf.get("scenario", {}))
+
+        # Explicit source artifact resolution and physical file verification
+        art_query = db.query(RunArtifact).filter(RunArtifact.run_id == source_run.id)
+        if source_artifact_id:
+            art = art_query.filter(RunArtifact.id == source_artifact_id).first()
+            if art is None:
+                raise ServiceError(
+                    404, "ARTIFACT_NOT_FOUND",
+                    f"Source artifact '{source_artifact_id}' does not belong to source run '{source_projection_run_id}'.",
+                )
+        else:
+            art = art_query.filter(RunArtifact.artifact_type.in_(("cash_flows", "outputs", "valuation_results", "projection_outputs"))).first()
+            if art is None:
+                art = art_query.first()
+
+        if art is None:
+            raise ServiceError(
+                400, "SOURCE_ARTIFACT_NOT_FOUND",
+                f"No persisted RunArtifact found for source run '{source_projection_run_id}'.",
+            )
+
+        source_artifact_id = art.id
+        if source_artifact_fingerprint and source_artifact_fingerprint != art.checksum_sha256:
+            raise ServiceError(
+                400, "FINGERPRINT_MISMATCH",
+                f"Source artifact fingerprint mismatch: expected '{art.checksum_sha256}', got '{source_artifact_fingerprint}'.",
+            )
+        source_artifact_fingerprint = art.checksum_sha256
+
+        from app.core.artifacts import get_artifact_store
+        store = get_artifact_store()
+        try:
+            path = store.path_for_uri(art.storage_uri)
+        except Exception as exc:
+            raise ServiceError(400, "PHYSICAL_ARTIFACT_MISSING", f"Failed to resolve artifact path: {exc}") from exc
+
+        if not path.exists():
+            raise ServiceError(
+                400, "PHYSICAL_ARTIFACT_MISSING",
+                f"Physical artifact file does not exist at storage URI: {art.storage_uri}",
+            )
+
+        actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual_sha != art.checksum_sha256:
+            raise ServiceError(
+                400, "FINGERPRINT_MISMATCH",
+                f"Physical artifact content SHA-256 ({actual_sha}) does not match recorded checksum ({art.checksum_sha256}).",
+            )
+
+    # 2. Provenance from derived dataset
     if derived_dataset_id and db is not None:
         from app.db.models.governance import DerivedDataset
         dataset = db.get(DerivedDataset, derived_dataset_id)
@@ -843,10 +966,21 @@ def freeze_valuation_run_package(
             )
         derived_dataset_fingerprint = dataset.fingerprint
 
+        if not model_dict and dataset.source_model_id:
+            model_dict = {"id": dataset.source_model_id, "product_code": getattr(dataset, "product_code", None) or "M5"}
+        if not model_version_dict and dataset.source_model_version_id:
+            model_version_dict = {
+                "id": dataset.source_model_version_id,
+                "version_label": "v1.0",
+                "basis": basis,
+                "methodology": methodology,
+                "methodology_version": methodology_version,
+            }
+
         if hasattr(dataset, "source_artifact_id") and dataset.source_artifact_id:
-            from app.db.models.run_artifact import RunArtifact
             art = db.get(RunArtifact, dataset.source_artifact_id)
             if art:
+                source_artifact_id = art.id
                 if source_artifact_fingerprint and source_artifact_fingerprint != art.checksum_sha256:
                     raise ServiceError(
                         400, "FINGERPRINT_MISMATCH",
@@ -854,32 +988,61 @@ def freeze_valuation_run_package(
                     )
                 source_artifact_fingerprint = art.checksum_sha256
                 from app.core.artifacts import get_artifact_store
+                store = get_artifact_store()
                 try:
-                    store = get_artifact_store()
                     path = store.path_for_uri(art.storage_uri)
-                    if path.exists():
-                        actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
-                        if actual_sha != art.checksum_sha256:
-                            raise ServiceError(
-                                400, "FINGERPRINT_MISMATCH",
-                                f"Physical artifact content does not match recorded fingerprint: {actual_sha} vs {art.checksum_sha256}.",
-                            )
-                except ServiceError:
-                    raise
-                except Exception:
-                    pass
+                except Exception as exc:
+                    raise ServiceError(400, "PHYSICAL_ARTIFACT_MISSING", f"Failed to resolve artifact path: {exc}") from exc
+                if not path.exists():
+                    raise ServiceError(
+                        400, "PHYSICAL_ARTIFACT_MISSING",
+                        f"Physical artifact file does not exist at storage URI: {art.storage_uri}",
+                    )
+                actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+                if actual_sha != art.checksum_sha256:
+                    raise ServiceError(
+                        400, "FINGERPRINT_MISMATCH",
+                        f"Physical artifact content SHA-256 ({actual_sha}) does not match recorded checksum ({art.checksum_sha256}).",
+                    )
 
-    if base_package_document and "configuration" in base_package_document:
-        configuration = copy.deepcopy(base_package_document["configuration"])
-        build = configuration.get("build") or {}
-    else:
-        try:
-            build = build_identity()
-        except BuildIdentityUnavailable as exc:
-            raise ServiceError(
-                503, "BUILD_IDENTITY_UNAVAILABLE",
-                "Governed valuation runs require verified immutable build identity.",
-            ) from exc
+    # 3. Direct model parameters on run
+    if not model_dict and (model_id or getattr(run, "model_id", None)):
+        effective_mid = model_id or getattr(run, "model_id", None)
+        model_dict = {"id": effective_mid, "product_code": getattr(run, "projection_key", None) or "M5"}
+    if not model_version_dict and (model_version_id or getattr(run, "model_version_id", None)):
+        effective_mvid = model_version_id or getattr(run, "model_version_id", None)
+        model_version_dict = {
+            "id": effective_mvid,
+            "version_label": "v1.0",
+            "basis": basis,
+            "methodology": methodology,
+            "methodology_version": methodology_version,
+        }
+
+    # 4. Zero fake identity defaults: fail if model identity cannot be established
+    if not model_dict or not model_dict.get("id") or model_dict["id"] == "model-default":
+        raise ServiceError(
+            400, "MODEL_IDENTITY_REQUIRED",
+            "Valuation runs require verified model identity derived from trusted source run, approved dataset, or validated model.",
+        )
+    if not model_version_dict or not model_version_dict.get("id") or model_version_dict["id"] == "mv-default":
+        raise ServiceError(
+            400, "MODEL_IDENTITY_REQUIRED",
+            "Valuation runs require verified model version identity derived from trusted source run, approved dataset, or validated model.",
+        )
+
+    model_version_dict["basis"] = basis
+    model_version_dict["methodology"] = methodology
+    model_version_dict["methodology_version"] = methodology_version
+
+    # 5. Immutable build identity obtained strictly from build_identity() for this run
+    try:
+        build = build_identity()
+    except BuildIdentityUnavailable as exc:
+        raise ServiceError(
+            503, "BUILD_IDENTITY_UNAVAILABLE",
+            "Governed valuation runs require verified immutable build identity.",
+        ) from exc
 
     exec_fp = build.get("build_fingerprint") or ""
     src_commit = build.get("source_commit") or ""
@@ -893,27 +1056,21 @@ def freeze_valuation_run_package(
     if src_commit and not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", src_commit):
         raise ServiceError(503, "BUILD_IDENTITY_INVALID", "SOURCE_COMMIT must be a Git commit SHA.")
 
-    if not (base_package_document and "configuration" in base_package_document):
-        configuration = {
-            "project": {"id": proj_id, "name": getattr(project, "name", "") if project else ""},
-            "run_type": "valuation",
-            "model": {"id": getattr(run, "model_id", None) or "model-default", "product_code": getattr(run, "projection_key", None) or "M5"},
-            "model_version": {
-                "id": getattr(run, "model_version_id", None) or "mv-default",
-                "version_label": "v1.0",
-                "basis": basis,
-                "methodology": methodology,
-                "methodology_version": methodology_version,
-            },
-            "valuation_date": str(valuation_date or getattr(run, "valuation_date", "2026-12-31")),
-            "horizon_months": getattr(run, "horizon_months", 120),
-            "execution_backend": "cpu",
-            "parameters": {},
-            "formulas": [],
-            "variables": [],
-            "datasets": {"inforce": [], "assumption_tables": [], "factor_tables": []},
-            "build": build,
-        }
+    configuration = {
+        "project": {"id": proj_id, "name": getattr(project, "name", "") if project else ""},
+        "run_type": "valuation",
+        "model": model_dict,
+        "model_version": model_version_dict,
+        "valuation_date": str(valuation_date or getattr(run, "valuation_date", "2026-12-31")),
+        "horizon_months": getattr(run, "horizon_months", 120),
+        "execution_backend": "cpu",
+        "parameters": parameters,
+        "formulas": formulas,
+        "variables": variables,
+        "datasets": datasets,
+        "scenario": scenario,
+        "build": build,
+    }
 
     val_params = dict(valuation_parameters or {})
     val_config_fp = compute_fp(val_params)
@@ -924,9 +1081,11 @@ def freeze_valuation_run_package(
         "methodology": methodology,
         "methodology_version": methodology_version,
         "source_projection_run_id": source_projection_run_id,
+        "source_run_package_fingerprint": source_run_package_fingerprint,
+        "source_artifact_id": source_artifact_id,
+        "source_artifact_fingerprint": source_artifact_fingerprint,
         "derived_dataset_id": derived_dataset_id,
         "derived_dataset_fingerprint": derived_dataset_fingerprint,
-        "source_artifact_fingerprint": source_artifact_fingerprint,
         "discount_curve_fingerprint": discount_curve_fingerprint,
         "valuation_date": val_date_str,
         "valuation_parameters": val_params,

@@ -187,40 +187,69 @@ def downgrade() -> None:
         """)
 
     # 2. Restore b8 valuation_run_details columns, nullability, foreign keys, constraints, and indexes
+    # Staged downgrade:
+    # 2a. Add legacy columns as nullable without foreign keys or server defaults
     with op.batch_alter_table("valuation_run_details") as batch_op:
-        batch_op.add_column(
-            sa.Column(
-                "project_id",
-                sa.String(36),
-                sa.ForeignKey("projects.id", ondelete="RESTRICT"),
-                nullable=False,
-                server_default="legacy-migrated",
-            )
+        batch_op.add_column(sa.Column("project_id", sa.String(36), nullable=True))
+        batch_op.add_column(sa.Column("source_projection_run_id", sa.String(36), nullable=True))
+        batch_op.add_column(sa.Column("derived_dataset_id", sa.String(36), nullable=True))
+        batch_op.add_column(sa.Column("basis", sa.String(50), nullable=True))
+        batch_op.add_column(sa.Column("methodology", sa.String(50), nullable=True))
+        batch_op.add_column(sa.Column("methodology_version", sa.String(50), nullable=True))
+
+    # 2b. Backfill existing rows from canonical parent runs table
+    if is_postgres:
+        op.execute("""
+            UPDATE valuation_run_details v
+            SET 
+                project_id = r.project_id,
+                source_projection_run_id = r.source_projection_run_id,
+                derived_dataset_id = r.derived_dataset_id,
+                basis = COALESCE(r.basis, 'STATUTORY'),
+                methodology = COALESCE(r.methodology, 'VM22'),
+                methodology_version = COALESCE(r.methodology_version, 'v1')
+            FROM runs r
+            WHERE v.run_id = r.id;
+        """)
+    else:
+        op.execute("""
+            UPDATE valuation_run_details
+            SET 
+                project_id = (SELECT project_id FROM runs WHERE runs.id = valuation_run_details.run_id),
+                source_projection_run_id = (SELECT source_projection_run_id FROM runs WHERE runs.id = valuation_run_details.run_id),
+                derived_dataset_id = (SELECT derived_dataset_id FROM runs WHERE runs.id = valuation_run_details.run_id),
+                basis = COALESCE((SELECT basis FROM runs WHERE runs.id = valuation_run_details.run_id), 'STATUTORY'),
+                methodology = COALESCE((SELECT methodology FROM runs WHERE runs.id = valuation_run_details.run_id), 'VM22'),
+                methodology_version = COALESCE((SELECT methodology_version FROM runs WHERE runs.id = valuation_run_details.run_id), 'v1')
+            WHERE EXISTS (SELECT 1 FROM runs WHERE runs.id = valuation_run_details.run_id);
+        """)
+
+    # 2c. Enforce NOT NULL, foreign keys, check constraints, and indexes
+    with op.batch_alter_table("valuation_run_details") as batch_op:
+        batch_op.alter_column("project_id", nullable=False)
+        batch_op.alter_column("basis", nullable=False)
+        batch_op.alter_column("methodology", nullable=False)
+        batch_op.alter_column("methodology_version", nullable=False)
+        batch_op.create_foreign_key(
+            "fk_valuation_run_details_project_id",
+            "projects",
+            ["project_id"],
+            ["id"],
+            ondelete="RESTRICT",
         )
-        batch_op.add_column(
-            sa.Column(
-                "source_projection_run_id",
-                sa.String(36),
-                sa.ForeignKey("runs.id", ondelete="RESTRICT"),
-                nullable=True,
-            )
+        batch_op.create_foreign_key(
+            "fk_valuation_run_details_source_projection_run_id",
+            "runs",
+            ["source_projection_run_id"],
+            ["id"],
+            ondelete="RESTRICT",
         )
-        batch_op.add_column(
-            sa.Column(
-                "derived_dataset_id",
-                sa.String(36),
-                sa.ForeignKey("derived_datasets.id", ondelete="RESTRICT"),
-                nullable=True,
-            )
-        )
-        batch_op.add_column(
-            sa.Column("basis", sa.String(50), nullable=False, server_default="STATUTORY")
-        )
-        batch_op.add_column(
-            sa.Column("methodology", sa.String(50), nullable=False, server_default="VM22")
-        )
-        batch_op.add_column(
-            sa.Column("methodology_version", sa.String(50), nullable=False, server_default="v1")
+        batch_op.create_foreign_key(
+            "fk_valuation_run_details_derived_dataset_id",
+            "derived_datasets",
+            ["derived_dataset_id"],
+            ["id"],
+            ondelete="RESTRICT",
         )
         batch_op.create_index(
             "ix_valuation_run_details_project_id",
