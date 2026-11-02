@@ -120,17 +120,17 @@ def test_dagster_end_to_end_pipeline_materialization():
     assert rf_meta["ending_balance"].value == 6000.0
     assert rf_meta["difference"].value == 0.0
 
-    # 7. Reconciliation asset
+    # 7. Reconciliation asset (defaults to NOT_VERIFIABLE when no external benchmark is provided)
     rec_event = [e for e in mat_events if e.asset_key.path[-1] == "reconciliation_report_asset"][0]
     rec_meta = rec_event.materialization.metadata
-    assert rec_meta["reconciliation_status"].value == "PASS"
+    assert rec_meta["reconciliation_status"].value == "NOT_VERIFIABLE"
     assert rec_meta["difference"].value == 0.0
 
     # 8. Reporting asset
     rep_event = [e for e in mat_events if e.asset_key.path[-1] == "reporting_asset"][0]
     rep_meta = rep_event.materialization.metadata
     assert rep_meta["rollforward_verified"].value is True
-    assert rep_meta["reconciliation_status"].value == "PASS"
+    assert rep_meta["reconciliation_status"].value == "NOT_VERIFIABLE"
     manifest_sha = rep_meta["manifest_sha256"].value
     assert len(manifest_sha) == 64
 
@@ -186,3 +186,9 @@ def test_dagster_reconciliation_discrepancy_and_tolerance():
     fail_res = reconciliation_report_asset(context, cfg_fail, val_out, rf_out)
     assert fail_res.value["status"] == "FAIL"
     assert fail_res.value["difference"] == 5000.00
+
+    # Case 3: Missing benchmark -> NOT_VERIFIABLE (No fake identity pass)
+    cfg_unverifiable = ReconciliationConfig(expected_benchmark=None)
+    unverifiable_res = reconciliation_report_asset(context, cfg_unverifiable, val_out, rf_out)
+    assert unverifiable_res.value["status"] == "NOT_VERIFIABLE"
+    assert unverifiable_res.value["expected_benchmark"] is None

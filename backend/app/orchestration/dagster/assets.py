@@ -467,8 +467,7 @@ def reconciliation_report_asset(
     expected_benchmark = config.expected_benchmark
 
     if expected_benchmark is None:
-        expected_benchmark = actual_reserve
-        status = "PASS"
+        status = "NOT_VERIFIABLE"
         diff = 0.0
     else:
         diff = abs(actual_reserve - expected_benchmark)
@@ -486,16 +485,19 @@ def reconciliation_report_asset(
         "completed_at": completed_at,
     }
 
+    report_metadata: dict[str, Any] = {
+        "reconciliation_status": MetadataValue.text(status),
+        "actual_value": MetadataValue.float(actual_reserve),
+        "difference": MetadataValue.float(diff),
+        "started_at": MetadataValue.text(started_at),
+        "completed_at": MetadataValue.text(completed_at),
+    }
+    if expected_benchmark is not None:
+        report_metadata["expected_benchmark"] = MetadataValue.float(expected_benchmark)
+
     return Output(
         value=report,
-        metadata={
-            "reconciliation_status": MetadataValue.text(status),
-            "actual_value": MetadataValue.float(actual_reserve),
-            "expected_benchmark": MetadataValue.float(expected_benchmark),
-            "difference": MetadataValue.float(diff),
-            "started_at": MetadataValue.text(started_at),
-            "completed_at": MetadataValue.text(completed_at),
-        },
+        metadata=report_metadata,
     )
 
 
