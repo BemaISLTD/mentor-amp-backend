@@ -265,3 +265,322 @@ def test_tampered_package_fails_verification():
     with pytest.raises(RunPackageError) as exc_info:
         verify(pkg, expected_fingerprint=pkg["fingerprint"])
     assert exc_info.value.code == "PACKAGE_TAMPERED"
+
+
+# =============================================================================
+# Production Service Integration Tests (Directive 2)
+# =============================================================================
+
+from unittest.mock import MagicMock
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+from app.db.database import Base
+from app.db.models.project import Project
+from app.db.models.project_member import ProjectMember
+from app.db.models.user import User
+from app.db.models.run import Run
+from app.db.models.run_package import RunPackage
+from app.db.models.valuation_detail import ValuationRunDetail
+from app.db.models.governance import DerivedDataset
+from app.db.models.run_artifact import RunArtifact
+from app.services.common import ServiceError
+from app.services.build_info import BuildIdentityUnavailable
+from app.services.run_package_service import freeze_valuation_run_package
+from app.services.run_submission_service import submit_valuation_run
+
+
+@pytest.fixture()
+def db_session_val():
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    try:
+        yield session
+    finally:
+        session.close()
+        engine.dispose()
+
+
+@pytest.fixture()
+def seeded_val_env(db_session_val):
+    proj1 = Project(id="proj-val-1", name="Valuation Project 1")
+    proj2 = Project(id="proj-val-2", name="Valuation Project 2")
+    user = User(id="user-val-actuary", email="val@mentoramp.com", full_name="Val Actuary", password_hash="pwd")
+    db_session_val.add_all([proj1, proj2, user])
+    db_session_val.commit()
+    mem1 = ProjectMember(project_id=proj1.id, user_id=user.id, role="owner")
+    mem2 = ProjectMember(project_id=proj2.id, user_id=user.id, role="owner")
+    db_session_val.add_all([mem1, mem2])
+    db_session_val.commit()
+    return {"session": db_session_val, "proj1": proj1, "proj2": proj2, "user": user}
+
+
+def test_real_service_freeze_valuation_run_package_success(seeded_val_env):
+    """Directive 2: Calling actual freeze_valuation_run_package service succeeds with valid build identity."""
+    db = seeded_val_env["session"]
+    proj = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+    run = Run(id="run-val-actual-1", project_id=proj.id, name="Test Valuation Run")
+    db.add(run)
+    db.commit()
+
+    pkg = freeze_valuation_run_package(
+        db=db,
+        project=proj,
+        run=run,
+        user=user,
+        basis="STATUTORY",
+        methodology="VM22",
+        methodology_version="v2024.1",
+        valuation_date="2026-12-31",
+        valuation_parameters={"spread_bps": 100},
+    )
+
+    assert pkg.fingerprint is not None
+    assert len(pkg.fingerprint) == 64
+    assert pkg.configuration["valuation"]["basis"] == "STATUTORY"
+    assert pkg.configuration["valuation"]["methodology"] == "VM22"
+    assert pkg.configuration["valuation"]["methodology_version"] == "v2024.1"
+    assert pkg.configuration["valuation"]["valuation_parameters"]["spread_bps"] == 100
+    assert pkg.configuration["build"]["identity_source"] in ("source_tree", "injected", "computed")
+
+
+def test_service_freeze_fails_on_missing_or_corrupt_build_identity(seeded_val_env, monkeypatch):
+    """Directive 2: Fails closed when build identity is missing or fallback."""
+    import app.services.run_package_service as rps
+    db = seeded_val_env["session"]
+    proj = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+    run = Run(id="run-val-actual-2", project_id=proj.id)
+
+    # 1. BuildIdentityUnavailable -> ServiceError(503, BUILD_IDENTITY_UNAVAILABLE)
+    def mock_unavailable():
+        raise BuildIdentityUnavailable("No build identity available")
+    monkeypatch.setattr(rps, "build_identity", mock_unavailable)
+
+    with pytest.raises(ServiceError) as exc_info:
+        freeze_valuation_run_package(
+            db=db, project=proj, run=run, user=user,
+            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+        )
+    assert exc_info.value.code == "BUILD_IDENTITY_UNAVAILABLE"
+    assert exc_info.value.status_code == 503
+
+    # 2. Corrupt/fallback zero identity -> ServiceError(503, BUILD_IDENTITY_UNAVAILABLE)
+    def mock_fallback():
+        return {
+            "app_version": "0.1.0",
+            "build_fingerprint": "0" * 64,
+            "source_commit": "0" * 40,
+            "identity_source": "fallback",
+        }
+    monkeypatch.setattr(rps, "build_identity", mock_fallback)
+
+    with pytest.raises(ServiceError) as exc_info2:
+        freeze_valuation_run_package(
+            db=db, project=proj, run=run, user=user,
+            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+        )
+    assert exc_info2.value.code == "BUILD_IDENTITY_UNAVAILABLE"
+
+
+def test_service_freeze_foreign_source_projection_run_fails(seeded_val_env):
+    """Directive 2: Foreign source projection run fails closed with 404 RUN_NOT_FOUND."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    proj2 = seeded_val_env["proj2"]
+    user = seeded_val_env["user"]
+
+    # Source projection run belongs to proj2
+    foreign_run = Run(id="run-proj2-source", project_id=proj2.id, name="Foreign Run")
+    db.add(foreign_run)
+    db.commit()
+
+    target_run = Run(id="run-val-target", project_id=proj1.id)
+
+    with pytest.raises(ServiceError) as exc_info:
+        freeze_valuation_run_package(
+            db=db, project=proj1, run=target_run, user=user,
+            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            source_projection_run_id=foreign_run.id,
+        )
+    assert exc_info.value.code == "RUN_NOT_FOUND"
+    assert exc_info.value.status_code == 404
+
+
+def test_service_freeze_foreign_derived_dataset_fails(seeded_val_env):
+    """Directive 2: Foreign derived dataset fails closed with 404 DATASET_NOT_FOUND."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    proj2 = seeded_val_env["proj2"]
+    user = seeded_val_env["user"]
+
+    foreign_ds = DerivedDataset(
+        id="ds-foreign-1",
+        project_id=proj2.id,
+        name="foreign_dataset",
+        dataset_type="cash_flows",
+        version_number=1,
+        status="approved",
+        fingerprint="a" * 64,
+        created_by="user-1",
+    )
+    db.add(foreign_ds)
+    db.commit()
+
+    target_run = Run(id="run-val-target-2", project_id=proj1.id)
+
+    with pytest.raises(ServiceError) as exc_info:
+        freeze_valuation_run_package(
+            db=db, project=proj1, run=target_run, user=user,
+            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            derived_dataset_id=foreign_ds.id,
+        )
+    assert exc_info.value.code == "DATASET_NOT_FOUND"
+    assert exc_info.value.status_code == 404
+
+
+def test_service_freeze_unapproved_derived_dataset_fails(seeded_val_env):
+    """Directive 2: Governed valuation run rejects unapproved derived dataset with 400 DATASET_NOT_APPROVED."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+
+    draft_ds = DerivedDataset(
+        id="ds-draft-1",
+        project_id=proj1.id,
+        name="draft_dataset",
+        dataset_type="cash_flows",
+        version_number=1,
+        status="draft",  # NOT approved
+        fingerprint="b" * 64,
+        created_by="user-1",
+    )
+    db.add(draft_ds)
+    db.commit()
+
+    target_run = Run(id="run-val-target-3", project_id=proj1.id)
+
+    with pytest.raises(ServiceError) as exc_info:
+        freeze_valuation_run_package(
+            db=db, project=proj1, run=target_run, user=user,
+            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            derived_dataset_id=draft_ds.id,
+        )
+    assert exc_info.value.code == "DATASET_NOT_APPROVED"
+    assert exc_info.value.status_code == 400
+
+
+def test_service_freeze_dataset_fingerprint_mismatch_fails(seeded_val_env):
+    """Directive 2: Dataset fingerprint mismatch fails closed with 400 FINGERPRINT_MISMATCH."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+
+    approved_ds = DerivedDataset(
+        id="ds-approved-1",
+        project_id=proj1.id,
+        name="approved_dataset",
+        dataset_type="cash_flows",
+        version_number=1,
+        status="approved",
+        fingerprint="c" * 64,
+        created_by="user-1",
+    )
+    db.add(approved_ds)
+    db.commit()
+
+    target_run = Run(id="run-val-target-4", project_id=proj1.id)
+
+    with pytest.raises(ServiceError) as exc_info:
+        freeze_valuation_run_package(
+            db=db, project=proj1, run=target_run, user=user,
+            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            derived_dataset_id=approved_ds.id,
+            derived_dataset_fingerprint="f" * 64,  # mismatched fingerprint
+        )
+    assert exc_info.value.code == "FINGERPRINT_MISMATCH"
+    assert exc_info.value.status_code == 400
+
+
+def test_service_freeze_reproducibility_identical_rerun(seeded_val_env):
+    """Directive 2 & 16: Identical calls to freeze_valuation_run_package produce identical package fingerprints."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+
+    base_doc = {
+        "configuration": copy.deepcopy(SAMPLE_VALUATION_CONFIGURATION)
+    }
+
+    run1 = Run(id="run-rerun-1", project_id=proj1.id)
+    run2 = Run(id="run-rerun-2", project_id=proj1.id)
+
+    pkg1 = freeze_valuation_run_package(
+        db=db, project=proj1, run=run1, user=user,
+        basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+        valuation_date="2026-12-31",
+        valuation_parameters={"spread_bps": 125},
+        base_package_document=base_doc,
+    )
+    pkg2 = freeze_valuation_run_package(
+        db=db, project=proj1, run=run2, user=user,
+        basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+        valuation_date="2026-12-31",
+        valuation_parameters={"spread_bps": 125},
+        base_package_document=base_doc,
+    )
+
+    assert pkg1.fingerprint == pkg2.fingerprint
+
+
+def test_service_submit_valuation_run_end_to_end(seeded_val_env):
+    """Directive 2: submit_valuation_run creates canonical Run, RunPackage, ValuationRunDetail, and Event."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+
+    payload = {
+        "project_id": proj1.id,
+        "name": "Production Valuation Run 2026",
+        "basis": "STATUTORY",
+        "methodology": "VM22",
+        "methodology_version": "v2024.1",
+        "valuation_date": "2026-12-31",
+        "horizon_months": 120,
+        "valuation_parameters": {"spread_bps": 125},
+        "base_package_document": {"configuration": copy.deepcopy(SAMPLE_VALUATION_CONFIGURATION)},
+    }
+
+    result = submit_valuation_run(db, payload, user)
+
+    assert "run" in result
+    run_info = result["run"]
+    run_id = run_info["id"]
+    assert run_info["basis"] == "STATUTORY"
+    assert run_info["methodology"] == "VM22"
+    assert run_info["status"] == "pending"
+
+    # Verify canonical database records
+    persisted_run = db.get(Run, run_id)
+    assert persisted_run is not None
+    assert persisted_run.basis == "STATUTORY"
+    assert persisted_run.methodology == "VM22"
+    assert persisted_run.run_package_fingerprint == run_info["run_package_fingerprint"]
+
+    persisted_pkg = db.get(RunPackage, run_info["run_package_id"])
+    assert persisted_pkg is not None
+    assert persisted_pkg.run_id == run_id
+    assert persisted_pkg.fingerprint == run_info["run_package_fingerprint"]
+
+    persisted_detail = db.get(ValuationRunDetail, run_id)
+    assert persisted_detail is not None
+    assert persisted_detail.run_id == run_id
+    assert str(persisted_detail.valuation_date) == "2026-12-31"
+    assert persisted_detail.basis == "STATUTORY"  # via proxy property
+    assert persisted_detail.methodology == "VM22"  # via proxy property

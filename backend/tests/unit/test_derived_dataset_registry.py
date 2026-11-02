@@ -559,3 +559,145 @@ def test_multi_segment_dimensional_resolution_and_ambiguity(db_session, test_env
     )
     res_seg2 = resolve("rila_prior_av", ctx_seg2, db_session)
     assert res_seg2.value == pytest.approx(98000.0)
+
+
+def test_prior_output_variable_resolver_does_not_default_on_governance_errors(db_session, test_environment):
+    """Directive 3: Governance/security/ambiguity errors MUST NOT default in Variable Resolver.
+
+    Proves:
+    1. Cross-project dataset -> raises not_found (404), does NOT return default_value.
+    2. Unapproved dataset -> raises DerivedDatasetGovernanceError, does NOT return default_value.
+    3. Superseded dataset -> raises DerivedDatasetGovernanceError, does NOT return default_value.
+    4. Fingerprint mismatch -> raises DerivedDatasetGovernanceError, does NOT return default_value.
+    5. Ambiguous multi-segment match -> raises AmbiguousDerivedOutputError, does NOT return default_value.
+    6. Legitimate missing data row (valid approved source) -> DOES return default_value safely.
+    """
+    env = test_environment
+    store = env["store"]
+
+    # Seed run and parquet artifact in proj-1
+    run = Run(id="run-gov-test", project_id="proj-1", status="success", run_type="projection")
+    db_session.add(run)
+    db_session.commit()
+
+    rows = [
+        {"policy_id": "P1", "segment_id": "S1", "projection_month": 1, "value": 100.0},
+        {"policy_id": "P1", "segment_id": "S2", "projection_month": 1, "value": 200.0},
+    ]
+    stored = store.write_rows("run-gov-test", "outputs", rows, attempt_number=1, schema_version="m2-v1")
+    art = RunArtifact(
+        id=str(uuid.uuid4()),
+        run_id="run-gov-test",
+        attempt_number=1,
+        artifact_type="outputs",
+        storage_uri=stored.uri,
+        checksum_sha256=stored.checksum_sha256,
+        row_count=stored.row_count,
+        storage_backend="local",
+        schema_version="m2-v1",
+    )
+    db_session.add(art)
+    db_session.commit()
+
+    # Promote to derived dataset
+    ds = promote_run_to_derived_dataset(
+        db_session,
+        project_id="proj-1",
+        run_id="run-gov-test",
+        dataset_name="gov_test_ds",
+        dataset_version="1",
+        user_id="user-actuary-1",
+        artifact_id=art.id,
+    )
+
+    # Register variable with an explicit default_value
+    var_name = "test_gov_protected_var"
+    var_def = VariableDefinition(
+        id=str(uuid.uuid4()),
+        name=var_name,
+        kind="prior_output",
+        source={"type": "prior_output", "dataset_id": ds.id, "column_name": "value"},
+        default_value=9999.99,
+        required=True,
+    )
+    register(db_session, var_def, actor_user_id="user-actuary-1")
+
+    # 1. Unapproved dataset: resolution MUST raise DerivedDatasetGovernanceError, NOT return 9999.99
+    ctx_unapproved = ProjectionContext(
+        project_id="proj-1",
+        policy_id="P1",
+        segment_id="S1",
+        projection_month=1,
+    )
+    with pytest.raises(DerivedDatasetGovernanceError) as exc_info:
+        resolve(var_name, ctx_unapproved, db_session)
+    assert "Governed runs only accept approved derived datasets" in exc_info.value.message
+
+    # Approve dataset
+    approve_derived_dataset(db_session, "proj-1", ds.id, "user-lead-2")
+
+    # 2. Cross-project request: resolution MUST raise not_found (404), NOT return 9999.99
+    ctx_foreign = ProjectionContext(
+        project_id="foreign-project-id",
+        policy_id="P1",
+        segment_id="S1",
+        projection_month=1,
+    )
+    with pytest.raises(ServiceError) as exc_info:
+        resolve(var_name, ctx_foreign, db_session)
+    assert exc_info.value.status_code == 404
+
+    # 3. Ambiguous match: omitting segment_id matches 2 rows -> MUST raise AmbiguousDerivedOutputError, NOT return 9999.99
+    ctx_ambiguous = ProjectionContext(
+        project_id="proj-1",
+        policy_id="P1",
+        projection_month=1,
+    )
+    with pytest.raises(AmbiguousDerivedOutputError) as exc_info:
+        resolve(var_name, ctx_ambiguous, db_session)
+    assert exc_info.value.status_code == 400
+
+    # 4. Fingerprint mismatch: tampering physical file -> MUST raise DerivedDatasetGovernanceError, NOT return 9999.99
+    file_path = store.path_for_uri(ds.storage_uri)
+    original_bytes = file_path.read_bytes()
+    try:
+        file_path.write_bytes(original_bytes + b"\x00TAMPERED")
+        with pytest.raises(DerivedDatasetGovernanceError) as exc_info:
+            resolve(var_name, ctx_unapproved, db_session)
+        assert "Storage fingerprint mismatch" in exc_info.value.message
+    finally:
+        file_path.write_bytes(original_bytes)
+
+    # 5. Superseded dataset: MUST raise DerivedDatasetGovernanceError, NOT return 9999.99
+    supersede_derived_dataset(db_session, "proj-1", ds.id, "user-lead-2")
+    with pytest.raises(DerivedDatasetGovernanceError) as exc_info:
+        resolve(var_name, ctx_unapproved, db_session)
+    assert "superseded and cannot be consumed" in exc_info.value.message
+
+    # 6. Legitimate missing row on an approved dataset: DOES safely fall back to default_value
+    ds2 = promote_run_to_derived_dataset(
+        db_session,
+        project_id="proj-1",
+        run_id="run-baseline-1",
+        dataset_name="gov_test_ds_2",
+        dataset_version="2",
+        user_id="user-actuary-1",
+    )
+    approve_derived_dataset(db_session, "proj-1", ds2.id, "user-lead-2")
+    var_def_2 = VariableDefinition(
+        id=str(uuid.uuid4()),
+        name="test_gov_missing_row_var",
+        kind="prior_output",
+        source={"type": "prior_output", "dataset_id": ds2.id, "column_name": "account_value"},
+        default_value=7777.77,
+        required=True,
+    )
+    register(db_session, var_def_2, actor_user_id="user-actuary-1")
+    ctx_missing_row = ProjectionContext(
+        project_id="proj-1",
+        policy_id="P_DOES_NOT_EXIST",
+        projection_month=1,
+    )
+    res_missing = resolve("test_gov_missing_row_var", ctx_missing_row, db_session)
+    assert res_missing.value == 7777.77
+    assert res_missing.was_defaulted is True

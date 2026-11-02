@@ -220,3 +220,112 @@ def submit_run_set(db: Session, payload: dict, user: Any) -> dict[str, Any]:
             for run, package in created
         ],
     }
+
+
+def submit_valuation_run(db: Session, payload: dict[str, Any], user: Any) -> dict[str, Any]:
+    """Submit and freeze a canonical valuation run subordinate to canonical Run model (Directive 2)."""
+    project_id = payload.get("project_id")
+    if not project_id:
+        raise ServiceError(422, "VALIDATION_ERROR", "Field 'project_id' is required.")
+
+    project = access.require_project_access(db, user, project_id, write=True)
+    basis = payload.get("basis")
+    if not basis:
+        raise ServiceError(422, "VALIDATION_ERROR", "Field 'basis' is required.")
+    methodology = payload.get("methodology")
+    if not methodology:
+        raise ServiceError(422, "VALIDATION_ERROR", "Field 'methodology' is required.")
+    methodology_version = payload.get("methodology_version", "v1.0")
+
+    val_date_raw = payload.get("valuation_date") or "2026-12-31"
+    val_date = date.fromisoformat(str(val_date_raw))
+
+    run_id = str(uuid.uuid4())
+    submitted_at = now_utc()
+
+    run = Run(
+        id=run_id,
+        project_id=project.id,
+        name=payload.get("name") or f"Valuation {basis} {methodology}",
+        projection_key=f"VALUATION@{basis}@{methodology}",
+        status=run_state.PENDING,
+        run_set_id=payload.get("run_set_id"),
+        model_version_id=payload.get("model_version_id"),
+        basis=basis,
+        methodology=methodology,
+        methodology_version=methodology_version,
+        source_projection_run_id=payload.get("source_projection_run_id"),
+        derived_dataset_id=payload.get("derived_dataset_id"),
+        valuation_date=val_date,
+        horizon_months=payload.get("horizon_months", 120),
+        illustrative=False,
+        triggered_by=user.id,
+        attempt_count=0,
+    )
+
+    package = packages.freeze_valuation_run_package(
+        db=db,
+        project=project,
+        run=run,
+        user=user,
+        basis=basis,
+        methodology=methodology,
+        methodology_version=methodology_version,
+        source_projection_run_id=payload.get("source_projection_run_id"),
+        derived_dataset_id=payload.get("derived_dataset_id"),
+        derived_dataset_fingerprint=payload.get("derived_dataset_fingerprint"),
+        source_artifact_fingerprint=payload.get("source_artifact_fingerprint"),
+        discount_curve_fingerprint=payload.get("discount_curve_fingerprint"),
+        valuation_date=str(val_date),
+        valuation_parameters=payload.get("valuation_parameters"),
+        base_package_document=payload.get("base_package_document"),
+    )
+
+    run.run_package_fingerprint = package.fingerprint
+    db.add(run)
+    db.flush()
+
+    document = package.document
+    db.add(RunPackage(
+        id=document["identity"]["package_id"],
+        run_id=run.id,
+        project_id=project.id,
+        schema_version=document["schema_version"],
+        fingerprint_algorithm=document["fingerprint_algorithm"],
+        fingerprint=package.fingerprint,
+        package=document,
+        created_by=user.id,
+    ))
+
+    from app.db.models.valuation_detail import ValuationRunDetail
+    detail = ValuationRunDetail(
+        run_id=run.id,
+        valuation_date=val_date,
+        discount_curve_fingerprint=payload.get("discount_curve_fingerprint"),
+        configuration=package.configuration.get("valuation", {}),
+        summary_results={},
+    )
+    db.add(detail)
+
+    add_event(
+        db, run.id, "queued",
+        f"Valuation run queued with run package {package.fingerprint[:12]}….",
+        data={"run_package_fingerprint": package.fingerprint},
+    )
+    db.commit()
+
+    return {
+        "run": {
+            "id": run.id,
+            "name": run.name,
+            "status": run.status,
+            "basis": run.basis,
+            "methodology": run.methodology,
+            "methodology_version": run.methodology_version,
+            "source_projection_run_id": run.source_projection_run_id,
+            "derived_dataset_id": run.derived_dataset_id,
+            "run_package_id": document["identity"]["package_id"],
+            "run_package_fingerprint": package.fingerprint,
+            "submitted_at": iso(submitted_at),
+        }
+    }

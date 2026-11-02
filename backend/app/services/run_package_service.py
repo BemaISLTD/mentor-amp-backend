@@ -750,10 +750,10 @@ def freeze(
 
 
 def freeze_valuation_run_package(
-    db: Session,
-    project: Project,
-    run: Any,
-    user: Any,
+    db: Session | None = None,
+    project: Any = None,
+    run: Any = None,
+    user: Any = None,
     *,
     basis: str,
     methodology: str,
@@ -767,7 +767,7 @@ def freeze_valuation_run_package(
     valuation_parameters: dict | None = None,
     base_package_document: dict[str, Any] | None = None,
 ) -> FrozenPackage:
-    """Freeze a canonical RunPackage for an M5 valuation run (Directives 3 & 16).
+    """Freeze a canonical RunPackage for an M5 valuation run (Directives 2, 3 and 16).
 
     Freezes:
     - basis
@@ -783,26 +783,119 @@ def freeze_valuation_run_package(
     - valuation_config_fingerprint
     into configuration['valuation'] and participates directly in the canonical
     reproducibility fingerprint (SHA-256 canonical JSON hash of configuration).
+
+    Governed Invariants:
+    1. Basis and methodology taxonomy strictly validated (no TAX, known pairings).
+    2. Zero build identity fallback: missing/corrupt build identity fails closed.
+    3. Provenance validation: verifies project ownership, approved status, and fingerprint
+       integrity against trusted database objects when db is provided.
     """
     import copy
+    import hashlib
+    import re
     from app.core.execution.fingerprints import fingerprint as compute_fp
+    from app.db.models.run import Run
+    from app.core.valuation.taxonomy import (
+        validate_basis,
+        validate_methodology,
+        validate_basis_methodology_pair,
+    )
+
+    validate_basis(basis)
+    validate_methodology(methodology)
+    validate_basis_methodology_pair(basis, methodology)
+
+    proj_id = getattr(project, "id", str(project)) if project else None
+    run_proj_id = getattr(run, "project_id", None)
+    if proj_id and run_proj_id and run_proj_id != proj_id:
+        raise ServiceError(404, "RUN_NOT_FOUND", f"Run not found in project '{proj_id}'.")
+
+    # Validate source projection run if db is available
+    if source_projection_run_id and db is not None:
+        source_run = db.get(Run, source_projection_run_id)
+        if source_run is None or (proj_id and source_run.project_id != proj_id):
+            raise ServiceError(404, "RUN_NOT_FOUND", f"Source projection run '{source_projection_run_id}' not found in project '{proj_id}'.")
+        if not source_artifact_fingerprint and getattr(source_run, "run_package_fingerprint", None):
+            source_artifact_fingerprint = source_run.run_package_fingerprint
+
+    # Validate derived dataset provenance if db is available
+    if derived_dataset_id and db is not None:
+        from app.db.models.governance import DerivedDataset
+        dataset = db.get(DerivedDataset, derived_dataset_id)
+        if dataset is None or (proj_id and dataset.project_id != proj_id):
+            raise ServiceError(404, "DATASET_NOT_FOUND", f"Derived dataset '{derived_dataset_id}' not found in project '{proj_id}'.")
+
+        if dataset.status != "approved":
+            raise ServiceError(
+                400, "DATASET_NOT_APPROVED",
+                f"Derived dataset '{derived_dataset_id}' must be approved for governed execution (current status: {dataset.status}).",
+            )
+        if getattr(dataset, "is_superseded", False) or getattr(dataset, "is_deleted", False):
+            raise ServiceError(
+                400, "DATASET_INACTIVE",
+                f"Derived dataset '{derived_dataset_id}' is inactive or deleted.",
+            )
+
+        if derived_dataset_fingerprint and derived_dataset_fingerprint != dataset.fingerprint:
+            raise ServiceError(
+                400, "FINGERPRINT_MISMATCH",
+                f"Derived dataset fingerprint mismatch: expected '{dataset.fingerprint}', got '{derived_dataset_fingerprint}'.",
+            )
+        derived_dataset_fingerprint = dataset.fingerprint
+
+        if hasattr(dataset, "source_artifact_id") and dataset.source_artifact_id:
+            from app.db.models.run_artifact import RunArtifact
+            art = db.get(RunArtifact, dataset.source_artifact_id)
+            if art:
+                if source_artifact_fingerprint and source_artifact_fingerprint != art.checksum_sha256:
+                    raise ServiceError(
+                        400, "FINGERPRINT_MISMATCH",
+                        f"Source artifact fingerprint mismatch: expected '{art.checksum_sha256}', got '{source_artifact_fingerprint}'.",
+                    )
+                source_artifact_fingerprint = art.checksum_sha256
+                from app.core.artifacts import get_artifact_store
+                try:
+                    store = get_artifact_store()
+                    path = store.path_for_uri(art.storage_uri)
+                    if path.exists():
+                        actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+                        if actual_sha != art.checksum_sha256:
+                            raise ServiceError(
+                                400, "FINGERPRINT_MISMATCH",
+                                f"Physical artifact content does not match recorded fingerprint: {actual_sha} vs {art.checksum_sha256}.",
+                            )
+                except ServiceError:
+                    raise
+                except Exception:
+                    pass
 
     if base_package_document and "configuration" in base_package_document:
         configuration = copy.deepcopy(base_package_document["configuration"])
+        build = configuration.get("build") or {}
     else:
         try:
             build = build_identity()
-        except BuildIdentityUnavailable:
-            build = {
-                "app_version": "0.1.0",
-                "engine_version": "m5-valuation-1",
-                "code_version": "development",
-                "build_fingerprint": "0" * 64,
-                "source_commit": "0" * 40,
-                "identity_source": "fallback",
-            }
+        except BuildIdentityUnavailable as exc:
+            raise ServiceError(
+                503, "BUILD_IDENTITY_UNAVAILABLE",
+                "Governed valuation runs require verified immutable build identity.",
+            ) from exc
+
+    exec_fp = build.get("build_fingerprint") or ""
+    src_commit = build.get("source_commit") or ""
+    id_source = build.get("identity_source") or ""
+
+    if id_source == "fallback" or exec_fp == "0" * 64 or not re.fullmatch(r"[0-9a-fA-F]{64}", exec_fp):
+        raise ServiceError(
+            503, "BUILD_IDENTITY_UNAVAILABLE",
+            "Governed valuation runs require verified immutable build identity.",
+        )
+    if src_commit and not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", src_commit):
+        raise ServiceError(503, "BUILD_IDENTITY_INVALID", "SOURCE_COMMIT must be a Git commit SHA.")
+
+    if not (base_package_document and "configuration" in base_package_document):
         configuration = {
-            "project": {"id": project.id, "name": getattr(project, "name", "")},
+            "project": {"id": proj_id, "name": getattr(project, "name", "") if project else ""},
             "run_type": "valuation",
             "model": {"id": getattr(run, "model_id", None) or "model-default", "product_code": getattr(run, "projection_key", None) or "M5"},
             "model_version": {
@@ -845,14 +938,14 @@ def freeze_valuation_run_package(
     now = now_utc()
     run_id = getattr(run, "id", str(run))
     run_set_id = getattr(run, "run_set_id", None)
-    user_id = getattr(user, "id", str(user))
-    user_name = getattr(user, "full_name", None)
+    user_id = getattr(user, "id", str(user)) if user else "user-system"
+    user_name = getattr(user, "full_name", None) if user else None
 
     identity = {
         "package_id": str(uuid.uuid4()),
         "frozen_for_run_id": run_id,
         "run_set_id": run_set_id,
-        "project_id": project.id,
+        "project_id": proj_id,
         "created_at": iso(now),
         "created_by": {"id": user_id, "full_name": user_name},
     }

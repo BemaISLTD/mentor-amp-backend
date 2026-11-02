@@ -12,6 +12,11 @@ from app.db.models.factor import FactorTable
 from app.db.models.inforce import InforceRecord
 from app.db.models.scenario import ScenarioTable
 from app.models.schemas import ProjectionContext, VariableResolutionResult
+from app.services.common import ServiceError
+from app.services.derived_dataset_service import (
+    AmbiguousDerivedOutputError,
+    DerivedDatasetGovernanceError,
+)
 
 
 def build_lookup_keys(definition, context: ProjectionContext) -> dict:
@@ -235,11 +240,15 @@ def resolve(
             value = definition.default_value
             source_table = "default"
 
+    except (DerivedDatasetGovernanceError, AmbiguousDerivedOutputError, ServiceError):
+        # Directive 3: Governance, security, and ambiguity errors must NEVER be masked by default fallback
+        raise
     except Exception as e:
         error = f"Error resolving '{variable_name}': {str(e)}"
 
     was_defaulted = False
-    if value is None and definition.default_value is not None:
+    # Only fall back to default when valid source returned no value AND no error occurred
+    if value is None and error is None and definition.default_value is not None:
         value = definition.default_value
         was_defaulted = True
 

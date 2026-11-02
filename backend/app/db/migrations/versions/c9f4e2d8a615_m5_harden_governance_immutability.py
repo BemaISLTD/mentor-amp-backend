@@ -1,30 +1,23 @@
-"""Harden M5 governance immutability and refine valuation detail schema.
+"""Harden M5 governance immutability, foreign keys, and valuation detail schema.
 
 Revision ID: c9f4e2d8a615
 Revises: b8f3d1e7c504
-Create Date: 2026-11-01 17:20:00.000000
-
-Implements Senior Review Directives 4, 8, 9, 13:
-1. Directive 13: Adds source_model_version_id FK to derived_datasets.
-2. Directive 4: Removes redundant execution identity columns from valuation_run_details
-   so canonical Run remains the sole owner of project, basis, methodology, and lineage.
-3. Directive 8: Closes derived_datasets immutability loophole in PostgreSQL trigger so
-   material evidence cannot be mutated even during supersession; prevents deletion of superseded.
-4. Directive 9: Enforces immutability on valuation_run_details for finalized/completed runs.
 """
+
+from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
 
-# revision identifiers, used by Alembic.
-revision = "c9f4e2d8a615"
-down_revision = "b8f3d1e7c504"
-branch_labels = None
-depends_on = None
+
+revision: str = "c9f4e2d8a615"
+down_revision: Union[str, Sequence[str], None] = "b8f3d1e7c504"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # 1. Add source_model_version_id to derived_datasets (Directive 13)
+    # 1. Add source_model_version_id to derived_datasets with FK to model_versions.id
     with op.batch_alter_table("derived_datasets") as batch_op:
         batch_op.add_column(
             sa.Column(
@@ -55,9 +48,13 @@ def upgrade() -> None:
         batch_op.drop_column("methodology")
         batch_op.drop_column("methodology_version")
 
-    # 3. Harden PostgreSQL immutability triggers (Directives 8 & 9)
+    # 3. Harden PostgreSQL immutability triggers (Directives 4, 8 & 9)
     if bind.dialect.name == "postgresql":
-        # Directive 8: Close loophole on derived_datasets
+        # Directives 4 & 8: Close loopholes on derived_datasets
+        # - approved status can only remain approved or transition to superseded (no draft/validated/arbitrary)
+        # - superseded status is terminal
+        # - soft-delete on approved or superseded evidence is blocked
+        # - material evidence is strictly immutable
         op.execute("""
             CREATE OR REPLACE FUNCTION mentoramp_protect_derived_datasets() RETURNS trigger AS $$
             BEGIN
@@ -69,9 +66,23 @@ def upgrade() -> None:
                 END IF;
                 IF TG_OP = 'UPDATE' THEN
                     IF OLD.status IN ('approved', 'superseded') THEN
-                        -- Cannot revert superseded status
+                        -- Lifecycle transition constraint (Directive 4):
+                        -- approved can ONLY stay approved or transition to superseded
+                        IF OLD.status = 'approved' AND NEW.status NOT IN ('approved', 'superseded') THEN
+                            RAISE EXCEPTION 'Approved derived_datasets status can only remain approved or transition to superseded'
+                                USING ERRCODE = 'integrity_constraint_violation';
+                        END IF;
+
+                        -- superseded status is terminal: can NEVER be changed
                         IF OLD.status = 'superseded' AND NEW.status != 'superseded' THEN
                             RAISE EXCEPTION 'Superseded derived_datasets status cannot be changed'
+                                USING ERRCODE = 'integrity_constraint_violation';
+                        END IF;
+
+                        -- Soft-delete protection: approved or superseded evidence cannot be soft-deleted
+                        IF (OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL) OR
+                           (OLD.deleted_by IS NULL AND NEW.deleted_by IS NOT NULL) THEN
+                            RAISE EXCEPTION 'Approved or superseded derived_datasets cannot be soft-deleted'
                                 USING ERRCODE = 'integrity_constraint_violation';
                         END IF;
 
@@ -98,11 +109,11 @@ def upgrade() -> None:
             $$ LANGUAGE plpgsql;
         """)
 
-        # Directive 9: Completed valuation execution evidence is immutable
+        # Directive 9: Protect valuation_run_details
         op.execute("""
             CREATE OR REPLACE FUNCTION mentoramp_protect_valuation_run_details() RETURNS trigger AS $$
             DECLARE
-                parent_status VARCHAR(20);
+                parent_status VARCHAR(30);
             BEGIN
                 IF TG_OP = 'DELETE' THEN
                     RAISE EXCEPTION 'valuation_run_details execution evidence cannot be deleted'
@@ -110,7 +121,7 @@ def upgrade() -> None:
                 END IF;
                 IF TG_OP = 'UPDATE' THEN
                     SELECT status INTO parent_status FROM runs WHERE id = OLD.run_id;
-                    IF parent_status IN ('completed', 'accepted', 'finalized', 'success') THEN
+                    IF parent_status IN ('completed', 'success') THEN
                         RAISE EXCEPTION 'valuation_run_details execution evidence is immutable for completed runs'
                             USING ERRCODE = 'integrity_constraint_violation';
                     END IF;
@@ -131,8 +142,11 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
-    if bind.dialect.name == "postgresql":
-        # Restore original triggers
+    is_postgres = (bind.dialect.name == "postgresql")
+
+    # 1. Restore b8 triggers and functions on PostgreSQL (Directive 5)
+    if is_postgres:
+        # Restore b8 DELETE-only trigger on valuation_run_details
         op.execute("DROP TRIGGER IF EXISTS valuation_run_details_protect_evidence ON valuation_run_details;")
         op.execute("""
             CREATE OR REPLACE FUNCTION mentoramp_protect_valuation_run_details() RETURNS trigger AS $$
@@ -151,14 +165,85 @@ def downgrade() -> None:
             FOR EACH ROW EXECUTE FUNCTION mentoramp_protect_valuation_run_details();
         """)
 
-    with op.batch_alter_table("valuation_run_details") as batch_op:
-        batch_op.add_column(sa.Column("methodology_version", sa.String(50), nullable=True))
-        batch_op.add_column(sa.Column("methodology", sa.String(50), nullable=True))
-        batch_op.add_column(sa.Column("basis", sa.String(50), nullable=True))
-        batch_op.add_column(sa.Column("derived_dataset_id", sa.String(36), nullable=True))
-        batch_op.add_column(sa.Column("source_projection_run_id", sa.String(36), nullable=True))
-        batch_op.add_column(sa.Column("project_id", sa.String(36), nullable=True))
+        # Restore b8 trigger function for derived_datasets
+        op.execute("""
+            CREATE OR REPLACE FUNCTION mentoramp_protect_derived_datasets() RETURNS trigger AS $$
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    IF OLD.status = 'approved' THEN
+                        RAISE EXCEPTION 'Approved derived_datasets cannot be deleted'
+                            USING ERRCODE = 'integrity_constraint_violation';
+                    END IF;
+                END IF;
+                IF TG_OP = 'UPDATE' THEN
+                    IF OLD.status = 'approved' AND NEW.status != 'superseded' THEN
+                        RAISE EXCEPTION 'Approved derived_datasets cannot be modified except to mark superseded'
+                            USING ERRCODE = 'integrity_constraint_violation';
+                    END IF;
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+        """)
 
+    # 2. Restore b8 valuation_run_details columns, nullability, foreign keys, constraints, and indexes
+    with op.batch_alter_table("valuation_run_details") as batch_op:
+        batch_op.add_column(
+            sa.Column(
+                "project_id",
+                sa.String(36),
+                sa.ForeignKey("projects.id", ondelete="RESTRICT"),
+                nullable=False,
+                server_default="legacy-migrated",
+            )
+        )
+        batch_op.add_column(
+            sa.Column(
+                "source_projection_run_id",
+                sa.String(36),
+                sa.ForeignKey("runs.id", ondelete="RESTRICT"),
+                nullable=True,
+            )
+        )
+        batch_op.add_column(
+            sa.Column(
+                "derived_dataset_id",
+                sa.String(36),
+                sa.ForeignKey("derived_datasets.id", ondelete="RESTRICT"),
+                nullable=True,
+            )
+        )
+        batch_op.add_column(
+            sa.Column("basis", sa.String(50), nullable=False, server_default="STATUTORY")
+        )
+        batch_op.add_column(
+            sa.Column("methodology", sa.String(50), nullable=False, server_default="VM22")
+        )
+        batch_op.add_column(
+            sa.Column("methodology_version", sa.String(50), nullable=False, server_default="v1")
+        )
+        batch_op.create_index(
+            "ix_valuation_run_details_project_id",
+            ["project_id"],
+        )
+        batch_op.create_index(
+            "ix_valuation_run_details_source_projection_run_id",
+            ["source_projection_run_id"],
+        )
+
+    if is_postgres:
+        op.create_check_constraint(
+            "ck_valuation_basis",
+            "valuation_run_details",
+            "basis IN ('GAAP', 'STATUTORY', 'TAX')",
+        )
+        op.create_check_constraint(
+            "ck_valuation_methodology",
+            "valuation_run_details",
+            "methodology IN ('VM21', 'VM22', 'LDTI', 'DAC', 'MRB', 'ASC815')",
+        )
+
+    # 3. Drop source_model_version_id column and index from derived_datasets
     with op.batch_alter_table("derived_datasets") as batch_op:
         batch_op.drop_index("ix_derived_datasets_source_model_version_id")
         batch_op.drop_column("source_model_version_id")

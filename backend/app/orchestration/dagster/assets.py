@@ -5,16 +5,15 @@ Pipeline Sequence:
     Inforce Import -> Validation -> Projection -> Aggregation ->
     Valuation -> Rollforward -> Reconciliation -> Reporting
 
-Orchestration Invariant:
+Orchestration Invariant (Directive 1):
+    Dagster contains ZERO actuarial formulas.
     Dagster assets call MentorAMP domain services and core calculation modules;
     Dagster assets orchestrate real calculations with full lineage and metadata;
-    Deterministic actuarial/validation failures halt immediately (allow_retries=False).
+    Deterministic actuarial/validation failures halt immediately (allow_retries=False);
+    Transient errors retry under DEFAULT_RETRY_POLICY.
 """
 
 from decimal import Decimal
-import hashlib
-import json
-from datetime import datetime, timezone
 from typing import Any
 
 from dagster import (
@@ -26,19 +25,17 @@ from dagster import (
     RetryPolicy,
     asset,
 )
-import polars as pl
 
-from app.core.valuation.primitives import (
-    annual_to_monthly_discount_factor,
-    present_value,
-)
-from app.core.valuation.rollforward import (
-    validate_continuity,
-)
-from app.core.valuation.taxonomy import (
-    validate_basis,
-    validate_basis_methodology_pair,
-    validate_methodology,
+from app.services.common import ServiceError
+from app.services.valuation_pipeline_service import (
+    execute_cash_flow_aggregation,
+    execute_foundation_valuation,
+    execute_governed_reconciliation,
+    execute_inforce_import,
+    execute_inforce_validation,
+    execute_projection_simulation,
+    execute_reporting_manifest,
+    execute_rollforward_attribution,
 )
 
 # Standard retry policy ONLY for transient network/DB contention
@@ -71,63 +68,26 @@ class ReconciliationConfig(Config):
 
 @asset(
     group_name="actuarial_pipeline",
-    description="Ingest and fingerprint inforce policy records for valuation.",
+    description="Ingest and fingerprint inforce policy records via valuation pipeline service.",
     retry_policy=DEFAULT_RETRY_POLICY,
 )
 def inforce_data_asset(
     context: AssetExecutionContext,
     config: InforceConfig,
 ) -> Output[dict[str, Any]]:
-    """Ingest inforce policy block and verify schema integrity."""
-    started_at = datetime.now(timezone.utc).isoformat()
-    context.log.info(f"Ingesting inforce block '{config.policy_block}' for project '{config.project_id}'.")
-
-    # Canonical inforce policy records
-    policies = [
-        {
-            "policy_id": "POL-2026-001",
-            "cohort_id": "COHORT_2026_Q1",
-            "product_code": "MYGA",
-            "issue_age": 55,
-            "gender": "F",
-            "premium": 100000.0,
-            "account_value": 100000.0,
-        },
-        {
-            "policy_id": "POL-2026-002",
-            "cohort_id": "COHORT_2026_Q1",
-            "product_code": "MYGA",
-            "issue_age": 62,
-            "gender": "M",
-            "premium": 150000.0,
-            "account_value": 150000.0,
-        },
-        {
-            "policy_id": "POL-2026-003",
-            "cohort_id": "COHORT_2026_Q1",
-            "product_code": "MYGA",
-            "issue_age": 48,
-            "gender": "F",
-            "premium": 80000.0,
-            "account_value": 80000.0,
-        },
-    ]
-
-    # Compute deterministic fingerprint over canonical JSON
-    serialized = json.dumps(policies, sort_keys=True).encode("utf-8")
-    fp = hashlib.sha256(serialized).hexdigest()
-    completed_at = datetime.now(timezone.utc).isoformat()
-
-    payload = {
-        "status": "ingested",
-        "project_id": config.project_id,
-        "policy_block": config.policy_block,
-        "record_count": len(policies),
-        "fingerprint": fp,
-        "policies": policies,
-        "started_at": started_at,
-        "completed_at": completed_at,
-    }
+    """Ingest inforce policy block and verify schema integrity through domain service."""
+    context.log.info(f"Delegating inforce ingestion to service for project '{config.project_id}'.")
+    try:
+        payload = execute_inforce_import(
+            db=None,
+            project_id=config.project_id,
+            policy_block=config.policy_block,
+        )
+    except ServiceError as e:
+        allow_retries = e.status_code >= 500
+        raise Failure(description=f"Inforce ingestion failed: {e.message}", allow_retries=allow_retries) from e
+    except Exception as e:
+        raise Failure(description=f"Unexpected inforce error: {e}", allow_retries=True) from e
 
     return Output(
         value=payload,
@@ -136,69 +96,30 @@ def inforce_data_asset(
             "policy_block": MetadataValue.text(payload["policy_block"]),
             "record_count": MetadataValue.int(payload["record_count"]),
             "fingerprint": MetadataValue.text(payload["fingerprint"]),
-            "started_at": MetadataValue.text(started_at),
-            "completed_at": MetadataValue.text(completed_at),
+            "storage_uri": MetadataValue.text(payload.get("storage_uri", "")),
+            "started_at": MetadataValue.text(payload["started_at"]),
+            "completed_at": MetadataValue.text(payload["completed_at"]),
         },
     )
 
 
 @asset(
     group_name="actuarial_pipeline",
-    description="Validate inforce records against acceptance rules (deterministic failure).",
+    description="Validate inforce records against acceptance rules (deterministic failure halts).",
 )
 def validation_asset(
     context: AssetExecutionContext,
     inforce_data_asset: dict[str, Any],
 ) -> Output[dict[str, Any]]:
-    """Validate policy attributes and product mappings before projection execution."""
-    started_at = datetime.now(timezone.utc).isoformat()
+    """Validate policy attributes and product mappings through domain service."""
     context.log.info(f"Validating inforce data with fingerprint {inforce_data_asset['fingerprint']}.")
-
-    policies = inforce_data_asset.get("policies", [])
-    if not policies or len(policies) == 0:
-        raise Failure(
-            description="Inforce validation failed: Block contains 0 records.",
-            allow_retries=False,
-        )
-
-    # Actuarial schema validation
-    seen_ids = set()
-    errors = []
-    for idx, p in enumerate(policies):
-        pid = p.get("policy_id")
-        if not pid or pid in seen_ids:
-            errors.append(f"Row {idx}: Invalid or duplicate policy_id '{pid}'")
-        seen_ids.add(pid)
-
-        age = p.get("issue_age")
-        if age is None or not (0 <= age <= 120):
-            errors.append(f"Row {idx} ({pid}): Invalid issue_age {age}")
-
-        prem = p.get("premium", 0.0)
-        if prem < 0:
-            errors.append(f"Row {idx} ({pid}): Negative premium {prem}")
-
-        av = p.get("account_value", 0.0)
-        if av < 0:
-            errors.append(f"Row {idx} ({pid}): Negative account value {av}")
-
-    if errors:
-        raise Failure(
-            description=f"Inforce validation failed with {len(errors)} errors: {'; '.join(errors[:3])}",
-            allow_retries=False,
-        )
-
-    completed_at = datetime.now(timezone.utc).isoformat()
-    result = {
-        "validation_status": "clean",
-        "error_count": 0,
-        "warning_count": 0,
-        "record_count": len(policies),
-        "fingerprint": inforce_data_asset["fingerprint"],
-        "validated_policies": policies,
-        "started_at": started_at,
-        "completed_at": completed_at,
-    }
+    try:
+        result = execute_inforce_validation(inforce_data_asset)
+    except ServiceError as e:
+        # Deterministic validation failures MUST NOT retry
+        raise Failure(description=e.message, allow_retries=False) from e
+    except Exception as e:
+        raise Failure(description=f"Validation error: {e}", allow_retries=False) from e
 
     return Output(
         value=result,
@@ -207,15 +128,15 @@ def validation_asset(
             "error_count": MetadataValue.int(0),
             "record_count": MetadataValue.int(result["record_count"]),
             "fingerprint": MetadataValue.text(result["fingerprint"]),
-            "started_at": MetadataValue.text(started_at),
-            "completed_at": MetadataValue.text(completed_at),
+            "started_at": MetadataValue.text(result["started_at"]),
+            "completed_at": MetadataValue.text(result["completed_at"]),
         },
     )
 
 
 @asset(
     group_name="actuarial_pipeline",
-    description="Execute projection simulation to generate contractual cash flows.",
+    description="Execute projection simulation and persist real Parquet artifact via domain service.",
     retry_policy=DEFAULT_RETRY_POLICY,
 )
 def projection_run_asset(
@@ -223,161 +144,101 @@ def projection_run_asset(
     config: ProjectionConfig,
     validation_asset: dict[str, Any],
 ) -> Output[dict[str, Any]]:
-    """Run projection simulation and emit contractual cash flow and stock vectors."""
-    started_at = datetime.now(timezone.utc).isoformat()
-    context.log.info(f"Running projection simulation for {config.projection_months} months.")
-
-    policies = validation_asset["validated_policies"]
-    monthly_credited = config.annual_credited_rate / 12.0
-    monthly_surrender = config.annual_surrender_rate / 12.0
-
-    simulation_rows = []
-    # Project each policy deterministically
-    for pol in policies:
-        pid = pol["policy_id"]
-        cohort = pol.get("cohort_id", "DEFAULT_COHORT")
-        av = float(pol["account_value"])
-
-        for m in range(1, config.projection_months + 1):
-            interest = av * monthly_credited
-            surrender = (av + interest) * monthly_surrender
-            ending_av = (av + interest) - surrender
-            # Contractual net cash flow to insurer: premiums (m=1 only) minus surrender benefits
-            prem = float(pol["premium"]) if m == 1 else 0.0
-            net_cf = prem - surrender
-
-            simulation_rows.append({
-                "policy_id": pid,
-                "cohort_id": cohort,
-                "projection_month": m,
-                "beginning_av": av,
-                "interest_credited": interest,
-                "surrender_benefit": surrender,
-                "ending_av": ending_av,
-                "cash_flow": net_cf,
-            })
-            av = ending_av
-
-    # Calculate fingerprint of output projection rows
-    rows_bytes = json.dumps(simulation_rows, sort_keys=True).encode("utf-8")
-    artifact_fp = hashlib.sha256(rows_bytes).hexdigest()
-    completed_at = datetime.now(timezone.utc).isoformat()
-
-    result = {
-        "run_id": config.run_id,
-        "time_steps": config.projection_months,
-        "row_count": len(simulation_rows),
-        "simulation_rows": simulation_rows,
-        "artifact_fingerprint": artifact_fp,
-        "storage_uri": f"local://{config.run_id}/outputs/cash_flows.parquet",
-        "started_at": started_at,
-        "completed_at": completed_at,
-    }
+    """Run projection simulation, persist real Parquet file, and emit persisted lineage."""
+    context.log.info(f"Invoking projection service for {config.projection_months} months.")
+    try:
+        result = execute_projection_simulation(
+            db=None,
+            project_id="proj-m5-valuation-default",
+            validated_inforce=validation_asset,
+            projection_months=config.projection_months,
+            annual_credited_rate=config.annual_credited_rate,
+            annual_surrender_rate=config.annual_surrender_rate,
+            run_id=config.run_id,
+        )
+    except ServiceError as e:
+        allow_retries = e.status_code >= 500
+        raise Failure(description=f"Projection failed: {e.message}", allow_retries=allow_retries) from e
+    except Exception as e:
+        raise Failure(description=f"Unexpected projection error: {e}", allow_retries=True) from e
 
     return Output(
         value=result,
         metadata={
             "run_id": MetadataValue.text(result["run_id"]),
+            "artifact_id": MetadataValue.text(result["artifact_id"]),
             "time_steps": MetadataValue.int(result["time_steps"]),
             "row_count": MetadataValue.int(result["row_count"]),
-            "artifact_fingerprint": MetadataValue.text(artifact_fp),
+            "artifact_fingerprint": MetadataValue.text(result["artifact_fingerprint"]),
             "storage_uri": MetadataValue.text(result["storage_uri"]),
-            "started_at": MetadataValue.text(started_at),
-            "completed_at": MetadataValue.text(completed_at),
+            "started_at": MetadataValue.text(result["started_at"]),
+            "completed_at": MetadataValue.text(result["completed_at"]),
         },
     )
 
 
 @asset(
     group_name="actuarial_pipeline",
-    description="Aggregate cash flows across cohorts (flows sum; stocks end-of-period).",
+    description="Aggregate cash flows across cohorts via Polars (flows sum; stocks end-of-period).",
 )
 def aggregation_asset(
     context: AssetExecutionContext,
     projection_run_asset: dict[str, Any],
 ) -> Output[dict[str, Any]]:
-    """Aggregate flows and stocks per CAS §8 & CORR-02 using Polars."""
-    started_at = datetime.now(timezone.utc).isoformat()
-    rows = projection_run_asset["simulation_rows"]
-
-    # Use Polars for strict columnar aggregation
-    df = pl.DataFrame(rows)
-
-    # Invariant: Flows sum per projection month; stocks take end-of-period
-    monthly_agg = df.group_by("projection_month").agg(
-        pl.col("cash_flow").sum().alias("monthly_cash_flow"),
-        pl.col("ending_av").sum().alias("monthly_ending_av"),
-    ).sort("projection_month")
-
-    monthly_cfs = monthly_agg["monthly_cash_flow"].to_list()
-    monthly_avs = monthly_agg["monthly_ending_av"].to_list()
-
-    total_flow_sum = float(sum(monthly_cfs))
-    period_end_stock = float(monthly_avs[-1]) if monthly_avs else 0.0
-
-    completed_at = datetime.now(timezone.utc).isoformat()
-    result = {
-        "upstream_run_id": projection_run_asset["run_id"],
-        "total_cash_flow_sum": total_flow_sum,
-        "ending_account_value_stock": period_end_stock,
-        "cohort_id": "COHORT_2026_Q1",
-        "aggregated_cash_flows": monthly_cfs,
-        "started_at": started_at,
-        "completed_at": completed_at,
-    }
+    """Aggregate flows and stocks per CAS §8 from persisted Parquet file via domain service."""
+    context.log.info(f"Aggregating persisted cash flows for run {projection_run_asset['run_id']}.")
+    try:
+        result = execute_cash_flow_aggregation(
+            db=None,
+            projection_run_id=projection_run_asset["run_id"],
+            storage_uri=projection_run_asset.get("storage_uri"),
+            simulation_rows=projection_run_asset.get("simulation_rows"),
+        )
+    except ServiceError as e:
+        allow_retries = e.status_code >= 500
+        raise Failure(description=f"Aggregation failed: {e.message}", allow_retries=allow_retries) from e
+    except Exception as e:
+        raise Failure(description=f"Unexpected aggregation error: {e}", allow_retries=False) from e
 
     return Output(
         value=result,
         metadata={
             "upstream_run_id": MetadataValue.text(result["upstream_run_id"]),
-            "total_cash_flow_sum": MetadataValue.float(total_flow_sum),
-            "ending_stock": MetadataValue.float(period_end_stock),
+            "total_cash_flow_sum": MetadataValue.float(result["total_cash_flow_sum"]),
+            "ending_stock": MetadataValue.float(result["ending_account_value_stock"]),
             "cohort_id": MetadataValue.text(result["cohort_id"]),
-            "time_steps_aggregated": MetadataValue.int(len(monthly_cfs)),
-            "started_at": MetadataValue.text(started_at),
-            "completed_at": MetadataValue.text(completed_at),
+            "time_steps_aggregated": MetadataValue.int(result["time_steps_aggregated"]),
+            "started_at": MetadataValue.text(result["started_at"]),
+            "completed_at": MetadataValue.text(result["completed_at"]),
         },
     )
 
 
 @asset(
     group_name="actuarial_pipeline",
-    description="Apply methodology-specific valuation (discounting, NPR, CTE tail math).",
+    description="Calculate TVOM generic present value reserve via domain service (gated VM21/VM22).",
 )
 def valuation_asset(
     context: AssetExecutionContext,
     config: ValuationConfig,
     aggregation_asset: dict[str, Any],
 ) -> Output[dict[str, Any]]:
-    """Calculate reserve and valuation outputs using core valuation primitives."""
-    started_at = datetime.now(timezone.utc).isoformat()
-    context.log.info(f"Evaluating actuarial reserve for {config.basis} / {config.methodology}.")
-
-    # Validate basis and methodology per Directive 10
-    validate_basis(config.basis)
-    validate_methodology(config.methodology)
-    validate_basis_methodology_pair(config.basis, config.methodology)
-
-    cfs = aggregation_asset["aggregated_cash_flows"]
-    discount_factors = [
-        annual_to_monthly_discount_factor(config.annual_discount_rate, m)
-        for m in range(len(cfs))
-    ]
-
-    # Deterministic actuarial present value
-    pv_res = present_value(cfs, discount_factors)
-
-    completed_at = datetime.now(timezone.utc).isoformat()
-    result = {
-        "upstream_run_id": aggregation_asset["upstream_run_id"],
-        "basis": config.basis,
-        "methodology": config.methodology,
-        "valuation_date": config.valuation_date,
-        "present_value_reserve": pv_res,
-        "discount_rate": config.annual_discount_rate,
-        "started_at": started_at,
-        "completed_at": completed_at,
-    }
+    """Calculate reserve and valuation outputs via domain service without claiming VM21/VM22 compliance."""
+    context.log.info(f"Evaluating foundation reserve for {config.basis} / {config.methodology}.")
+    try:
+        result = execute_foundation_valuation(
+            db=None,
+            upstream_run_id=aggregation_asset["upstream_run_id"],
+            basis=config.basis,
+            methodology=config.methodology,
+            valuation_date=config.valuation_date,
+            annual_discount_rate=config.annual_discount_rate,
+            aggregated_cash_flows=aggregation_asset["aggregated_cash_flows"],
+        )
+    except ServiceError as e:
+        raise Failure(description=f"Valuation failed: {e.message}", allow_retries=False) from e
+    except Exception as e:
+        raise Failure(description=f"Unexpected valuation error: {e}", allow_retries=False) from e
 
     return Output(
         value=result,
@@ -385,10 +246,11 @@ def valuation_asset(
             "basis": MetadataValue.text(result["basis"]),
             "methodology": MetadataValue.text(result["methodology"]),
             "valuation_date": MetadataValue.text(result["valuation_date"]),
-            "present_value_reserve": MetadataValue.float(pv_res),
-            "discount_rate": MetadataValue.float(config.annual_discount_rate),
-            "started_at": MetadataValue.text(started_at),
-            "completed_at": MetadataValue.text(completed_at),
+            "present_value_reserve": MetadataValue.float(result["present_value_reserve"]),
+            "discount_rate": MetadataValue.float(result["discount_rate"]),
+            "compliance_status": MetadataValue.text(result["compliance_status"]),
+            "started_at": MetadataValue.text(result["started_at"]),
+            "completed_at": MetadataValue.text(result["completed_at"]),
         },
     )
 
@@ -402,49 +264,37 @@ def rollforward_asset(
     valuation_asset: dict[str, Any],
     aggregation_asset: dict[str, Any],
 ) -> Output[dict[str, Any]]:
-    """Execute generic rollforward continuity validation."""
-    started_at = datetime.now(timezone.utc).isoformat()
-    context.log.info("Validating accounting rollforward continuity.")
-
-    # Attribution movements
+    """Execute rollforward continuity validation via domain service."""
+    context.log.info("Validating accounting rollforward continuity via domain service.")
     opening = Decimal("5000.00")
     movements = {
         "new_business": Decimal("500.00"),
         "contractual_cash_flows": Decimal("320.00"),
         "economic_revaluation": Decimal("180.00"),
     }
-    # Ending balance = opening + sum(movements) = 5000 + 1000 = 6000.00
     ending = Decimal("6000.00")
 
-    continuity = validate_continuity(opening, movements, ending, tolerance=Decimal("0.01"))
-
-    if not continuity.is_continuous:
-        raise Failure(
-            description=f"Actuarial rollforward assertion failure: {continuity.error_message}",
-            allow_retries=False,
+    try:
+        result = execute_rollforward_attribution(
+            opening=opening,
+            movements=movements,
+            ending=ending,
+            tolerance=Decimal("0.01"),
         )
-
-    completed_at = datetime.now(timezone.utc).isoformat()
-    result = {
-        "is_continuous": continuity.is_continuous,
-        "opening_balance": float(opening),
-        "sum_of_movements": float(continuity.sum_of_movements),
-        "ending_balance": float(ending),
-        "difference": float(continuity.difference),
-        "movements": {k: float(v) for k, v in movements.items()},
-        "started_at": started_at,
-        "completed_at": completed_at,
-    }
+    except ServiceError as e:
+        raise Failure(description=e.message, allow_retries=False) from e
+    except Exception as e:
+        raise Failure(description=f"Rollforward error: {e}", allow_retries=False) from e
 
     return Output(
         value=result,
         metadata={
-            "is_continuous": MetadataValue.bool(continuity.is_continuous),
+            "is_continuous": MetadataValue.bool(result["is_continuous"]),
             "opening_balance": MetadataValue.float(result["opening_balance"]),
             "ending_balance": MetadataValue.float(result["ending_balance"]),
             "difference": MetadataValue.float(result["difference"]),
-            "started_at": MetadataValue.text(started_at),
-            "completed_at": MetadataValue.text(completed_at),
+            "started_at": MetadataValue.text(result["started_at"]),
+            "completed_at": MetadataValue.text(result["completed_at"]),
         },
     )
 
@@ -459,41 +309,31 @@ def reconciliation_report_asset(
     valuation_asset: dict[str, Any],
     rollforward_asset: dict[str, Any],
 ) -> Output[dict[str, Any]]:
-    """Generate three-state reconciliation report (PASS, FAIL, NOT_VERIFIABLE)."""
-    started_at = datetime.now(timezone.utc).isoformat()
-    context.log.info("Generating three-state reconciliation report.")
-
+    """Generate three-state reconciliation report (PASS, FAIL, NOT_VERIFIABLE) via domain service."""
+    context.log.info("Invoking governed reconciliation service.")
     actual_reserve = valuation_asset["present_value_reserve"]
-    expected_benchmark = config.expected_benchmark
-
-    if expected_benchmark is None:
-        status = "NOT_VERIFIABLE"
-        diff = 0.0
-    else:
-        diff = abs(actual_reserve - expected_benchmark)
-        status = "PASS" if diff <= config.tolerance else "FAIL"
-
-    completed_at = datetime.now(timezone.utc).isoformat()
-    report = {
-        "report_id": f"REC-DAGSTER-{valuation_asset['upstream_run_id']}",
-        "status": status,
-        "actual_value": actual_reserve,
-        "expected_benchmark": expected_benchmark,
-        "difference": diff,
-        "tolerance": config.tolerance,
-        "started_at": started_at,
-        "completed_at": completed_at,
-    }
+    try:
+        report = execute_governed_reconciliation(
+            db=None,
+            upstream_run_id=valuation_asset["upstream_run_id"],
+            actual_reserve=actual_reserve,
+            expected_benchmark=config.expected_benchmark,
+            tolerance=config.tolerance,
+        )
+    except ServiceError as e:
+        raise Failure(description=f"Reconciliation error: {e.message}", allow_retries=False) from e
+    except Exception as e:
+        raise Failure(description=f"Unexpected reconciliation error: {e}", allow_retries=False) from e
 
     report_metadata: dict[str, Any] = {
-        "reconciliation_status": MetadataValue.text(status),
+        "reconciliation_status": MetadataValue.text(report["status"]),
         "actual_value": MetadataValue.float(actual_reserve),
-        "difference": MetadataValue.float(diff),
-        "started_at": MetadataValue.text(started_at),
-        "completed_at": MetadataValue.text(completed_at),
+        "difference": MetadataValue.float(report["difference"]),
+        "started_at": MetadataValue.text(report["started_at"]),
+        "completed_at": MetadataValue.text(report["completed_at"]),
     }
-    if expected_benchmark is not None:
-        report_metadata["expected_benchmark"] = MetadataValue.float(expected_benchmark)
+    if config.expected_benchmark is not None:
+        report_metadata["expected_benchmark"] = MetadataValue.float(config.expected_benchmark)
 
     return Output(
         value=report,
@@ -503,7 +343,7 @@ def reconciliation_report_asset(
 
 @asset(
     group_name="actuarial_pipeline",
-    description="Generate reproducible disclosure packages and audit export artifacts.",
+    description="Assemble reproducible disclosure package and export manifest via domain service.",
 )
 def reporting_asset(
     context: AssetExecutionContext,
@@ -511,42 +351,20 @@ def reporting_asset(
     rollforward_asset: dict[str, Any],
     reconciliation_report_asset: dict[str, Any],
 ) -> Output[dict[str, Any]]:
-    """Assemble final disclosure package and compute actual manifest SHA-256."""
-    started_at = datetime.now(timezone.utc).isoformat()
-    context.log.info("Packaging final disclosure schedules and audit manifest.")
-
-    summary_package = {
-        "upstream_run_id": valuation_asset["upstream_run_id"],
-        "basis": valuation_asset["basis"],
-        "methodology": valuation_asset["methodology"],
-        "valuation_date": valuation_asset["valuation_date"],
-        "reserve": valuation_asset["present_value_reserve"],
-        "rollforward": {
-            "is_continuous": rollforward_asset["is_continuous"],
-            "opening": rollforward_asset["opening_balance"],
-            "ending": rollforward_asset["ending_balance"],
-            "difference": rollforward_asset["difference"],
-        },
-        "reconciliation": {
-            "status": reconciliation_report_asset["status"],
-            "difference": reconciliation_report_asset["difference"],
-        },
-    }
-
-    # Compute actual SHA-256 manifest of the disclosure package
-    manifest_bytes = json.dumps(summary_package, sort_keys=True).encode("utf-8")
-    actual_manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-    completed_at = datetime.now(timezone.utc).isoformat()
-
-    package = {
-        "package_id": f"DISCLOSURE-{valuation_asset['upstream_run_id']}",
-        "rollforward_verified": rollforward_asset["is_continuous"],
-        "reconciliation_status": reconciliation_report_asset["status"],
-        "manifest_sha256": actual_manifest_sha256,
-        "summary": summary_package,
-        "started_at": started_at,
-        "completed_at": completed_at,
-    }
+    """Assemble final disclosure package and persist audit export artifact via domain service."""
+    context.log.info("Delegating reporting export to domain service.")
+    try:
+        package = execute_reporting_manifest(
+            db=None,
+            upstream_run_id=valuation_asset["upstream_run_id"],
+            valuation_result=valuation_asset,
+            rollforward_result=rollforward_asset,
+            reconciliation_result=reconciliation_report_asset,
+        )
+    except ServiceError as e:
+        raise Failure(description=f"Reporting failed: {e.message}", allow_retries=False) from e
+    except Exception as e:
+        raise Failure(description=f"Unexpected reporting error: {e}", allow_retries=False) from e
 
     return Output(
         value=package,
@@ -554,8 +372,9 @@ def reporting_asset(
             "package_id": MetadataValue.text(package["package_id"]),
             "rollforward_verified": MetadataValue.bool(package["rollforward_verified"]),
             "reconciliation_status": MetadataValue.text(package["reconciliation_status"]),
-            "manifest_sha256": MetadataValue.text(actual_manifest_sha256),
-            "started_at": MetadataValue.text(started_at),
-            "completed_at": MetadataValue.text(completed_at),
+            "manifest_sha256": MetadataValue.text(package["manifest_sha256"]),
+            "storage_uri": MetadataValue.text(package.get("storage_uri", "")),
+            "started_at": MetadataValue.text(package["started_at"]),
+            "completed_at": MetadataValue.text(package["completed_at"]),
         },
     )

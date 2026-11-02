@@ -1,20 +1,36 @@
-"""M5 PostgreSQL Governance & Immutability Verification.
+"""M5 PostgreSQL Governance, Immutability & Downgrade Fidelity Verification.
 
 Runs only when MENTORAMP_TEST_POSTGRES_URL points to a disposable PostgreSQL database.
 
 Verifies:
 1. Zero -> Head upgrade on PostgreSQL (c9f4e2d8a615).
-2. Downgrade c9f4e2d8a615 -> b8f3d1e7c504 and re-upgrade to head.
-3. Foreign key constraints:
+2. Schema inspection of head c9:
+   - derived_datasets has source_model_version_id
+   - valuation_run_details has redundant identity columns dropped
+3. Downgrade c9f4e2d8a615 -> b8f3d1e7c504 with full fidelity inspection (Directive 5):
+   - valuation_run_details columns, NOT NULL nullability, FKs, check constraints, and indexes restored
+   - derived_datasets source_model_version_id dropped
+   - prior b8 trigger behavior verified
+4. Re-upgrade b8f3d1e7c504 -> c9f4e2d8a615.
+5. Foreign key constraints:
    - source_model_id -> models.id
    - source_model_version_id -> model_versions.id
-4. Immutability trigger on derived_datasets (Directive 8):
+6. Hardened immutability triggers on derived_datasets (Directives 4 & 8):
    - Approved dataset cannot be deleted.
    - Approved dataset material fields cannot be mutated.
-   - Superseded dataset cannot be deleted.
-   - Superseded dataset material fields cannot be mutated.
-   - Superseded dataset status cannot be reverted.
-5. Immutability trigger on valuation_run_details (Directive 9):
+   - Status transitions strictly restricted:
+     - approved -> draft BLOCKED
+     - approved -> validated BLOCKED
+     - approved -> arbitrary status BLOCKED
+     - approved -> superseded ALLOWED
+   - Terminal superseded status:
+     - superseded -> approved BLOCKED
+     - superseded -> draft BLOCKED
+     - superseded material mutation BLOCKED
+     - superseded deletion BLOCKED
+   - Soft-delete protection:
+     - deleted_at / deleted_by on approved or superseded BLOCKED
+7. Immutability trigger on valuation_run_details (Directive 9):
    - Delete is blocked.
    - Update is blocked once parent Run is in completed/success status.
 """
@@ -32,7 +48,7 @@ import psycopg2
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 
 from app.config import settings
 
@@ -42,7 +58,6 @@ pytestmark = pytest.mark.skipif(
     reason="set MENTORAMP_TEST_POSTGRES_URL to a disposable PostgreSQL database"
 )
 
-BACKEND = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MIGRATIONS_DIR = os.path.join(BACKEND, "app", "db", "migrations")
 
 
@@ -58,7 +73,7 @@ def run_full_m5_postgres_verification():
     postgres_url = _get_url()
     settings.database_url = postgres_url
 
-    # 1. Reset public schema
+    # 1. Reset public schema cleanly
     conn = psycopg2.connect(postgres_url)
     conn.autocommit = True
     with conn.cursor() as cur:
@@ -68,19 +83,71 @@ def run_full_m5_postgres_verification():
         cur.execute("GRANT ALL ON SCHEMA public TO public;")
     conn.close()
 
-    # 2. Run Alembic upgrade zero -> head
+    # 2. Run Alembic upgrade zero -> head (c9f4e2d8a615)
     alembic_cfg = Config()
     alembic_cfg.set_main_option("script_location", MIGRATIONS_DIR)
     alembic_cfg.set_main_option("sqlalchemy.url", postgres_url)
     
     command.upgrade(alembic_cfg, "head")
 
-    # 3. Test Downgrade and Re-upgrade
+    engine = create_engine(postgres_url)
+    inspector = inspect(engine)
+
+    # 2a. Verify c9 head schema structure
+    c9_ds_cols = {col["name"]: col for col in inspector.get_columns("derived_datasets")}
+    assert "source_model_version_id" in c9_ds_cols, "c9 derived_datasets must have source_model_version_id"
+
+    c9_vrd_cols = {col["name"]: col for col in inspector.get_columns("valuation_run_details")}
+    assert "run_id" in c9_vrd_cols
+    assert "valuation_date" in c9_vrd_cols
+    assert "discount_curve_fingerprint" in c9_vrd_cols
+    assert "configuration" in c9_vrd_cols
+    assert "summary_results" in c9_vrd_cols
+    # Redundant columns must be absent in c9
+    assert "project_id" not in c9_vrd_cols, "c9 valuation_run_details must NOT have redundant project_id"
+    assert "basis" not in c9_vrd_cols, "c9 valuation_run_details must NOT have redundant basis"
+    assert "methodology" not in c9_vrd_cols, "c9 valuation_run_details must NOT have redundant methodology"
+
+    # 3. Test Downgrade c9 -> b8 with full fidelity inspection (Directive 5)
     command.downgrade(alembic_cfg, "b8f3d1e7c504")
+
+    inspector_b8 = inspect(engine)
+    b8_vrd_cols = {col["name"]: col for col in inspector_b8.get_columns("valuation_run_details")}
+
+    # Verify restored columns
+    for col_name in ["project_id", "basis", "methodology", "methodology_version", "source_projection_run_id", "derived_dataset_id"]:
+        assert col_name in b8_vrd_cols, f"Downgraded b8 valuation_run_details missing column: {col_name}"
+
+    # Verify restored nullability (project_id, basis, methodology, methodology_version must be NOT NULL)
+    assert b8_vrd_cols["project_id"]["nullable"] is False, "b8 project_id must be NOT NULL"
+    assert b8_vrd_cols["basis"]["nullable"] is False, "b8 basis must be NOT NULL"
+    assert b8_vrd_cols["methodology"]["nullable"] is False, "b8 methodology must be NOT NULL"
+    assert b8_vrd_cols["methodology_version"]["nullable"] is False, "b8 methodology_version must be NOT NULL"
+
+    # Verify restored foreign keys on valuation_run_details
+    b8_vrd_fks = {fk["referred_table"]: fk for fk in inspector_b8.get_foreign_keys("valuation_run_details")}
+    assert "projects" in b8_vrd_fks, "b8 valuation_run_details missing FK to projects"
+    assert "runs" in b8_vrd_fks, "b8 valuation_run_details missing FK to runs"
+    assert "derived_datasets" in b8_vrd_fks, "b8 valuation_run_details missing FK to derived_datasets"
+
+    # Verify restored check constraints on valuation_run_details
+    b8_vrd_checks = {ck["name"] for ck in inspector_b8.get_check_constraints("valuation_run_details")}
+    assert "ck_valuation_basis" in b8_vrd_checks, "b8 valuation_run_details missing ck_valuation_basis"
+    assert "ck_valuation_methodology" in b8_vrd_checks, "b8 valuation_run_details missing ck_valuation_methodology"
+
+    # Verify restored indexes on valuation_run_details
+    b8_vrd_indexes = {ix["name"] for ix in inspector_b8.get_indexes("valuation_run_details")}
+    assert "ix_valuation_run_details_project_id" in b8_vrd_indexes
+    assert "ix_valuation_run_details_source_projection_run_id" in b8_vrd_indexes
+
+    # Verify source_model_version_id was removed from derived_datasets on downgrade
+    b8_ds_cols = {col["name"]: col for col in inspector_b8.get_columns("derived_datasets")}
+    assert "source_model_version_id" not in b8_ds_cols, "b8 derived_datasets must NOT have source_model_version_id"
+
+    # 4. Re-upgrade b8 -> c9
     command.upgrade(alembic_cfg, "head")
 
-    # 4. Verify Foreign Key constraints (Directive 13)
-    engine = create_engine(postgres_url)
+    # 5. Seed test data and verify Foreign Key constraints
     u_id = str(uuid.uuid4())
     p_id = str(uuid.uuid4())
     m_id = str(uuid.uuid4())
@@ -124,7 +191,7 @@ def run_full_m5_postgres_verification():
             {"id": ds_id, "pid": p_id, "rid": run_id, "mid": m_id, "mvid": mv_id},
         )
 
-    # 4a. Invalid source_model_id -> FK violation
+    # 5a. Invalid source_model_id -> FK violation
     with engine.connect() as c:
         trans = c.begin()
         try:
@@ -144,7 +211,7 @@ def run_full_m5_postgres_verification():
                     "id": str(uuid.uuid4()),
                     "pid": p_id,
                     "rid": run_id,
-                    "mid": str(uuid.uuid4()),  # Nonexistent model
+                    "mid": str(uuid.uuid4()),
                     "mvid": mv_id,
                 },
             )
@@ -154,7 +221,7 @@ def run_full_m5_postgres_verification():
             trans.rollback()
             assert "foreign key constraint" in str(e).lower()
 
-    # 4b. Invalid source_model_version_id -> FK violation
+    # 5b. Invalid source_model_version_id -> FK violation
     with engine.connect() as c:
         trans = c.begin()
         try:
@@ -175,7 +242,7 @@ def run_full_m5_postgres_verification():
                     "pid": p_id,
                     "rid": run_id,
                     "mid": m_id,
-                    "mvid": str(uuid.uuid4()),  # Nonexistent model version
+                    "mvid": str(uuid.uuid4()),
                 },
             )
             trans.commit()
@@ -184,14 +251,14 @@ def run_full_m5_postgres_verification():
             trans.rollback()
             assert "foreign key constraint" in str(e).lower()
 
-    # 5. Verify Immutability Trigger on derived_datasets (Directive 8)
+    # 6. Verify Hardened Immutability Triggers on derived_datasets (Directives 4 & 8)
     with engine.begin() as c:
         c.execute(
             text("UPDATE derived_datasets SET status = 'approved', approved_by = :u, approved_at = NOW() WHERE id = :id"),
             {"id": ds_id, "u": u_id},
         )
 
-    # 5a. Attempt to DELETE approved dataset -> MUST FAIL
+    # 6a. Attempt to DELETE approved dataset -> MUST FAIL
     with engine.connect() as c:
         trans = c.begin()
         try:
@@ -202,7 +269,7 @@ def run_full_m5_postgres_verification():
             trans.rollback()
             assert "Approved or superseded derived_datasets cannot be deleted" in str(e)
 
-    # 5b. Attempt to MUTATE material field (fingerprint) on approved dataset -> MUST FAIL
+    # 6b. Attempt to MUTATE material field on approved dataset -> MUST FAIL
     with engine.connect() as c:
         trans = c.begin()
         try:
@@ -216,7 +283,7 @@ def run_full_m5_postgres_verification():
             trans.rollback()
             assert "Approved derived_datasets material evidence is immutable" in str(e)
 
-    # 5c. Attempt exploit: set status = 'superseded' WHILE tampering fingerprint -> MUST FAIL
+    # 6c. Attempt exploit: set status = 'superseded' WHILE tampering fingerprint -> MUST FAIL
     with engine.connect() as c:
         trans = c.begin()
         try:
@@ -230,14 +297,69 @@ def run_full_m5_postgres_verification():
             trans.rollback()
             assert "Approved derived_datasets material evidence is immutable" in str(e)
 
-    # 5d. Legitimate supersede: change ONLY lifecycle status -> SUCCEEDS
+    # 6d. Status transition loophole tests (Directive 4):
+    # - approved -> draft BLOCKED
+    with engine.connect() as c:
+        trans = c.begin()
+        try:
+            c.execute(text("UPDATE derived_datasets SET status = 'draft' WHERE id = :id"), {"id": ds_id})
+            trans.commit()
+            raise AssertionError("approved -> draft was not blocked!")
+        except Exception as e:
+            trans.rollback()
+            assert "Approved derived_datasets status can only remain approved or transition to superseded" in str(e)
+
+    # - approved -> validated BLOCKED
+    with engine.connect() as c:
+        trans = c.begin()
+        try:
+            c.execute(text("UPDATE derived_datasets SET status = 'validated' WHERE id = :id"), {"id": ds_id})
+            trans.commit()
+            raise AssertionError("approved -> validated was not blocked!")
+        except Exception as e:
+            trans.rollback()
+            assert "Approved derived_datasets status can only remain approved or transition to superseded" in str(e)
+
+    # - approved -> arbitrary unknown status BLOCKED
+    with engine.connect() as c:
+        trans = c.begin()
+        try:
+            c.execute(text("UPDATE derived_datasets SET status = 'unknown_status' WHERE id = :id"), {"id": ds_id})
+            trans.commit()
+            raise AssertionError("approved -> unknown status was not blocked!")
+        except Exception as e:
+            trans.rollback()
+            assert "Approved derived_datasets status can only remain approved or transition to superseded" in str(e)
+
+    # - soft-delete on approved dataset BLOCKED (Directive 4)
+    with engine.connect() as c:
+        trans = c.begin()
+        try:
+            c.execute(text("UPDATE derived_datasets SET deleted_at = NOW() WHERE id = :id"), {"id": ds_id})
+            trans.commit()
+            raise AssertionError("soft-delete deleted_at on approved dataset was not blocked!")
+        except Exception as e:
+            trans.rollback()
+            assert "Approved or superseded derived_datasets cannot be soft-deleted" in str(e)
+
+    with engine.connect() as c:
+        trans = c.begin()
+        try:
+            c.execute(text("UPDATE derived_datasets SET deleted_by = :u WHERE id = :id"), {"id": ds_id, "u": u_id})
+            trans.commit()
+            raise AssertionError("soft-delete deleted_by on approved dataset was not blocked!")
+        except Exception as e:
+            trans.rollback()
+            assert "Approved or superseded derived_datasets cannot be soft-deleted" in str(e)
+
+    # 6e. Legitimate supersession: change ONLY lifecycle status -> SUCCEEDS
     with engine.begin() as c:
         c.execute(
             text("UPDATE derived_datasets SET status = 'superseded', updated_at = NOW() WHERE id = :id"),
             {"id": ds_id},
         )
 
-    # 5e. Attempt to DELETE superseded dataset -> MUST FAIL
+    # 6f. Attempt to DELETE superseded dataset -> MUST FAIL
     with engine.connect() as c:
         trans = c.begin()
         try:
@@ -248,7 +370,7 @@ def run_full_m5_postgres_verification():
             trans.rollback()
             assert "Approved or superseded derived_datasets cannot be deleted" in str(e)
 
-    # 5f. Attempt to MUTATE material field on superseded dataset -> MUST FAIL
+    # 6g. Attempt to MUTATE material field on superseded dataset -> MUST FAIL
     with engine.connect() as c:
         trans = c.begin()
         try:
@@ -262,21 +384,29 @@ def run_full_m5_postgres_verification():
             trans.rollback()
             assert "Approved derived_datasets material evidence is immutable" in str(e)
 
-    # 5g. Attempt to REVERT superseded status back to approved -> MUST FAIL
+    # 6h. Attempt to REVERT superseded status back to approved -> MUST FAIL
     with engine.connect() as c:
         trans = c.begin()
         try:
-            c.execute(
-                text("UPDATE derived_datasets SET status = 'approved' WHERE id = :id"),
-                {"id": ds_id},
-            )
+            c.execute(text("UPDATE derived_datasets SET status = 'approved' WHERE id = :id"), {"id": ds_id})
             trans.commit()
             raise AssertionError("Reverting superseded status was not blocked!")
         except Exception as e:
             trans.rollback()
             assert "Superseded derived_datasets status cannot be changed" in str(e)
 
-    # 6. Verify Immutability Trigger on valuation_run_details (Directive 9)
+    # 6i. Attempt to REVERT superseded status back to draft -> MUST FAIL
+    with engine.connect() as c:
+        trans = c.begin()
+        try:
+            c.execute(text("UPDATE derived_datasets SET status = 'draft' WHERE id = :id"), {"id": ds_id})
+            trans.commit()
+            raise AssertionError("Reverting superseded status to draft was not blocked!")
+        except Exception as e:
+            trans.rollback()
+            assert "Superseded derived_datasets status cannot be changed" in str(e)
+
+    # 7. Verify Immutability Trigger on valuation_run_details (Directive 9)
     with engine.begin() as c:
         c.execute(
             text("""
@@ -291,7 +421,7 @@ def run_full_m5_postgres_verification():
             {"rid": run_id},
         )
 
-    # 6a. Attempt to DELETE valuation_run_details -> MUST FAIL
+    # 7a. Attempt to DELETE valuation_run_details -> MUST FAIL
     with engine.connect() as c:
         trans = c.begin()
         try:
@@ -302,7 +432,7 @@ def run_full_m5_postgres_verification():
             trans.rollback()
             assert "valuation_run_details execution evidence cannot be deleted" in str(e)
 
-    # 6b. Attempt to UPDATE valuation_run_details on completed run -> MUST FAIL
+    # 7b. Attempt to UPDATE valuation_run_details on completed run -> MUST FAIL
     with engine.connect() as c:
         trans = c.begin()
         try:
