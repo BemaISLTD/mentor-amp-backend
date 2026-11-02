@@ -31,7 +31,11 @@ def test_validate_basis_accepts_valid_bases():
     assert validate_basis("gaap") == "GAAP"
     assert validate_basis("STATUTORY") == "STATUTORY"
     assert validate_basis("statutory") == "STATUTORY"
-    assert validate_basis("TAX") == "TAX"
+    # TAX is extensible future basis: rejected by default in Launch 1.0, accepted with allow_future=True
+    with pytest.raises(ValuationTaxonomyError) as exc_info:
+        validate_basis("TAX")
+    assert "not approved for launch 1.0" in str(exc_info.value).lower()
+    assert validate_basis("TAX", allow_future=True) == "TAX"
 
 
 def test_validate_basis_rejects_methodologies_with_helpful_error():
@@ -85,7 +89,12 @@ def test_validate_basis_methodology_pairs():
     b, m = validate_basis_methodology_pair("GAAP", "LDTI")
     assert b == "GAAP" and m == "LDTI"
 
-    b, m = validate_basis_methodology_pair("TAX", "VM22")
+    # TAX is extensible future basis: rejected by default in Launch 1.0, accepted with allow_future=True
+    with pytest.raises(ValuationTaxonomyError) as exc_info:
+        validate_basis_methodology_pair("TAX", "VM22")
+    assert "not approved for launch 1.0" in str(exc_info.value).lower()
+
+    b, m = validate_basis_methodology_pair("TAX", "VM22", allow_future=True)
     assert b == "TAX" and m == "VM22"
 
     # Unsupported pairing check
