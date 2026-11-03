@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from app.core.valuation.taxonomy import (
     SUPPORTED_LAUNCH_METHODOLOGIES,
     validate_basis,
+    validate_basis_methodology_pair,
     validate_methodology,
 )
 from app.db.models.rollforward import RollforwardSummary
@@ -278,6 +279,7 @@ def record_rollforward_summary(
         raise bad_request(
             f"Rollforward methodology '{valid_m}' contradicts parent run methodology '{run.methodology}'."
         )
+    validate_basis_methodology_pair(valid_b, valid_m)
 
     trace_identifier = trace_id or str(uuid.uuid4())[:32]
     records = []

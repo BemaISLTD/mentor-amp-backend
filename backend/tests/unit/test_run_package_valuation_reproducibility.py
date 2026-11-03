@@ -1,18 +1,43 @@
-"""Tests for M5 Valuation RunPackage provenance and reproducibility (Directives 3 & 16).
+"""Tests for M5 Valuation RunPackage provenance and reproducibility (Directives 3 & 16, P0-03).
 
 Verifies:
 1. Pure reproducibility: Identical valuation inputs produce identical package fingerprints bit-for-bit.
 2. Material sensitivity: Mutating ANY valuation provenance field alters the package fingerprint.
 3. Envelope integrity: verify_envelope detects mismatches between run row and frozen valuation package.
 4. Concrete governed valuation run package artifact verification.
+5. P0-03: Trusted provenance enforcement (mandatory DB session, authoritative upstream source,
+   no caller fallback model_id/model_version_id fabrication, rejection of unapproved/foreign/mismatched models).
 """
 
 import copy
-import pytest
+from datetime import date
+import gc
+import json
 
+import pytest
+import sqlalchemy as sa
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.core.artifacts import get_artifact_store
 from app.core.execution import run_package
 from app.core.execution.fingerprints import fingerprint
 from app.core.execution.run_package import RunPackageError, verify, verify_envelope
+import app.core.execution.run_package as core_run_pkg
+from app.db.database import Base
+from app.db.models.governance import DerivedDataset
+from app.db.models.modeling import Model, ModelVersion
+from app.db.models.project import Project
+from app.db.models.project_member import ProjectMember
+from app.db.models.run import Run
+from app.db.models.run_artifact import RunArtifact
+from app.db.models.run_package import RunPackage
+from app.db.models.user import User
+from app.db.models.valuation_detail import ValuationRunDetail
+from app.services.build_info import BuildIdentityUnavailable, build_identity
+from app.services.common import ServiceError, iso, now_utc
+from app.services.run_package_service import freeze_valuation_run_package
+from app.services.run_submission_service import submit_valuation_run
 
 
 SAMPLE_VALUATION_CONFIGURATION = {
@@ -168,12 +193,10 @@ def test_valuation_reproducibility_identical_rerun():
     """Directive 16: Identical valuation inputs produce the exact same package fingerprint."""
     pkg1 = seal_valuation_package()
     pkg2 = seal_valuation_package(package_id="pkg-val-DIFFERENT-ID", run_id="run-val-DIFFERENT-RUN")
-    
-    # Fingerprint covers the frozen configuration deterministically
+
     assert pkg1["fingerprint"] == pkg2["fingerprint"]
     assert pkg1["fingerprint"] == fingerprint(SAMPLE_VALUATION_CONFIGURATION)
-    
-    # Verification succeeds against expected fingerprint
+
     verified_cfg = verify(pkg1, expected_fingerprint=pkg1["fingerprint"])
     assert verified_cfg["valuation"]["methodology"] == "VM22"
 
@@ -197,7 +220,7 @@ def test_valuation_reproducibility_identical_rerun():
 def test_material_valuation_change_changes_package_fingerprint(field_path, mutated_value):
     """Directive 3 & 16: Proves mutating any material valuation field changes the package fingerprint."""
     baseline_fp = fingerprint(SAMPLE_VALUATION_CONFIGURATION)
-    
+
     mutated_cfg = copy.deepcopy(SAMPLE_VALUATION_CONFIGURATION)
     target = mutated_cfg
     for key in field_path[:-1]:
@@ -219,8 +242,7 @@ def test_envelope_verification_enforces_run_row_and_valuation_identity_agreement
         "schema_version": pkg["schema_version"],
         "fingerprint_algorithm": pkg["fingerprint_algorithm"],
     }
-    
-    # 1. Matching run row -> succeeds
+
     matching_run = {
         "id": "run-val-1",
         "project_id": "proj-m5-core",
@@ -239,7 +261,6 @@ def test_envelope_verification_enforces_run_row_and_valuation_identity_agreement
     }
     verify_envelope(pkg, package_row, matching_run)
 
-    # 2. Contradictory basis in run row -> raises RUN_INDEX_MISMATCH
     mismatched_run_basis = copy.deepcopy(matching_run)
     mismatched_run_basis["basis"] = "GAAP"
     with pytest.raises(RunPackageError) as exc_info:
@@ -247,7 +268,6 @@ def test_envelope_verification_enforces_run_row_and_valuation_identity_agreement
     assert exc_info.value.code == "RUN_INDEX_MISMATCH"
     assert "basis" in exc_info.value.message
 
-    # 3. Contradictory methodology in run row -> raises RUN_INDEX_MISMATCH
     mismatched_run_meth = copy.deepcopy(matching_run)
     mismatched_run_meth["methodology"] = "VM21"
     with pytest.raises(RunPackageError) as exc_info:
@@ -259,48 +279,24 @@ def test_envelope_verification_enforces_run_row_and_valuation_identity_agreement
 def test_tampered_package_fails_verification():
     """Directive 3: Tampering with package configuration raises PACKAGE_TAMPERED."""
     pkg = seal_valuation_package()
-    # Maliciously modify the discount curve fingerprint without updating top-level fingerprint
     pkg["configuration"]["valuation"]["discount_curve_fingerprint"] = "TAMPERED_CURVE_HASH"
-    
+
     with pytest.raises(RunPackageError) as exc_info:
         verify(pkg, expected_fingerprint=pkg["fingerprint"])
     assert exc_info.value.code == "PACKAGE_TAMPERED"
 
 
 # =============================================================================
-# Production Service Integration Tests (Directive 2 & Senior Review Blocker 2)
+# Production Service Integration Tests (Directive 2, Blocker 2, & P0-03)
 # =============================================================================
-
-from datetime import date
-import hashlib
-import json
-from unittest.mock import MagicMock
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
-from app.db.database import Base
-from app.db.models.project import Project
-from app.db.models.project_member import ProjectMember
-from app.db.models.user import User
-from app.db.models.run import Run
-from app.db.models.run_package import RunPackage
-from app.db.models.valuation_detail import ValuationRunDetail
-from app.db.models.governance import DerivedDataset
-from app.db.models.run_artifact import RunArtifact
-from app.services.common import ServiceError, iso, now_utc
-from app.services.build_info import BuildIdentityUnavailable, build_identity
-from app.services.run_package_service import freeze_valuation_run_package
-from app.services.run_submission_service import submit_valuation_run
-from app.core.artifacts import get_artifact_store
-import app.core.execution.run_package as core_run_pkg
 
 
 @pytest.fixture()
-def db_session_val():
+def db_session_val(tmp_path):
+    db_file = tmp_path / "val_repro_test.db"
     engine = create_engine(
-        "sqlite://",
+        f"sqlite:///{db_file}",
         connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
     )
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine)()
@@ -308,6 +304,7 @@ def db_session_val():
         yield session
     finally:
         session.close()
+        gc.collect()
         engine.dispose()
 
 
@@ -325,7 +322,43 @@ def seeded_val_env(db_session_val):
     return {"session": db_session_val, "proj1": proj1, "proj2": proj2, "user": user}
 
 
+def _ensure_governed_spia_model(
+    db,
+    project_id,
+    model_id="model-spia-01",
+    mv_id="mv-spia-v1",
+    mv_status="approved",
+    product_code="SPIA",
+):
+    model = db.get(Model, model_id)
+    if model is None:
+        model = Model(
+            id=model_id,
+            project_id=project_id,
+            name="SPIA VM-22 Model" if model_id == "model-spia-01" else f"Model {model_id}",
+            product_code=product_code,
+            status="approved",
+        )
+        db.add(model)
+        db.flush()
+    mv = db.get(ModelVersion, mv_id)
+    if mv is None:
+        mv = ModelVersion(
+            id=mv_id,
+            model_id=model.id,
+            version_label="v1.0.0" if mv_id == "mv-spia-v1" else f"v-{mv_id}",
+            status=mv_status,
+            basis="STATUTORY",
+            methodology="VM22",
+            approved_at=now_utc() if mv_status in ("approved", "published") else None,
+        )
+        db.add(mv)
+        db.flush()
+    return model, mv
+
+
 def _seed_source_projection_run(db, project_id, run_id="run-src-proj-1", status="success"):
+    _ensure_governed_spia_model(db, project_id)
     store = get_artifact_store()
     rows = [{"policy_id": "P1", "month": 1, "cash_flow": 100.0, "reserve": 5000.0}]
     stored = store.write_rows(
@@ -452,27 +485,32 @@ def test_real_service_freeze_valuation_run_package_success(seeded_val_env):
 def test_service_freeze_fails_on_missing_or_corrupt_build_identity(seeded_val_env, monkeypatch):
     """Directive 2 & Blocker 2: Fails closed (503) when build identity is missing or fallback."""
     import app.services.run_package_service as rps
+
     db = seeded_val_env["session"]
     proj = seeded_val_env["proj1"]
     user = seeded_val_env["user"]
     src_run, _, _ = _seed_source_projection_run(db, proj.id)
     run = Run(id="run-val-actual-2", project_id=proj.id)
 
-    # 1. BuildIdentityUnavailable -> ServiceError(503, BUILD_IDENTITY_UNAVAILABLE)
     def mock_unavailable():
         raise BuildIdentityUnavailable("No build identity available")
+
     monkeypatch.setattr(rps, "build_identity", mock_unavailable)
 
     with pytest.raises(ServiceError) as exc_info:
         freeze_valuation_run_package(
-            db=db, project=proj, run=run, user=user,
-            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            db=db,
+            project=proj,
+            run=run,
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
             source_projection_run_id=src_run.id,
         )
     assert exc_info.value.code == "BUILD_IDENTITY_UNAVAILABLE"
     assert exc_info.value.status_code == 503
 
-    # 2. Corrupt/fallback zero identity -> ServiceError(503, BUILD_IDENTITY_UNAVAILABLE)
     def mock_fallback():
         return {
             "app_version": "0.1.0",
@@ -480,12 +518,18 @@ def test_service_freeze_fails_on_missing_or_corrupt_build_identity(seeded_val_en
             "source_commit": "0" * 40,
             "identity_source": "fallback",
         }
+
     monkeypatch.setattr(rps, "build_identity", mock_fallback)
 
     with pytest.raises(ServiceError) as exc_info2:
         freeze_valuation_run_package(
-            db=db, project=proj, run=run, user=user,
-            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            db=db,
+            project=proj,
+            run=run,
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
             source_projection_run_id=src_run.id,
         )
     assert exc_info2.value.code == "BUILD_IDENTITY_UNAVAILABLE"
@@ -506,8 +550,13 @@ def test_service_freeze_foreign_source_projection_run_fails(seeded_val_env):
 
     with pytest.raises(ServiceError) as exc_info:
         freeze_valuation_run_package(
-            db=db, project=proj1, run=target_run, user=user,
-            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            db=db,
+            project=proj1,
+            run=target_run,
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
             source_projection_run_id=foreign_run.id,
         )
     assert exc_info.value.code == "RUN_NOT_FOUND"
@@ -538,8 +587,13 @@ def test_service_freeze_foreign_derived_dataset_fails(seeded_val_env):
 
     with pytest.raises(ServiceError) as exc_info:
         freeze_valuation_run_package(
-            db=db, project=proj1, run=target_run, user=user,
-            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            db=db,
+            project=proj1,
+            run=target_run,
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
             derived_dataset_id=foreign_ds.id,
         )
     assert exc_info.value.code == "DATASET_NOT_FOUND"
@@ -569,8 +623,13 @@ def test_service_freeze_unapproved_derived_dataset_fails(seeded_val_env):
 
     with pytest.raises(ServiceError) as exc_info:
         freeze_valuation_run_package(
-            db=db, project=proj1, run=target_run, user=user,
-            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            db=db,
+            project=proj1,
+            run=target_run,
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
             derived_dataset_id=draft_ds.id,
         )
     assert exc_info.value.code == "DATASET_NOT_APPROVED"
@@ -600,8 +659,13 @@ def test_service_freeze_dataset_fingerprint_mismatch_fails(seeded_val_env):
 
     with pytest.raises(ServiceError) as exc_info:
         freeze_valuation_run_package(
-            db=db, project=proj1, run=target_run, user=user,
-            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            db=db,
+            project=proj1,
+            run=target_run,
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
             derived_dataset_id=approved_ds.id,
             derived_dataset_fingerprint="f" * 64,
         )
@@ -621,15 +685,25 @@ def test_service_freeze_reproducibility_identical_rerun(seeded_val_env):
     run2 = Run(id="run-rerun-2", project_id=proj1.id)
 
     pkg1 = freeze_valuation_run_package(
-        db=db, project=proj1, run=run1, user=user,
-        basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+        db=db,
+        project=proj1,
+        run=run1,
+        user=user,
+        basis="STATUTORY",
+        methodology="VM22",
+        methodology_version="v2024.1",
         valuation_date="2026-12-31",
         valuation_parameters={"spread_bps": 125},
         source_projection_run_id=src_run.id,
     )
     pkg2 = freeze_valuation_run_package(
-        db=db, project=proj1, run=run2, user=user,
-        basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+        db=db,
+        project=proj1,
+        run=run2,
+        user=user,
+        basis="STATUTORY",
+        methodology="VM22",
+        methodology_version="v2024.1",
         valuation_date="2026-12-31",
         valuation_parameters={"spread_bps": 125},
         source_projection_run_id=src_run.id,
@@ -669,7 +743,6 @@ def test_service_submit_valuation_run_end_to_end(seeded_val_env):
     assert run_info["methodology"] == "VM22"
     assert run_info["status"] == "pending"
 
-    # Verify canonical database records
     persisted_run = db.get(Run, run_id)
     assert persisted_run is not None
     assert persisted_run.basis == "STATUTORY"
@@ -680,7 +753,6 @@ def test_service_submit_valuation_run_end_to_end(seeded_val_env):
     persisted_pkg = db.get(RunPackage, run_info["run_package_id"])
     assert persisted_pkg is not None
     assert persisted_pkg.package["configuration"]["model"]["id"] == "model-spia-01"
-    assert persisted_pkg is not None
     assert persisted_pkg.run_id == run_id
     assert persisted_pkg.fingerprint == run_info["run_package_fingerprint"]
     assert persisted_pkg.package["configuration"]["valuation"]["source_run_package_fingerprint"] == src_pkg.fingerprint
@@ -695,14 +767,13 @@ def test_service_submit_valuation_run_end_to_end(seeded_val_env):
 
 
 def test_rejection_of_caller_supplied_base_package_or_fake_build_sha(seeded_val_env):
-    """Blocker 2: Caller-supplied base_package_document and fake build identity are rejected; build identity is always from build_identity()."""
+    """P0-03 & Blocker 2: Caller-supplied base_package_document is explicitly rejected with 400 UNTRUSTED_PROVENANCE_FORBIDDEN."""
     db = seeded_val_env["session"]
     proj1 = seeded_val_env["proj1"]
     user = seeded_val_env["user"]
 
     src_run, _, _ = _seed_source_projection_run(db, proj1.id)
 
-    # Caller attempts to submit fake build SHA and fake formulas via base_package_document
     fake_caller_payload = {
         "project_id": proj1.id,
         "name": "Malicious Caller Submission",
@@ -722,15 +793,10 @@ def test_rejection_of_caller_supplied_base_package_or_fake_build_sha(seeded_val_
         },
     }
 
-    result = submit_valuation_run(db, fake_caller_payload, user)
-    val_pkg = db.get(RunPackage, result["run"]["run_package_id"])
-
-    # Must NOT contain fake caller build info or fake formulas
-    pkg_build = val_pkg.package["configuration"]["build"]
-    trusted_build = build_identity()
-    assert pkg_build["build_fingerprint"] == trusted_build["build_fingerprint"]
-    assert pkg_build["source_commit"] == trusted_build["source_commit"]
-    assert val_pkg.package["configuration"]["formulas"] != [{"id": "fake_formula"}]
+    with pytest.raises(ServiceError) as exc_info:
+        submit_valuation_run(db, fake_caller_payload, user)
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.code == "UNTRUSTED_PROVENANCE_FORBIDDEN"
 
 
 def test_rejection_of_tampered_source_run_package(seeded_val_env):
@@ -741,8 +807,6 @@ def test_rejection_of_tampered_source_run_package(seeded_val_env):
 
     src_run, src_pkg, _ = _seed_source_projection_run(db, proj1.id)
 
-    # Tamper with the package configuration bypassing ORM immutability via raw SQL
-    import sqlalchemy as sa
     tampered_package = copy.deepcopy(src_pkg.package)
     tampered_package["configuration"]["parameters"]["tampered_key"] = "malicious"
     db.execute(
@@ -756,8 +820,13 @@ def test_rejection_of_tampered_source_run_package(seeded_val_env):
 
     with pytest.raises(ServiceError) as exc_info:
         freeze_valuation_run_package(
-            db=db, project=proj1, run=target_run, user=user,
-            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            db=db,
+            project=proj1,
+            run=target_run,
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
             source_projection_run_id=src_run.id,
         )
     assert exc_info.value.code == "SOURCE_PACKAGE_TAMPERED"
@@ -776,8 +845,13 @@ def test_rejection_of_incomplete_source_run_status(seeded_val_env):
 
     with pytest.raises(ServiceError) as exc_info:
         freeze_valuation_run_package(
-            db=db, project=proj1, run=target_run, user=user,
-            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            db=db,
+            project=proj1,
+            run=target_run,
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
             source_projection_run_id=src_run.id,
         )
     assert exc_info.value.code == "INVALID_SOURCE_RUN_STATUS"
@@ -795,27 +869,35 @@ def test_physical_artifact_existence_and_checksum_verification(seeded_val_env):
     path = store.path_for_uri(src_art.storage_uri)
     assert path.exists()
 
-    # 1. Tamper with file content -> FINGERPRINT_MISMATCH
     original_bytes = path.read_bytes()
     path.write_bytes(original_bytes + b"corruption")
 
     target_run1 = Run(id="run-val-art-corrupt", project_id=proj1.id)
     with pytest.raises(ServiceError) as exc_info:
         freeze_valuation_run_package(
-            db=db, project=proj1, run=target_run1, user=user,
-            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            db=db,
+            project=proj1,
+            run=target_run1,
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
             source_projection_run_id=src_run.id,
         )
     assert exc_info.value.code == "FINGERPRINT_MISMATCH"
     assert exc_info.value.status_code == 400
 
-    # 2. Delete file -> PHYSICAL_ARTIFACT_MISSING
     path.unlink()
     target_run2 = Run(id="run-val-art-missing", project_id=proj1.id)
     with pytest.raises(ServiceError) as exc_info2:
         freeze_valuation_run_package(
-            db=db, project=proj1, run=target_run2, user=user,
-            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            db=db,
+            project=proj1,
+            run=target_run2,
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
             source_projection_run_id=src_run.id,
         )
     assert exc_info2.value.code == "PHYSICAL_ARTIFACT_MISSING"
@@ -832,8 +914,13 @@ def test_distinctness_of_source_run_package_fingerprint_vs_source_artifact_finge
 
     target_run = Run(id="run-val-distinct-fp", project_id=proj1.id)
     pkg = freeze_valuation_run_package(
-        db=db, project=proj1, run=target_run, user=user,
-        basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+        db=db,
+        project=proj1,
+        run=target_run,
+        user=user,
+        basis="STATUTORY",
+        methodology="VM22",
+        methodology_version="v2024.1",
         source_projection_run_id=src_run.id,
     )
 
@@ -843,23 +930,213 @@ def test_distinctness_of_source_run_package_fingerprint_vs_source_artifact_finge
 
     assert src_pkg_fp == src_pkg.fingerprint
     assert src_art_fp == src_art.checksum_sha256
-    # The package configuration hash is fundamentally distinct from the Parquet byte checksum
     assert src_pkg_fp != src_art_fp
 
 
-def test_rejection_of_missing_model_identity(seeded_val_env):
-    """Blocker 2: Zero fake defaults: valuation run fails closed with 400 MODEL_IDENTITY_REQUIRED when model identity cannot be established."""
+def test_rejection_of_missing_model_identity_and_missing_source(seeded_val_env):
+    """P0-03: Valuation run fails closed with 400 VALUATION_SOURCE_REQUIRED when no upstream source is provided."""
     db = seeded_val_env["session"]
     proj1 = seeded_val_env["proj1"]
     user = seeded_val_env["user"]
 
-    # Run without source run, without derived dataset, and without model_id
-    run_no_model = Run(id="run-val-no-model", project_id=proj1.id)
+    run_no_source = Run(id="run-val-no-source", project_id=proj1.id)
 
     with pytest.raises(ServiceError) as exc_info:
         freeze_valuation_run_package(
-            db=db, project=proj1, run=run_no_model, user=user,
-            basis="STATUTORY", methodology="VM22", methodology_version="v2024.1",
+            db=db,
+            project=proj1,
+            run=run_no_source,
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
         )
-    assert exc_info.value.code == "MODEL_IDENTITY_REQUIRED"
+    assert exc_info.value.code == "VALUATION_SOURCE_REQUIRED"
     assert exc_info.value.status_code == 400
+
+
+def test_p0_03_db_none_rejected(seeded_val_env):
+    """P0-03: Calling freeze_valuation_run_package with db=None fails closed with 500 DATABASE_REQUIRED."""
+    proj1 = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+    run = Run(id="run-val-db-none", project_id=proj1.id)
+
+    with pytest.raises(ServiceError) as exc_info:
+        freeze_valuation_run_package(
+            db=None,
+            project=proj1,
+            run=run,
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
+            source_projection_run_id="run-src-proj-1",
+        )
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.code == "DATABASE_REQUIRED"
+
+
+def test_p0_03_caller_invented_model_without_source_rejected(seeded_val_env):
+    """P0-03: Caller cannot bypass source verification by passing invented model_id and model_version_id."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+
+    run = Run(id="run-val-invented-model", project_id=proj1.id)
+    with pytest.raises(ServiceError) as exc_info:
+        freeze_valuation_run_package(
+            db=db,
+            project=proj1,
+            run=run,
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
+            model_id="fake-caller-model-999",
+            model_version_id="fake-caller-mv-999",
+        )
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.code == "VALUATION_SOURCE_REQUIRED"
+
+    with pytest.raises(ServiceError) as exc_sub:
+        submit_valuation_run(
+            db,
+            {
+                "project_id": proj1.id,
+                "name": "Fake Caller Model Valuation",
+                "basis": "STATUTORY",
+                "methodology": "VM22",
+                "methodology_version": "v2024.1",
+                "model_id": "fake-caller-model-999",
+                "model_version_id": "fake-caller-mv-999",
+            },
+            user,
+        )
+    assert exc_sub.value.status_code == 400
+    assert exc_sub.value.code == "VALUATION_SOURCE_REQUIRED"
+
+
+def test_p0_03_fabricated_foreign_unapproved_and_mismatched_model_selectors_rejected(seeded_val_env):
+    """P0-03: Fabricated, foreign-project, unapproved, and lineage-conflicting model/model_version selectors fail closed."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    proj2 = seeded_val_env["proj2"]
+    user = seeded_val_env["user"]
+
+    src_run, _, _ = _seed_source_projection_run(db, proj1.id, run_id="run-src-p003")
+
+    # 1. Fabricated model_id / model_version_id -> 400 MODEL_NOT_FOUND / MODEL_VERSION_NOT_FOUND
+    with pytest.raises(ServiceError) as exc_fab_m:
+        freeze_valuation_run_package(
+            db=db,
+            project=proj1,
+            run=Run(id="r-fab-m", project_id=proj1.id),
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
+            source_projection_run_id=src_run.id,
+            model_id="nonexistent-model-xyz",
+        )
+    assert exc_fab_m.value.status_code == 400
+    assert exc_fab_m.value.code == "MODEL_NOT_FOUND"
+
+    with pytest.raises(ServiceError) as exc_fab_mv:
+        submit_valuation_run(
+            db,
+            {
+                "project_id": proj1.id,
+                "name": "Fab MV",
+                "basis": "STATUTORY",
+                "methodology": "VM22",
+                "methodology_version": "v2024.1",
+                "source_projection_run_id": src_run.id,
+                "model_version_id": "nonexistent-mv-xyz",
+            },
+            user,
+        )
+    assert exc_fab_mv.value.status_code == 400
+    assert exc_fab_mv.value.code == "MODEL_VERSION_NOT_FOUND"
+
+    # 2. Foreign-project model / model_version -> 404
+    foreign_model, foreign_mv = _ensure_governed_spia_model(
+        db, proj2.id, model_id="model-foreign-p2", mv_id="mv-foreign-p2", mv_status="approved"
+    )
+    db.commit()
+
+    with pytest.raises(ServiceError) as exc_for_m:
+        freeze_valuation_run_package(
+            db=db,
+            project=proj1,
+            run=Run(id="r-for-m", project_id=proj1.id),
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
+            source_projection_run_id=src_run.id,
+            model_id=foreign_model.id,
+        )
+    assert exc_for_m.value.status_code == 404
+    assert exc_for_m.value.code == "MODEL_NOT_FOUND"
+
+    with pytest.raises(ServiceError) as exc_for_mv:
+        submit_valuation_run(
+            db,
+            {
+                "project_id": proj1.id,
+                "name": "Foreign MV",
+                "basis": "STATUTORY",
+                "methodology": "VM22",
+                "methodology_version": "v2024.1",
+                "source_projection_run_id": src_run.id,
+                "model_version_id": foreign_mv.id,
+            },
+            user,
+        )
+    assert exc_for_mv.value.status_code == 404
+    assert exc_for_mv.value.code == "MODEL_VERSION_NOT_FOUND"
+
+    # 3. Unapproved (draft) model_version in same project -> 400 MODEL_VERSION_NOT_APPROVED
+    _, draft_mv = _ensure_governed_spia_model(
+        db, proj1.id, model_id="model-spia-01", mv_id="mv-spia-draft-v2", mv_status="draft"
+    )
+    db.commit()
+
+    with pytest.raises(ServiceError) as exc_draft_mv:
+        freeze_valuation_run_package(
+            db=db,
+            project=proj1,
+            run=Run(id="r-draft-mv", project_id=proj1.id),
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
+            source_projection_run_id=src_run.id,
+            model_version_id=draft_mv.id,
+        )
+    assert exc_draft_mv.value.status_code == 400
+    assert exc_draft_mv.value.code == "MODEL_VERSION_NOT_APPROVED"
+
+    # 4. Approved model / model_version in same project that conflicts with source run lineage -> 400 MISMATCH
+    other_model, other_mv = _ensure_governed_spia_model(
+        db, proj1.id, model_id="model-other-p1", mv_id="mv-other-p1", mv_status="approved"
+    )
+    db.commit()
+
+    with pytest.raises(ServiceError) as exc_mismatch:
+        submit_valuation_run(
+            db,
+            {
+                "project_id": proj1.id,
+                "name": "Lineage Mismatch Valuation",
+                "basis": "STATUTORY",
+                "methodology": "VM22",
+                "methodology_version": "v2024.1",
+                "source_projection_run_id": src_run.id,
+                "model_id": other_model.id,
+                "model_version_id": other_mv.id,
+            },
+            user,
+        )
+    assert exc_mismatch.value.status_code == 400
+    assert exc_mismatch.value.code in ("MODEL_LINEAGE_MISMATCH", "MODEL_VERSION_LINEAGE_MISMATCH")

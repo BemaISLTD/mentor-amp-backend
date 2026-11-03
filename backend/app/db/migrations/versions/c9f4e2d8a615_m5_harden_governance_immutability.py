@@ -2,18 +2,40 @@
 
 Revision ID: c9f4e2d8a615
 Revises: b8f3d1e7c504
+
+Downgrade Governance & Data-Loss Policy:
+- Downgrading `valuation_run_details` from `c9f4e2d8a615` to `b8f3d1e7c504` restores
+  legacy columns (`project_id`, `source_projection_run_id`, `derived_dataset_id`,
+  `basis`, `methodology`, `methodology_version`) strictly from the parent `runs` row.
+  It NEVER fabricates default values (`'STATUTORY'`, `'VM22'`, `'v1'`). A preflight
+  check verifies that every `valuation_run_details` row has a valid parent `runs` row
+  with non-null `project_id`, `basis`, `methodology`, and `methodology_version` matching
+  the target check constraints; if any row is incomplete or invalid, downgrade fails
+  closed with an actionable `RuntimeError`.
+- Dropping `derived_datasets.source_model_version_id` during downgrade discards any
+  populated model-version lineage on `derived_datasets`. Preflight checks whether any
+  `derived_datasets` row has `source_model_version_id IS NOT NULL`; if populated,
+  downgrade fails closed unless `MENTORAMP_ALLOW_DATA_LOSS_DOWNGRADE=1` is explicitly
+  set in the environment.
 """
 
+import logging
+import os
 from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
 
 
+logger = logging.getLogger("alembic.runtime.migration")
+
 revision: str = "c9f4e2d8a615"
 down_revision: Union[str, Sequence[str], None] = "b8f3d1e7c504"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
+
+VALID_BASES = ("GAAP", "STATUTORY", "TAX")
+VALID_METHODOLOGIES = ("VM21", "VM22", "LDTI", "DAC", "MRB", "ASC815")
 
 
 def upgrade() -> None:
@@ -50,11 +72,6 @@ def upgrade() -> None:
 
     # 3. Harden PostgreSQL immutability triggers (Directives 4, 8 & 9)
     if bind.dialect.name == "postgresql":
-        # Directives 4 & 8: Close loopholes on derived_datasets
-        # - approved status can only remain approved or transition to superseded (no draft/validated/arbitrary)
-        # - superseded status is terminal
-        # - soft-delete on approved or superseded evidence is blocked
-        # - material evidence is strictly immutable
         op.execute("""
             CREATE OR REPLACE FUNCTION mentoramp_protect_derived_datasets() RETURNS trigger AS $$
             BEGIN
@@ -140,9 +157,84 @@ def upgrade() -> None:
         """)
 
 
+def _preflight_downgrade_checks(bind: sa.engine.Connection) -> None:
+    """Fail closed before downgrade if parent runs metadata is missing/invalid or unacknowledged data loss would occur."""
+    # 1. Check for orphan valuation_run_details rows without a parent runs row
+    orphan_rows = bind.execute(
+        sa.text("""
+            SELECT v.run_id
+            FROM valuation_run_details v
+            LEFT JOIN runs r ON v.run_id = r.id
+            WHERE r.id IS NULL
+        """)
+    ).fetchall()
+    if orphan_rows:
+        orphan_ids = [row[0] for row in orphan_rows]
+        raise RuntimeError(
+            "Downgrade preflight failed: orphan valuation_run_details rows without parent runs row: "
+            f"{orphan_ids}. Remediate orphan rows before downgrading to b8f3d1e7c504."
+        )
+
+    # 2. Check for parent runs rows with NULL or invalid basis/methodology/methodology_version/project_id
+    invalid_parent_rows = bind.execute(
+        sa.text("""
+            SELECT v.run_id, r.project_id, r.basis, r.methodology, r.methodology_version
+            FROM valuation_run_details v
+            JOIN runs r ON v.run_id = r.id
+            WHERE r.project_id IS NULL
+               OR r.basis IS NULL
+               OR r.methodology IS NULL
+               OR r.methodology_version IS NULL
+               OR r.basis NOT IN ('GAAP', 'STATUTORY', 'TAX')
+               OR r.methodology NOT IN ('VM21', 'VM22', 'LDTI', 'DAC', 'MRB', 'ASC815')
+        """)
+    ).fetchall()
+    if invalid_parent_rows:
+        details = [
+            {
+                "run_id": row[0],
+                "project_id": row[1],
+                "basis": row[2],
+                "methodology": row[3],
+                "methodology_version": row[4],
+            }
+            for row in invalid_parent_rows
+        ]
+        raise RuntimeError(
+            "Downgrade preflight failed: parent runs rows for valuation_run_details contain NULL or invalid "
+            f"governance metadata (refusing to fabricate fallback defaults): {details}"
+        )
+
+    # 3. Check for populated derived_datasets.source_model_version_id data-loss risk
+    populated_mv_rows = bind.execute(
+        sa.text("""
+            SELECT id, source_model_version_id
+            FROM derived_datasets
+            WHERE source_model_version_id IS NOT NULL
+        """)
+    ).fetchall()
+    if populated_mv_rows:
+        allow_override = os.environ.get("MENTORAMP_ALLOW_DATA_LOSS_DOWNGRADE") == "1"
+        lineage_map = {row[0]: row[1] for row in populated_mv_rows}
+        if not allow_override:
+            raise RuntimeError(
+                "Downgrade preflight failed: derived_datasets.source_model_version_id is populated on "
+                f"{len(populated_mv_rows)} row(s) ({lineage_map}). Dropping this column will discard governed "
+                "model-version lineage. Set MENTORAMP_ALLOW_DATA_LOSS_DOWNGRADE=1 to acknowledge and proceed."
+            )
+        logger.warning(
+            "MENTORAMP_ALLOW_DATA_LOSS_DOWNGRADE=1 acknowledged; dropping derived_datasets.source_model_version_id "
+            "for rows: %s",
+            lineage_map,
+        )
+
+
 def downgrade() -> None:
     bind = op.get_bind()
     is_postgres = (bind.dialect.name == "postgresql")
+
+    # 0. Fail-closed preflight verification before mutating schema or triggers
+    _preflight_downgrade_checks(bind)
 
     # 1. Restore b8 triggers and functions on PostgreSQL (Directive 5)
     if is_postgres:
@@ -197,7 +289,7 @@ def downgrade() -> None:
         batch_op.add_column(sa.Column("methodology", sa.String(50), nullable=True))
         batch_op.add_column(sa.Column("methodology_version", sa.String(50), nullable=True))
 
-    # 2b. Backfill existing rows from canonical parent runs table
+    # 2b. Backfill existing rows strictly from canonical parent runs table (zero COALESCE fabrication)
     if is_postgres:
         op.execute("""
             UPDATE valuation_run_details v
@@ -205,9 +297,9 @@ def downgrade() -> None:
                 project_id = r.project_id,
                 source_projection_run_id = r.source_projection_run_id,
                 derived_dataset_id = r.derived_dataset_id,
-                basis = COALESCE(r.basis, 'STATUTORY'),
-                methodology = COALESCE(r.methodology, 'VM22'),
-                methodology_version = COALESCE(r.methodology_version, 'v1')
+                basis = r.basis,
+                methodology = r.methodology,
+                methodology_version = r.methodology_version
             FROM runs r
             WHERE v.run_id = r.id;
         """)
@@ -218,9 +310,9 @@ def downgrade() -> None:
                 project_id = (SELECT project_id FROM runs WHERE runs.id = valuation_run_details.run_id),
                 source_projection_run_id = (SELECT source_projection_run_id FROM runs WHERE runs.id = valuation_run_details.run_id),
                 derived_dataset_id = (SELECT derived_dataset_id FROM runs WHERE runs.id = valuation_run_details.run_id),
-                basis = COALESCE((SELECT basis FROM runs WHERE runs.id = valuation_run_details.run_id), 'STATUTORY'),
-                methodology = COALESCE((SELECT methodology FROM runs WHERE runs.id = valuation_run_details.run_id), 'VM22'),
-                methodology_version = COALESCE((SELECT methodology_version FROM runs WHERE runs.id = valuation_run_details.run_id), 'v1')
+                basis = (SELECT basis FROM runs WHERE runs.id = valuation_run_details.run_id),
+                methodology = (SELECT methodology FROM runs WHERE runs.id = valuation_run_details.run_id),
+                methodology_version = (SELECT methodology_version FROM runs WHERE runs.id = valuation_run_details.run_id)
             WHERE EXISTS (SELECT 1 FROM runs WHERE runs.id = valuation_run_details.run_id);
         """)
 

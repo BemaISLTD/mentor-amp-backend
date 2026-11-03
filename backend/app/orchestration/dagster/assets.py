@@ -47,6 +47,7 @@ DEFAULT_RETRY_POLICY = RetryPolicy(max_retries=3, delay=1, backoff=None)
 class InforceConfig(Config):
     project_id: str = "proj-m5-valuation-default"
     policy_block: str = "BLOCK_MYGA_2026"
+    inforce_file_id: str | None = None
 
 
 class ProjectionConfig(Config):
@@ -55,6 +56,9 @@ class ProjectionConfig(Config):
     annual_credited_rate: float = 0.045
     annual_surrender_rate: float = 0.02
     run_id: str = "run-m5-dagster-projection-001"
+    projection_set_id: str | None = None
+    model_version_id: str | None = None
+    scenario_id: str | None = None
 
 
 class ValuationConfig(Config):
@@ -65,8 +69,10 @@ class ValuationConfig(Config):
 
 
 class ReconciliationConfig(Config):
-    expected_benchmark: float | None = None
+    expected_result_set_id: str | None = None
+    target_metric: str = "present_value_reserve"
     tolerance: float = 0.01
+    rel_tol: float = 1e-4
 
 
 @asset(
@@ -78,7 +84,7 @@ def inforce_data_asset(
     context: AssetExecutionContext,
     config: InforceConfig,
 ) -> Output[dict[str, Any]]:
-    """Ingest inforce policy block and verify schema integrity through domain service."""
+    """Ingest governed inforce policy block and verify schema integrity through domain service."""
     context.log.info(f"Delegating inforce ingestion to service for project '{config.project_id}'.")
     with db_mod.SessionLocal() as db:
         try:
@@ -86,10 +92,10 @@ def inforce_data_asset(
                 db=db,
                 project_id=config.project_id,
                 policy_block=config.policy_block,
+                inforce_file_id=config.inforce_file_id,
             )
         except ServiceError as e:
-            allow_retries = e.status_code >= 500
-            if allow_retries:
+            if e.status_code >= 500:
                 raise RetryRequested(max_retries=3, seconds_to_wait=1.0) from e
             raise Failure(description=f"Inforce ingestion failed: {e.message}", allow_retries=False) from e
         except Exception as e:
@@ -99,6 +105,7 @@ def inforce_data_asset(
         value=payload,
         metadata={
             "project_id": MetadataValue.text(payload["project_id"]),
+            "inforce_file_id": MetadataValue.text(payload["inforce_file_id"]),
             "policy_block": MetadataValue.text(payload["policy_block"]),
             "record_count": MetadataValue.int(payload["record_count"]),
             "fingerprint": MetadataValue.text(payload["fingerprint"]),
@@ -119,13 +126,16 @@ def validation_asset(
 ) -> Output[dict[str, Any]]:
     """Validate policy attributes and product mappings through domain service."""
     context.log.info(f"Validating inforce data with fingerprint {inforce_data_asset['fingerprint']}.")
-    try:
-        result = execute_inforce_validation(inforce_data_asset)
-        result["project_id"] = inforce_data_asset["project_id"]
-    except ServiceError as e:
-        raise Failure(description=e.message, allow_retries=False) from e
-    except Exception as e:
-        raise Failure(description=f"Validation error: {e}", allow_retries=False) from e
+    with db_mod.SessionLocal() as db:
+        try:
+            result = execute_inforce_validation(inforce_data_asset, db=db)
+            result["project_id"] = inforce_data_asset["project_id"]
+        except ServiceError as e:
+            if e.status_code >= 500:
+                raise RetryRequested(max_retries=3, seconds_to_wait=1.0) from e
+            raise Failure(description=e.message, allow_retries=False) from e
+        except Exception as e:
+            raise Failure(description=f"Validation error: {e}", allow_retries=False) from e
 
     return Output(
         value=result,
@@ -150,7 +160,7 @@ def projection_run_asset(
     config: ProjectionConfig,
     validation_asset: dict[str, Any],
 ) -> Output[dict[str, Any]]:
-    """Run projection simulation, persist real Parquet file, and emit persisted lineage."""
+    """Run projection simulation via shared engine, persist real Parquet file, and emit persisted lineage."""
     context.log.info(f"Invoking projection service for {config.projection_months} months.")
     project_id = validation_asset.get("project_id", config.project_id)
     with db_mod.SessionLocal() as db:
@@ -163,10 +173,12 @@ def projection_run_asset(
                 annual_credited_rate=config.annual_credited_rate,
                 annual_surrender_rate=config.annual_surrender_rate,
                 run_id=config.run_id,
+                projection_set_id=config.projection_set_id,
+                model_version_id=config.model_version_id,
+                scenario_id=config.scenario_id,
             )
         except ServiceError as e:
-            allow_retries = e.status_code >= 500
-            if allow_retries:
+            if e.status_code >= 500:
                 raise RetryRequested(max_retries=3, seconds_to_wait=1.0) from e
             raise Failure(description=f"Projection failed: {e.message}", allow_retries=False) from e
         except Exception as e:
@@ -177,6 +189,8 @@ def projection_run_asset(
         metadata={
             "run_id": MetadataValue.text(result["run_id"]),
             "artifact_id": MetadataValue.text(result["artifact_id"]),
+            "model_id": MetadataValue.text(result["model_id"]),
+            "model_version_id": MetadataValue.text(result["model_version_id"]),
             "time_steps": MetadataValue.int(result["time_steps"]),
             "row_count": MetadataValue.int(result["row_count"]),
             "artifact_fingerprint": MetadataValue.text(result["artifact_fingerprint"]),
@@ -190,6 +204,7 @@ def projection_run_asset(
 @asset(
     group_name="actuarial_pipeline",
     description="Aggregate cash flows across cohorts via Polars (flows sum; stocks end-of-period).",
+    retry_policy=DEFAULT_RETRY_POLICY,
 )
 def aggregation_asset(
     context: AssetExecutionContext,
@@ -202,12 +217,12 @@ def aggregation_asset(
             result = execute_cash_flow_aggregation(
                 db=db,
                 projection_run_id=projection_run_asset["run_id"],
+                artifact_id=projection_run_asset.get("artifact_id"),
                 storage_uri=projection_run_asset.get("storage_uri"),
-                simulation_rows=projection_run_asset.get("simulation_rows"),
+                project_id=projection_run_asset.get("project_id"),
             )
         except ServiceError as e:
-            allow_retries = e.status_code >= 500
-            if allow_retries:
+            if e.status_code >= 500:
                 raise RetryRequested(max_retries=3, seconds_to_wait=1.0) from e
             raise Failure(description=f"Aggregation failed: {e.message}", allow_retries=False) from e
         except Exception as e:
@@ -217,6 +232,7 @@ def aggregation_asset(
         value=result,
         metadata={
             "upstream_run_id": MetadataValue.text(result["upstream_run_id"]),
+            "verified_artifact_id": MetadataValue.text(result["verified_artifact_id"]),
             "total_cash_flow_sum": MetadataValue.float(result["total_cash_flow_sum"]),
             "ending_stock": MetadataValue.float(result["ending_account_value_stock"]),
             "cohort_id": MetadataValue.text(result["cohort_id"]),
@@ -230,6 +246,7 @@ def aggregation_asset(
 @asset(
     group_name="actuarial_pipeline",
     description="Calculate TVOM generic present value reserve via domain service (gated VM21/VM22).",
+    retry_policy=DEFAULT_RETRY_POLICY,
 )
 def valuation_asset(
     context: AssetExecutionContext,
@@ -251,8 +268,7 @@ def valuation_asset(
                 project_id=aggregation_asset["project_id"],
             )
         except ServiceError as e:
-            allow_retries = e.status_code >= 500
-            if allow_retries:
+            if e.status_code >= 500:
                 raise RetryRequested(max_retries=3, seconds_to_wait=1.0) from e
             raise Failure(description=f"Valuation failed: {e.message}", allow_retries=False) from e
         except Exception as e:
@@ -278,34 +294,26 @@ def valuation_asset(
 @asset(
     group_name="actuarial_pipeline",
     description="Execute attribution framework and verify Beginning + Sum(Movements) = Ending.",
+    retry_policy=DEFAULT_RETRY_POLICY,
 )
 def rollforward_asset(
     context: AssetExecutionContext,
     valuation_asset: dict[str, Any],
     aggregation_asset: dict[str, Any],
 ) -> Output[dict[str, Any]]:
-    """Execute rollforward continuity validation and persist summary via domain service."""
+    """Execute rollforward continuity validation and persist summary derived from parent valuation run."""
     context.log.info("Validating accounting rollforward continuity via domain service.")
-    opening = Decimal("5000.00")
-    movements = {
-        "new_business": Decimal("500.00"),
-        "contractual_cash_flows": Decimal("320.00"),
-        "economic_revaluation": Decimal("180.00"),
-    }
-    ending = Decimal("6000.00")
-
     with db_mod.SessionLocal() as db:
         try:
             result = execute_rollforward_attribution(
                 db=db,
                 valuation_run_id=valuation_asset["valuation_run_id"],
                 project_id=valuation_asset["project_id"],
-                opening=opening,
-                movements=movements,
-                ending=ending,
                 tolerance=Decimal("0.01"),
             )
         except ServiceError as e:
+            if e.status_code >= 500:
+                raise RetryRequested(max_retries=3, seconds_to_wait=1.0) from e
             raise Failure(description=e.message, allow_retries=False) from e
         except Exception as e:
             raise Failure(description=f"Rollforward error: {e}", allow_retries=False) from e
@@ -317,6 +325,9 @@ def rollforward_asset(
             "opening_balance": MetadataValue.float(result["opening_balance"]),
             "ending_balance": MetadataValue.float(result["ending_balance"]),
             "difference": MetadataValue.float(result["difference"]),
+            "cohort_id": MetadataValue.text(result["cohort_id"]),
+            "basis": MetadataValue.text(result["basis"]),
+            "methodology": MetadataValue.text(result["methodology"]),
             "summary_id": MetadataValue.text(result["summary_id"]),
             "started_at": MetadataValue.text(result["started_at"]),
             "completed_at": MetadataValue.text(result["completed_at"]),
@@ -326,7 +337,8 @@ def rollforward_asset(
 
 @asset(
     group_name="actuarial_pipeline",
-    description="Audit actual valuation against benchmarks using three-state reconciliation.",
+    description="Audit actual valuation against governed benchmarks using three-state reconciliation.",
+    retry_policy=DEFAULT_RETRY_POLICY,
 )
 def reconciliation_report_asset(
     context: AssetExecutionContext,
@@ -344,10 +356,14 @@ def reconciliation_report_asset(
                 valuation_run_id=valuation_asset["valuation_run_id"],
                 project_id=valuation_asset["project_id"],
                 actual_reserve=actual_reserve,
-                expected_benchmark=config.expected_benchmark,
+                expected_result_set_id=config.expected_result_set_id,
+                target_metric=config.target_metric,
                 tolerance=config.tolerance,
+                rel_tol=config.rel_tol,
             )
         except ServiceError as e:
+            if e.status_code >= 500:
+                raise RetryRequested(max_retries=3, seconds_to_wait=1.0) from e
             raise Failure(description=f"Reconciliation error: {e.message}", allow_retries=False) from e
         except Exception as e:
             raise Failure(description=f"Unexpected reconciliation error: {e}", allow_retries=False) from e
@@ -360,8 +376,10 @@ def reconciliation_report_asset(
         "started_at": MetadataValue.text(report["started_at"]),
         "completed_at": MetadataValue.text(report["completed_at"]),
     }
-    if config.expected_benchmark is not None:
-        report_metadata["expected_benchmark"] = MetadataValue.float(config.expected_benchmark)
+    if report.get("expected_result_set_id") is not None:
+        report_metadata["expected_result_set_id"] = MetadataValue.text(report["expected_result_set_id"])
+    if report.get("expected_benchmark") is not None:
+        report_metadata["expected_benchmark"] = MetadataValue.float(report["expected_benchmark"])
 
     return Output(
         value=report,
@@ -372,6 +390,7 @@ def reconciliation_report_asset(
 @asset(
     group_name="actuarial_pipeline",
     description="Assemble reproducible disclosure package and export manifest via domain service.",
+    retry_policy=DEFAULT_RETRY_POLICY,
 )
 def reporting_asset(
     context: AssetExecutionContext,
@@ -392,6 +411,8 @@ def reporting_asset(
                 reconciliation_result=reconciliation_report_asset,
             )
         except ServiceError as e:
+            if e.status_code >= 500:
+                raise RetryRequested(max_retries=3, seconds_to_wait=1.0) from e
             raise Failure(description=f"Reporting failed: {e.message}", allow_retries=False) from e
         except Exception as e:
             raise Failure(description=f"Unexpected reporting error: {e}", allow_retries=False) from e

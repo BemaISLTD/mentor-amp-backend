@@ -229,6 +229,11 @@ def submit_valuation_run(db: Session, payload: dict[str, Any], user: Any) -> dic
         raise ServiceError(422, "VALIDATION_ERROR", "Field 'project_id' is required.")
 
     project = access.require_project_access(db, user, project_id, write=True)
+    if "base_package_document" in payload and payload["base_package_document"] is not None:
+        raise ServiceError(
+            400, "UNTRUSTED_PROVENANCE_FORBIDDEN",
+            "Caller-supplied 'base_package_document' is forbidden; valuation provenance must be resolved from PostgreSQL.",
+        )
     basis = payload.get("basis")
     if not basis:
         raise ServiceError(422, "VALIDATION_ERROR", "Field 'basis' is required.")

@@ -816,10 +816,28 @@ def freeze_valuation_run_package(
     if basis == "TAX":
         raise ServiceError(400, "UNSUPPORTED_VALUATION_BASIS", "TAX basis is explicitly not supported at launch.")
 
+    if db is None:
+        raise ServiceError(
+            500, "DATABASE_REQUIRED",
+            "Governed valuation RunPackage freezing requires an active database session.",
+        )
+
+    if not source_projection_run_id and not derived_dataset_id:
+        raise ServiceError(
+            400, "VALUATION_SOURCE_REQUIRED",
+            "Valuation runs require an authoritative upstream source (source_projection_run_id or derived_dataset_id).",
+        )
+
     proj_id = getattr(project, "id", str(project)) if project else None
     run_proj_id = getattr(run, "project_id", None)
     if proj_id and run_proj_id and run_proj_id != proj_id:
         raise ServiceError(404, "RUN_NOT_FOUND", f"Run not found in project '{proj_id}'.")
+
+    if model_id == "model-default" or model_version_id == "mv-default":
+        raise ServiceError(
+            400, "MODEL_IDENTITY_REQUIRED",
+            "Fake default model identities ('model-default' / 'mv-default') are forbidden.",
+        )
 
     model_dict: dict[str, Any] | None = None
     model_version_dict: dict[str, Any] | None = None
@@ -831,7 +849,7 @@ def freeze_valuation_run_package(
     source_run_package_fingerprint: str | None = None
 
     # 1. Provenance from source projection run
-    if source_projection_run_id and db is not None:
+    if source_projection_run_id:
         source_run = db.get(Run, source_projection_run_id)
         if source_run is None or (proj_id and source_run.project_id != proj_id):
             raise ServiceError(404, "RUN_NOT_FOUND", f"Source projection run '{source_projection_run_id}' not found in project '{proj_id}'.")
@@ -942,7 +960,7 @@ def freeze_valuation_run_package(
             )
 
     # 2. Provenance from derived dataset
-    if derived_dataset_id and db is not None:
+    if derived_dataset_id:
         from app.db.models.governance import DerivedDataset
         dataset = db.get(DerivedDataset, derived_dataset_id)
         if dataset is None or (proj_id and dataset.project_id != proj_id):
@@ -967,69 +985,145 @@ def freeze_valuation_run_package(
         derived_dataset_fingerprint = dataset.fingerprint
 
         if not model_dict and dataset.source_model_id:
-            model_dict = {"id": dataset.source_model_id, "product_code": getattr(dataset, "product_code", None) or "M5"}
+            db_src_model = db.get(Model, dataset.source_model_id)
+            if db_src_model and (not proj_id or db_src_model.project_id == proj_id):
+                model_dict = {
+                    "id": db_src_model.id,
+                    "name": db_src_model.name,
+                    "product_code": db_src_model.product_code,
+                }
+            else:
+                model_dict = {"id": dataset.source_model_id, "product_code": getattr(dataset, "product_code", None) or "M5"}
         if not model_version_dict and dataset.source_model_version_id:
-            model_version_dict = {
-                "id": dataset.source_model_version_id,
-                "version_label": "v1.0",
-                "basis": basis,
-                "methodology": methodology,
-                "methodology_version": methodology_version,
-            }
+            db_src_mv = db.get(ModelVersion, dataset.source_model_version_id)
+            if db_src_mv:
+                model_version_dict = {
+                    "id": db_src_mv.id,
+                    "version_label": db_src_mv.version_label,
+                    "basis": basis,
+                    "methodology": methodology,
+                    "methodology_version": methodology_version,
+                }
+            else:
+                model_version_dict = {
+                    "id": dataset.source_model_version_id,
+                    "version_label": "v1.0",
+                    "basis": basis,
+                    "methodology": methodology,
+                    "methodology_version": methodology_version,
+                }
 
         if hasattr(dataset, "source_artifact_id") and dataset.source_artifact_id:
             art = db.get(RunArtifact, dataset.source_artifact_id)
-            if art:
-                source_artifact_id = art.id
-                if source_artifact_fingerprint and source_artifact_fingerprint != art.checksum_sha256:
-                    raise ServiceError(
-                        400, "FINGERPRINT_MISMATCH",
-                        f"Source artifact fingerprint mismatch: expected '{art.checksum_sha256}', got '{source_artifact_fingerprint}'.",
-                    )
-                source_artifact_fingerprint = art.checksum_sha256
-                from app.core.artifacts import get_artifact_store
-                store = get_artifact_store()
-                try:
-                    path = store.path_for_uri(art.storage_uri)
-                except Exception as exc:
-                    raise ServiceError(400, "PHYSICAL_ARTIFACT_MISSING", f"Failed to resolve artifact path: {exc}") from exc
-                if not path.exists():
-                    raise ServiceError(
-                        400, "PHYSICAL_ARTIFACT_MISSING",
-                        f"Physical artifact file does not exist at storage URI: {art.storage_uri}",
-                    )
-                actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
-                if actual_sha != art.checksum_sha256:
-                    raise ServiceError(
-                        400, "FINGERPRINT_MISMATCH",
-                        f"Physical artifact content SHA-256 ({actual_sha}) does not match recorded checksum ({art.checksum_sha256}).",
-                    )
+            if art is None:
+                raise ServiceError(
+                    404, "ARTIFACT_NOT_FOUND",
+                    f"Derived dataset source artifact '{dataset.source_artifact_id}' not found.",
+                )
+            source_artifact_id = art.id
+            if source_artifact_fingerprint and source_artifact_fingerprint != art.checksum_sha256:
+                raise ServiceError(
+                    400, "FINGERPRINT_MISMATCH",
+                    f"Source artifact fingerprint mismatch: expected '{art.checksum_sha256}', got '{source_artifact_fingerprint}'.",
+                )
+            source_artifact_fingerprint = art.checksum_sha256
+            from app.core.artifacts import get_artifact_store
+            store = get_artifact_store()
+            try:
+                path = store.path_for_uri(art.storage_uri)
+            except Exception as exc:
+                raise ServiceError(400, "PHYSICAL_ARTIFACT_MISSING", f"Failed to resolve artifact path: {exc}") from exc
+            if not path.exists():
+                raise ServiceError(
+                    400, "PHYSICAL_ARTIFACT_MISSING",
+                    f"Physical artifact file does not exist at storage URI: {art.storage_uri}",
+                )
+            actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            if actual_sha != art.checksum_sha256:
+                raise ServiceError(
+                    400, "FINGERPRINT_MISMATCH",
+                    f"Physical artifact content SHA-256 ({actual_sha}) does not match recorded checksum ({art.checksum_sha256}).",
+                )
 
-    # 3. Direct model parameters on run
-    if not model_dict and (model_id or getattr(run, "model_id", None)):
-        effective_mid = model_id or getattr(run, "model_id", None)
-        model_dict = {"id": effective_mid, "product_code": getattr(run, "projection_key", None) or "M5"}
-    if not model_version_dict and (model_version_id or getattr(run, "model_version_id", None)):
-        effective_mvid = model_version_id or getattr(run, "model_version_id", None)
-        model_version_dict = {
-            "id": effective_mvid,
-            "version_label": "v1.0",
-            "basis": basis,
-            "methodology": methodology,
-            "methodology_version": methodology_version,
-        }
+    # 3. Validate any caller-supplied model_id / model_version_id selectors against DB and authoritative lineage
+    if model_id:
+        db_model = db.get(Model, model_id)
+        if db_model is None:
+            raise ServiceError(
+                400, "MODEL_NOT_FOUND",
+                f"Caller-supplied model_id '{model_id}' does not exist in database.",
+            )
+        if proj_id and db_model.project_id != proj_id:
+            raise ServiceError(
+                404, "MODEL_NOT_FOUND",
+                f"Model '{model_id}' not found in project '{proj_id}'.",
+            )
+        if db_model.deleted_at is not None or db_model.status not in ("active", "validated", "approved", "published"):
+            raise ServiceError(
+                400, "MODEL_NOT_APPROVED",
+                f"Model '{model_id}' is not in a runnable/approved governance state (status: {db_model.status}).",
+            )
+        if model_dict and model_dict.get("id") and model_dict["id"] != model_id:
+            raise ServiceError(
+                400, "MODEL_LINEAGE_MISMATCH",
+                f"Caller-supplied model_id '{model_id}' conflicts with authoritative source model '{model_dict['id']}'.",
+            )
 
-    # 4. Zero fake identity defaults: fail if model identity cannot be established
+    if model_version_id:
+        db_mv = db.get(ModelVersion, model_version_id)
+        if db_mv is None:
+            raise ServiceError(
+                400, "MODEL_VERSION_NOT_FOUND",
+                f"Caller-supplied model_version_id '{model_version_id}' does not exist in database.",
+            )
+        parent_model = db.get(Model, db_mv.model_id)
+        if parent_model is None or (proj_id and parent_model.project_id != proj_id):
+            raise ServiceError(
+                404, "MODEL_VERSION_NOT_FOUND",
+                f"Model version '{model_version_id}' not found in project '{proj_id}'.",
+            )
+        if db_mv.deleted_at is not None or db_mv.status not in ("validated", "approved", "published"):
+            raise ServiceError(
+                400, "MODEL_VERSION_NOT_APPROVED",
+                f"Model version '{model_version_id}' is not in a runnable/approved governance state (status: {db_mv.status}).",
+            )
+        if model_version_dict and model_version_dict.get("id") and model_version_dict["id"] != model_version_id:
+            raise ServiceError(
+                400, "MODEL_VERSION_LINEAGE_MISMATCH",
+                f"Caller-supplied model_version_id '{model_version_id}' conflicts with authoritative source model version '{model_version_dict['id']}'.",
+            )
+
+    # 4. Zero fake identity defaults: fail if model identity cannot be established from authoritative source
     if not model_dict or not model_dict.get("id") or model_dict["id"] == "model-default":
         raise ServiceError(
             400, "MODEL_IDENTITY_REQUIRED",
-            "Valuation runs require verified model identity derived from trusted source run, approved dataset, or validated model.",
+            "Valuation runs require verified model identity derived from trusted source run or approved dataset.",
         )
     if not model_version_dict or not model_version_dict.get("id") or model_version_dict["id"] == "mv-default":
         raise ServiceError(
             400, "MODEL_IDENTITY_REQUIRED",
-            "Valuation runs require verified model version identity derived from trusted source run, approved dataset, or validated model.",
+            "Valuation runs require verified model version identity derived from trusted source run or approved dataset.",
         )
+
+    # Verify authoritative model / model_version row in database if present
+    auth_model = db.get(Model, model_dict["id"])
+    if auth_model is not None:
+        if proj_id and auth_model.project_id != proj_id:
+            raise ServiceError(404, "MODEL_NOT_FOUND", f"Model '{auth_model.id}' not found in project '{proj_id}'.")
+        if auth_model.deleted_at is not None or auth_model.status not in ("active", "validated", "approved", "published"):
+            raise ServiceError(
+                400, "MODEL_NOT_APPROVED",
+                f"Authoritative model '{auth_model.id}' is not in an approved/validated state (status: {auth_model.status}).",
+            )
+    auth_mv = db.get(ModelVersion, model_version_dict["id"])
+    if auth_mv is not None:
+        if auth_model is not None and auth_mv.model_id != auth_model.id:
+            raise ServiceError(400, "MODEL_LINEAGE_MISMATCH", "ModelVersion does not belong to Model.")
+        if auth_mv.deleted_at is not None or auth_mv.status not in ("validated", "approved", "published"):
+            raise ServiceError(
+                400, "MODEL_VERSION_NOT_APPROVED",
+                f"Authoritative model version '{auth_mv.id}' is not in an approved/validated state (status: {auth_mv.status}).",
+            )
 
     model_version_dict["basis"] = basis
     model_version_dict["methodology"] = methodology
