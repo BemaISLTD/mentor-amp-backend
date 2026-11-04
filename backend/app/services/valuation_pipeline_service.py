@@ -26,6 +26,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 import hashlib
 import json
+import math
 from typing import Any
 import uuid
 
@@ -470,16 +471,21 @@ def execute_projection_simulation(
             f"Model '{model.id}' (status: '{model.status}') is not in a runnable governance state.",
         )
 
-    # Require approved / published ModelVersion with independent approval evidence
-    if mv.status not in ("approved", "published") or mv.approved_at is None:
+    # Require approved / published ModelVersion with independent approval evidence (V6-P1-05)
+    if (
+        mv.status not in ("approved", "published")
+        or mv.approved_at is None
+        or not mv.approved_by
+        or not mv.created_by
+    ):
         raise ServiceError(
             400, "MODEL_VERSION_NOT_APPROVED",
-            f"ModelVersion '{mv.id}' (status: '{mv.status}') must be approved for governed execution.",
+            f"ModelVersion '{mv.id}' (status: '{mv.status}') must be approved with recorded approver and creator for governed execution.",
         )
-    if mv.approved_by and mv.created_by and mv.approved_by == mv.created_by:
+    if mv.approved_by == mv.created_by:
         raise ServiceError(
             400, "SELF_APPROVED_MODEL_FORBIDDEN",
-            f"ModelVersion '{mv.id}' violates four-eyes governance (created_by == approved_by).",
+            f"ModelVersion '{mv.id}' violates four-eyes governance: created_by ('{mv.created_by}') cannot match approved_by ('{mv.approved_by}').",
         )
 
     # Enforce strict product family match between inforce policies and Model.product_code (P0-02)
@@ -550,7 +556,7 @@ def execute_projection_simulation(
     if actor is None:
         actor = db.query(User).first()
 
-    # V5-P1-G: Check if effective_run_id already exists from an interrupted/retried execution
+    # V6-P0-01: Check if effective_run_id already exists from an interrupted/retried execution
     existing_run = db.get(Run, effective_run_id)
     if existing_run is not None:
         if (
@@ -566,9 +572,33 @@ def execute_projection_simulation(
                 "RUN_ID_CONFLICT",
                 f"Run '{effective_run_id}' already exists with different governed parameters.",
             )
-        ps = db.get(ProjectionSet, existing_run.projection_set_id) if existing_run.projection_set_id else ps
 
-    if ps is None or ps.inforce_file_ids != [inforce_file.id] or ps.horizon_months != projection_months or ps.valuation_date != parsed_val_date:
+        existing_ps = db.get(ProjectionSet, existing_run.projection_set_id) if existing_run.projection_set_id else None
+        if existing_ps is not None:
+            if existing_ps.inforce_file_ids != [inforce_file.id]:
+                raise ServiceError(
+                    409,
+                    "RUN_RETRY_LINEAGE_MISMATCH",
+                    f"Run '{effective_run_id}' was frozen with inforce files {existing_ps.inforce_file_ids}, "
+                    f"but retry requested inforce file '{inforce_file.id}'. Cannot replay existing run under different inforce lineage.",
+                )
+            ps = existing_ps
+
+        pkg_row_check = db.query(RunPackage).filter(RunPackage.run_id == existing_run.id).first()
+        if pkg_row_check is not None and pkg_row_check.package:
+            inforce_list = (pkg_row_check.package.get("configuration", {}) or {}).get("datasets", {}).get("inforce", [])
+            if inforce_list:
+                frozen_ids = [f.get("id") for f in inforce_list if isinstance(f, dict)]
+                frozen_fps = [f.get("fingerprint") for f in inforce_list if isinstance(f, dict)]
+                if inforce_file.id not in frozen_ids or inforce_file.fingerprint not in frozen_fps:
+                    raise ServiceError(
+                        409,
+                        "RUN_RETRY_LINEAGE_MISMATCH",
+                        f"Run '{effective_run_id}' package is frozen with inforce {frozen_ids} ({frozen_fps}), "
+                        f"but retry requested '{inforce_file.id}' ({inforce_file.fingerprint}). Cannot replay existing run under different inforce lineage.",
+                    )
+
+    if existing_run is None and (ps is None or ps.inforce_file_ids != [inforce_file.id] or ps.horizon_months != projection_months or ps.valuation_date != parsed_val_date):
         assumption_tables = (
             db.query(AssumptionTable)
             .join(AssumptionSet, AssumptionTable.set_id == AssumptionSet.id)
@@ -1272,7 +1302,32 @@ def execute_rollforward_attribution(
         or val_run.projection_key
         or f"COHORT_{val_run.id[:8]}"
     )
-    tol_dec = Decimal(str(tolerance))
+    # V6-P0-03: Governed, bounded rollforward continuity tolerances
+    MAX_GOVERNED_ROLLFORWARD_TOLERANCE = Decimal("0.05")
+    try:
+        f_tol = float(tolerance)
+        if not math.isfinite(f_tol) or f_tol < 0.0:
+            raise ServiceError(
+                400, "INVALID_ROLLFORWARD_TOLERANCE",
+                f"Rollforward tolerance must be a finite, non-negative number; got '{tolerance}'.",
+            )
+        tol_dec = Decimal(str(tolerance))
+        if not tol_dec.is_finite() or tol_dec < Decimal("0"):
+            raise ServiceError(
+                400, "INVALID_ROLLFORWARD_TOLERANCE",
+                f"Rollforward tolerance must be a finite, non-negative number; got '{tolerance}'.",
+            )
+    except (ValueError, TypeError, ArithmeticError) as exc:
+        raise ServiceError(
+            400, "INVALID_ROLLFORWARD_TOLERANCE",
+            f"Rollforward tolerance must be a finite, non-negative number; got '{tolerance}'.",
+        ) from exc
+
+    if tol_dec > MAX_GOVERNED_ROLLFORWARD_TOLERANCE:
+        raise ServiceError(
+            400, "GOVERNED_TOLERANCE_EXCEEDED",
+            f"Requested rollforward tolerance {tol_dec} exceeds maximum governed policy threshold of {MAX_GOVERNED_ROLLFORWARD_TOLERANCE}.",
+        )
     attribution_mode = persisted_summary.get("attribution_mode", "ILLUSTRATIVE_GENERIC_PV_NON_REGULATORY")
 
     if prior_valuation_run_id:
@@ -1390,8 +1445,10 @@ def execute_rollforward_attribution(
                     f"Rollforward closing balance ({ending_dec}) disagrees with persisted valuation reserve ({persisted_closing_dec}) beyond tolerance ({tol_dec}).",
                 )
 
-    # V5-P0-E: Reject any movement bucket that attempts to disguise an unexplained residual as a named movement
+    # V5-P0-E & V6-P0-03: Validate source attribution of movements and reject forbidden residuals/non-finites
     movements_dec: dict[str, Decimal] = {}
+    has_unverified_movement_source = False
+    persisted_movements = persisted_summary.get("period_movements", {}) if prior_valuation_run_id else {}
     for k, v in resolved_movements.items():
         norm_key = str(k).strip().lower()
         if norm_key in FORBIDDEN_RESIDUAL_MOVEMENT_NAMES:
@@ -1400,7 +1457,21 @@ def execute_rollforward_attribution(
                 "UNEXPLAINED_MOVEMENT_FORBIDDEN",
                 f"Movement component '{k}' is a forbidden balancing/residual plug; unexplained movements cannot masquerade as attributed movements.",
             )
-        movements_dec[str(k)] = Decimal(str(v))
+        try:
+            f_v = float(v)
+            if not math.isfinite(f_v):
+                raise ServiceError(400, "INVALID_ROLLFORWARD_MOVEMENT", f"Movement component '{k}' has non-finite value '{v}'.")
+            dec_v = Decimal(str(v))
+            if not dec_v.is_finite():
+                raise ServiceError(400, "INVALID_ROLLFORWARD_MOVEMENT", f"Movement component '{k}' has non-finite value '{v}'.")
+        except (ValueError, TypeError, ArithmeticError) as exc:
+            raise ServiceError(400, "INVALID_ROLLFORWARD_MOVEMENT", f"Movement component '{k}' has invalid numeric value '{v}'.") from exc
+
+        # If caller passed custom movement in multi-period comparison without a verified source:
+        if prior_valuation_run_id and movements is not None and k not in persisted_movements:
+            has_unverified_movement_source = True
+
+        movements_dec[str(k)] = dec_v
 
     continuity = validate_continuity(opening_dec, movements_dec, ending_dec, tolerance=tol_dec)
     unexplained_residual = ending_dec - (opening_dec + continuity.sum_of_movements)
@@ -1441,6 +1512,9 @@ def execute_rollforward_attribution(
         "ending_balance": float(ending_dec),
         "difference": float(continuity.difference),
         "unexplained_residual": float(unexplained_residual),
+        "tolerance": float(tol_dec),
+        "tolerance_policy_id": "tol-policy-m5-standard",
+        "has_unverified_movement_source": has_unverified_movement_source,
         "movements": {k: float(v) for k, v in movements_dec.items()},
         "started_at": started_at,
         "completed_at": completed_at,
@@ -1571,12 +1645,23 @@ def execute_governed_reconciliation(
                 f"ExpectedResultSet '{expected_result_set_id}' rows do not match recorded fingerprint.",
             )
 
-        # Verify product family agreement
+        # Verify product family agreement (V6-P0-04: require recognized matching product)
         ers_product = _normalize_product_family(ers.product_code)
-        if ers_product != "UNKNOWN" and run_product != "UNKNOWN" and ers_product != run_product:
+        if ers_product == "UNKNOWN" or run_product == "UNKNOWN":
+            raise ServiceError(
+                400, "UNKNOWN_PRODUCT_FOR_BENCHMARK",
+                f"Governed reconciliation requires recognized product codes (benchmark: '{ers.product_code}', run: '{run_product}').",
+            )
+        if ers_product != run_product:
             raise ServiceError(
                 400, "BENCHMARK_PRODUCT_MISMATCH",
                 f"ExpectedResultSet product '{ers.product_code}' ({ers_product}) mismatches valuation run product '{run_product}'.",
+            )
+
+        if not run_basis or not run_method or not run_val_date:
+            raise ServiceError(
+                400, "REQUIRED_DIMENSION_MISSING",
+                "Valuation run is missing required reconciliation dimension (basis, methodology, or valuation_date).",
             )
 
         ers_fp = ers.fingerprint
@@ -1595,14 +1680,20 @@ def execute_governed_reconciliation(
                     400, "AMBIGUOUS_BENCHMARK_ROWS",
                     f"Multi-row ExpectedResultSet '{ers.id}' contains unscoped rows without basis/methodology/cohort_id/valuation_date/scenario_id.",
                 )
-
-            if row.get("basis") is not None and str(row["basis"]).strip().upper() != run_basis:
+            # V6-P0-04: Strict dimensional contract: benchmark row must carry basis, methodology, and valuation_date
+            row_basis = row.get("basis")
+            row_method = row.get("methodology")
+            row_val_date = row.get("valuation_date")
+            if not row_basis or not row_method or not row_val_date:
                 continue
-            if row.get("methodology") is not None and str(row["methodology"]).strip().upper() != run_method:
+
+            if str(row_basis).strip().upper() != run_basis:
+                continue
+            if str(row_method).strip().upper() != run_method:
+                continue
+            if str(row_val_date).strip() != run_val_date:
                 continue
             if row.get("cohort_id") is not None and run_cohort and str(row["cohort_id"]).strip() != run_cohort:
-                continue
-            if row.get("valuation_date") is not None and run_val_date and str(row["valuation_date"]).strip() != run_val_date:
                 continue
             if row.get("scenario_id") is not None and run_scenario_id and str(row["scenario_id"]).strip() != run_scenario_id:
                 continue
@@ -1729,16 +1820,85 @@ def execute_reporting_manifest(
     if val_run is None or val_run.project_id != project_id:
         raise ServiceError(404, "RUN_NOT_FOUND", f"Valuation run '{valuation_run_id}' not found in project '{project_id}'.")
 
-    rec_status = str(reconciliation_result.get("status") or "NOT_VERIFIABLE")
-    rf_ok = bool(rollforward_result.get("is_continuous", False))
+    # V6-P0-02: Derive release/approval status ONLY from verified persisted database rows!
+    val_detail = db.get(ValuationRunDetail, valuation_run_id)
+    val_pkg = db.query(RunPackage).filter(RunPackage.run_id == valuation_run_id).first()
 
-    if rec_status == "FAIL" or not rf_ok:
+    persisted_reserve = None
+    val_detail_consistent = True
+    if val_detail is None or not val_detail.summary_results:
+        val_detail_consistent = False
+    else:
+        persisted_reserve = val_detail.summary_results.get("present_value_reserve")
+        if persisted_reserve is None:
+            val_detail_consistent = False
+        elif valuation_result.get("present_value_reserve") is not None:
+            try:
+                if abs(float(valuation_result["present_value_reserve"]) - float(persisted_reserve)) > 1e-4:
+                    val_detail_consistent = False
+            except (ValueError, TypeError):
+                val_detail_consistent = False
+
+    pkg_consistent = True
+    if val_pkg is not None:
+        if val_pkg.project_id != project_id:
+            pkg_consistent = False
+        if valuation_result.get("run_package_id") and valuation_result["run_package_id"] != val_pkg.id:
+            pkg_consistent = False
+        if valuation_result.get("run_package_fingerprint") and valuation_result["run_package_fingerprint"] != val_pkg.fingerprint:
+            pkg_consistent = False
+    elif valuation_result.get("run_package_id"):
+        pkg_consistent = False
+
+    rec_report_id = reconciliation_result.get("report_id")
+    rec_row = db.get(ReconciliationReport, rec_report_id) if rec_report_id else None
+    if rec_row is None or rec_row.project_id != project_id or rec_row.run_id != valuation_run_id:
+        persisted_rec_status = "NOT_VERIFIABLE"
+        rec_verified = False
+        actual_rec_diff = float(reconciliation_result.get("difference", 0.0))
+        actual_rec_reason = reconciliation_result.get("reason") or "Persisted ReconciliationReport missing or inconsistent with project/run."
+    else:
+        persisted_rec_status = rec_row.status
+        actual_rec_diff = float((rec_row.summary or {}).get("difference") or 0.0)
+        actual_rec_reason = (rec_row.summary or {}).get("reason") or rec_row.disposition_notes or ""
+        # Reconciling reserve is mandatory for authorized release of reserves
+        target_var = rec_row.variables_requested[0] if rec_row.variables_requested else target_metric
+        is_material_metric = target_var in ("present_value_reserve", "closing_reserve")
+        rec_verified = (rec_row.status == "PASS" and is_material_metric)
+        if reconciliation_result.get("status") != rec_row.status:
+            rec_verified = False
+
+    rf_summary_id = rollforward_result.get("summary_id")
+    rf_row = db.get(RollforwardSummary, rf_summary_id) if rf_summary_id else None
+    if rf_row is None:
+        rf_row = db.query(RollforwardSummary).filter(
+            RollforwardSummary.run_id == valuation_run_id,
+            RollforwardSummary.project_id == project_id,
+        ).first()
+
+    if rf_row is None or rf_row.project_id != project_id or rf_row.run_id != valuation_run_id:
+        persisted_rf_ok = False
+        rf_verified = False
+    else:
+        persisted_rf_ok = bool(rf_row.is_continuity_verified)
+        has_unverified_source = bool(rollforward_result.get("has_unverified_movement_source", False))
+        rf_verified = persisted_rf_ok and not has_unverified_source
+        if bool(rollforward_result.get("is_continuous")) != bool(rf_row.is_continuity_verified):
+            rf_verified = False
+
+    if not val_detail_consistent or not pkg_consistent:
         governance_status = "REJECTED_NON_APPROVED"
         is_approved_for_release = False
         artifact_type = "reporting_quarantined"
         filename = "quarantined_diagnostic_manifest.json"
         package_id = f"QUARANTINED-{valuation_run_id}"
-    elif rec_status != "PASS":
+    elif persisted_rec_status == "FAIL" or not persisted_rf_ok or not rf_verified:
+        governance_status = "REJECTED_NON_APPROVED"
+        is_approved_for_release = False
+        artifact_type = "reporting_quarantined"
+        filename = "quarantined_diagnostic_manifest.json"
+        package_id = f"QUARANTINED-{valuation_run_id}"
+    elif persisted_rec_status != "PASS" or not rec_verified:
         governance_status = "TECHNICAL_MATERIALIZATION_UNVERIFIED_NON_APPROVED"
         is_approved_for_release = False
         artifact_type = "reporting_unverified"
@@ -1755,7 +1915,8 @@ def execute_reporting_manifest(
         raise ServiceError(
             422,
             "REPORTING_APPROVAL_GATE_FAILED",
-            f"Cannot emit approved disclosure package: reconciliation_status='{rec_status}', rollforward_verified={rf_ok} (governance_status='{governance_status}').",
+            f"Cannot emit approved disclosure package: reconciliation_status='{persisted_rec_status}', "
+            f"rollforward_verified={persisted_rf_ok} (governance_status='{governance_status}').",
         )
 
     val_date_str = valuation_result.get("valuation_date") or (
@@ -1769,15 +1930,15 @@ def execute_reporting_manifest(
         "methodology": valuation_result["methodology"],
         "cohort_id": valuation_result.get("cohort_id"),
         "valuation_date": val_date_str,
-        "run_package_id": valuation_result.get("run_package_id"),
-        "run_package_fingerprint": valuation_result.get("run_package_fingerprint"),
-        "reserve": valuation_result["present_value_reserve"],
+        "run_package_id": val_pkg.id if val_pkg else valuation_result.get("run_package_id"),
+        "run_package_fingerprint": val_pkg.fingerprint if val_pkg else valuation_result.get("run_package_fingerprint"),
+        "reserve": persisted_reserve if persisted_reserve is not None else valuation_result.get("present_value_reserve"),
         "governance_status": governance_status,
         "is_approved_for_release": is_approved_for_release,
         "regulatory_compliance_claimed": False,
         "rollforward": {
-            "summary_id": rollforward_result.get("summary_id"),
-            "is_continuous": rf_ok,
+            "summary_id": rf_row.id if rf_row else rollforward_result.get("summary_id"),
+            "is_continuous": persisted_rf_ok,
             "attribution_mode": rollforward_result.get("attribution_mode", "ILLUSTRATIVE_GENERIC_PV_NON_REGULATORY"),
             "opening": rollforward_result.get("opening_balance"),
             "movements": rollforward_result.get("movements", {}),
@@ -1785,11 +1946,11 @@ def execute_reporting_manifest(
             "difference": rollforward_result.get("difference"),
         },
         "reconciliation": {
-            "report_id": reconciliation_result.get("report_id"),
-            "expected_result_set_id": reconciliation_result.get("expected_result_set_id"),
-            "status": rec_status,
-            "difference": reconciliation_result["difference"],
-            "reason": reconciliation_result.get("reason"),
+            "report_id": rec_row.id if rec_row else reconciliation_result.get("report_id"),
+            "expected_result_set_id": getattr(rec_row, "expected_result_set_id", None) or reconciliation_result.get("expected_result_set_id"),
+            "status": persisted_rec_status,
+            "difference": actual_rec_diff,
+            "reason": actual_rec_reason,
         },
     }
 
@@ -1828,8 +1989,8 @@ def execute_reporting_manifest(
         "governance_status": governance_status,
         "is_approved_for_release": is_approved_for_release,
         "regulatory_compliance_claimed": False,
-        "rollforward_verified": rf_ok,
-        "reconciliation_status": rec_status,
+        "rollforward_verified": persisted_rf_ok,
+        "reconciliation_status": persisted_rec_status,
         "manifest_sha256": actual_manifest_sha256,
         "storage_uri": stored.uri,
         "summary": summary_package,

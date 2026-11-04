@@ -79,6 +79,7 @@ def test_environment(db_session, tmp_path, monkeypatch):
         run_type="projection",
         projection_key="MYGA",
         status="success",
+        accepted_attempt_number=1,
     )
     db_session.add(run)
     db_session.commit()
@@ -442,6 +443,8 @@ def test_multi_segment_dimensional_resolution_and_ambiguity(db_session, test_env
         created_at=datetime.now(timezone.utc),
     )
     db_session.add(artifact_record)
+    run_rec = db_session.get(Run, 'run-baseline-1')
+    run_rec.accepted_attempt_number = 2
     db_session.commit()
 
     # Promote to derived dataset
@@ -576,7 +579,7 @@ def test_prior_output_variable_resolver_does_not_default_on_governance_errors(db
     store = env["store"]
 
     # Seed run and parquet artifact in proj-1
-    run = Run(id="run-gov-test", project_id="proj-1", status="success", run_type="projection")
+    run = Run(id="run-gov-test", project_id="proj-1", status="success", run_type="projection", accepted_attempt_number=1)
     db_session.add(run)
     db_session.commit()
 

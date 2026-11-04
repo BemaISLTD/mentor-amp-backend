@@ -200,6 +200,8 @@ def validate_continuity(
     dec_open = to_decimal(opening_balance)
     dec_end = to_decimal(ending_balance)
     dec_tol = to_decimal(tolerance)
+    if not dec_tol.is_finite() or dec_tol < Decimal("0"):
+        raise ValueError(f"Rollforward tolerance must be a finite, non-negative number; got {tolerance}.")
 
     if isinstance(movements, dict):
         movement_items = [(k, to_decimal(v)) for k, v in movements.items()]

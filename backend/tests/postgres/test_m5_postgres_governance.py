@@ -563,8 +563,8 @@ def test_m5_postgres_dagster_e2e_and_production_retry(monkeypatch):
             user_id = seeded["user"].id
             reviewer_id = seeded["reviewer"].id
 
-        # V5-P1-G: Inject a REAL mid-execution PostgreSQL persistence fault AFTER Run, RunSet, RunPackage,
-        # and RunAttempt(attempt_number=1, status='running') are committed to PostgreSQL!
+        # V5-P1-G & V6-P1-07: Simulate a worker crash after real PostgreSQL commits of Run, RunSet, RunPackage,
+        # and RunAttempt(attempt_number=1, status='running'), demonstrating partial-persistence recovery without duplicate runs.
         pg_proj_run_id = f"run-pg-dagster-proj-{uuid.uuid4().hex[:8]}"
         real_execute_run = run_execution_service.execute_run
         attempts: list[int] = []
@@ -576,7 +576,7 @@ def test_m5_postgres_dagster_e2e_and_production_retry(monkeypatch):
                 if attempt == 1:
                     # Claim attempt 1 in PostgreSQL so RunAttempt(attempt_number=1, status='running') is committed!
                     run_execution_service.claim_run(db, run_id, worker_id="pg-worker-attempt-1")
-                    raise RuntimeError("Simulated PostgreSQL worker connection drop after committing RunPackage and RunAttempt 1")
+                    raise RuntimeError("Simulated worker process crash after committing RunPackage and RunAttempt 1 to PostgreSQL")
             return real_execute_run(db, run_id)
 
         monkeypatch.setattr(run_execution_service, "execute_run", pg_flaky_execute_run)

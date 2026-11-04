@@ -1056,7 +1056,24 @@ def test_p0_06_and_v5_p0_f_governed_benchmark_reconciliation_and_v5_p1_i_reporti
                 "cohort_id": "COHORT_MYGA_2026",
             },
         )
-        db.add_all([r, detail])
+        rf_summary = RollforwardSummary(
+            id=f"rf-test-{uuid.uuid4().hex[:8]}",
+            run_id=val_run_id,
+            project_id=proj_id,
+            cohort_id="COHORT_MYGA_2026",
+            methodology="VM22",
+            basis="STATUTORY",
+            component_name="ending_reserve",
+            component_order=99,
+            is_movement=False,
+            opening_balance=100000.0,
+            movement_amount=25000.0,
+            closing_balance=actual_reserve,
+            is_continuity_verified=True,
+            continuity_difference=0.0,
+            trace_identifier="trace-01",
+        )
+        db.add_all([r, detail, rf_summary])
 
         # 1. Seed four-eyes approved multi-row scoped ExpectedResultSet (matching row + other cohort row)
         ers_scoped_rows = [
@@ -1300,7 +1317,7 @@ def test_p0_06_and_v5_p0_f_governed_benchmark_reconciliation_and_v5_p1_i_reporti
         "basis": "STATUTORY",
         "methodology": "VM22",
     }
-    rf_out = {"is_continuous": True}
+    rf_out = {"is_continuous": True, "summary_id": rf_summary.id}
 
     # 1. PASS: Scoped multi-row ExpectedResultSet selects the exact matching cohort row
     cfg_pass = ReconciliationConfig(expected_result_set_id="ers-approved-match-01")

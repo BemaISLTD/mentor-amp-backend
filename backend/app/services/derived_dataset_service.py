@@ -15,6 +15,7 @@ Enforces:
 
 from datetime import datetime, timezone
 import hashlib
+import re
 from typing import Any
 import uuid
 
@@ -67,6 +68,13 @@ def promote_run_to_derived_dataset(
             f"Derived dataset '{dataset_name}' version '{dataset_version}' already exists in this project."
         )
 
+    # V6-P1-06: Require run to have an accepted attempt
+    if run.accepted_attempt_number is None or run.accepted_attempt_number < 1:
+        raise bad_request(
+            f"Run '{run_id}' has no accepted attempt (accepted_attempt_number: {run.accepted_attempt_number}). "
+            f"Cannot promote unaccepted run."
+        )
+
     # 3. Locate target artifact from accepted attempt
     canonical_types = ("outputs", "valuation_results", "cash_flows")
     if artifact_id:
@@ -80,27 +88,30 @@ def promote_run_to_derived_dataset(
             raise bad_request(
                 f"Artifact '{artifact_id}' has unsupported type '{artifact.artifact_type}' for dataset promotion."
             )
-        if run.accepted_attempt_number is not None and artifact.attempt_number is not None:
-            if artifact.attempt_number != run.accepted_attempt_number:
-                raise bad_request(
-                    f"Artifact '{artifact_id}' belongs to attempt {artifact.attempt_number}, "
-                    f"not accepted attempt {run.accepted_attempt_number}."
-                )
-    else:
-        artifact_query = db.query(RunArtifact).filter(
-            RunArtifact.run_id == run_id,
-            RunArtifact.artifact_type.in_(list(canonical_types)),
-        )
-        if run.accepted_attempt_number is not None:
-            artifact_query = artifact_query.filter(
-                RunArtifact.attempt_number == run.accepted_attempt_number
+        if artifact.attempt_number != run.accepted_attempt_number:
+            raise bad_request(
+                f"Artifact '{artifact_id}' belongs to attempt {artifact.attempt_number}, "
+                f"not accepted attempt {run.accepted_attempt_number}."
             )
-        artifact = artifact_query.order_by(RunArtifact.created_at.desc()).first()
+    else:
+        artifact = (
+            db.query(RunArtifact)
+            .filter(
+                RunArtifact.run_id == run_id,
+                RunArtifact.artifact_type.in_(list(canonical_types)),
+                RunArtifact.attempt_number == run.accepted_attempt_number,
+            )
+            .order_by(RunArtifact.created_at.desc())
+            .first()
+        )
 
     if not artifact:
         raise not_found(f"No suitable analytical artifact found for run '{run_id}'.")
 
-    # 4. Inspect storage, verify SHA-256 checksum, and verify rows / schema
+    # 4. Inspect storage, verify recorded 64-hex SHA-256 checksum, and verify rows / schema
+    if not artifact.checksum_sha256 or not re.fullmatch(r"[0-9a-fA-F]{64}", artifact.checksum_sha256):
+        raise bad_request(f"Artifact '{artifact.id}' lacks a valid 64-hex recorded SHA-256 checksum.")
+
     store = get_artifact_store()
     try:
         path = store.path_for_uri(artifact.storage_uri)
@@ -108,7 +119,7 @@ def promote_run_to_derived_dataset(
             raise bad_request(f"Artifact storage file does not exist at '{artifact.storage_uri}'.")
         raw_bytes = path.read_bytes()
         computed_sha = hashlib.sha256(raw_bytes).hexdigest()
-        if artifact.checksum_sha256 and computed_sha != artifact.checksum_sha256:
+        if computed_sha != artifact.checksum_sha256:
             raise bad_request(
                 f"Artifact storage SHA-256 mismatch during promotion: expected {artifact.checksum_sha256}, got {computed_sha}."
             )
@@ -256,8 +267,27 @@ def approve_derived_dataset(
     """
     dataset = get_derived_dataset(db, project_id, dataset_id)
 
+    if not approved_by_user_id or not dataset.created_by:
+        raise bad_request("Approved by and created by user IDs are mandatory.")
+
     if dataset.created_by == approved_by_user_id:
         raise bad_request("Segregation of duties violation: Creator cannot approve their own derived dataset.")
+
+    # V6-P1-06: Re-verify source run, accepted attempt, and recorded artifact checksum at approval
+    if dataset.source_run_id:
+        src_run = db.get(Run, dataset.source_run_id)
+        if not src_run or src_run.project_id != project_id:
+            raise bad_request(f"Source run '{dataset.source_run_id}' not found in project '{project_id}'.")
+        if src_run.accepted_attempt_number is None or src_run.accepted_attempt_number < 1:
+            raise bad_request(f"Source run '{dataset.source_run_id}' lacks an accepted attempt.")
+        if dataset.source_artifact_id:
+            src_art = db.get(RunArtifact, dataset.source_artifact_id)
+            if not src_art or src_art.run_id != dataset.source_run_id:
+                raise bad_request(f"Source artifact '{dataset.source_artifact_id}' does not belong to source run '{dataset.source_run_id}'.")
+            if src_art.attempt_number != src_run.accepted_attempt_number:
+                raise bad_request(f"Source artifact '{src_art.id}' belongs to attempt {src_art.attempt_number}, not accepted attempt {src_run.accepted_attempt_number}.")
+            if not src_art.checksum_sha256 or src_art.checksum_sha256 != dataset.fingerprint:
+                raise bad_request(f"Source artifact checksum '{src_art.checksum_sha256}' mismatches dataset fingerprint '{dataset.fingerprint}'.")
 
     if dataset.status == "approved":
         return dataset

@@ -1245,10 +1245,21 @@ def freeze_valuation_run_package(
         )
     if auth_mv.model_id != auth_model.id:
         raise ServiceError(400, "MODEL_LINEAGE_MISMATCH", "ModelVersion does not belong to Model.")
-    if auth_mv.deleted_at is not None or auth_mv.status not in ("validated", "approved", "published"):
+    if (
+        auth_mv.deleted_at is not None
+        or auth_mv.status not in ("approved", "published")
+        or auth_mv.approved_at is None
+        or not auth_mv.approved_by
+        or not auth_mv.created_by
+    ):
         raise ServiceError(
             400, "MODEL_VERSION_NOT_APPROVED",
-            f"Authoritative model version '{auth_mv.id}' is not in an approved/validated state (status: {auth_mv.status}).",
+            f"Authoritative model version '{auth_mv.id}' must be in an approved or published state with recorded approver and creator (status: {auth_mv.status}).",
+        )
+    if auth_mv.approved_by == auth_mv.created_by:
+        raise ServiceError(
+            400, "SELF_APPROVED_MODEL_FORBIDDEN",
+            f"Authoritative model version '{auth_mv.id}' violates four-eyes governance: created_by ('{auth_mv.created_by}') cannot match approved_by ('{auth_mv.approved_by}').",
         )
 
     model_version_dict["basis"] = basis
