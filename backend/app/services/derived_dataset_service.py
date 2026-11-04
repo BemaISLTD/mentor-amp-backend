@@ -10,6 +10,7 @@ Enforces:
 2. Four-eyes segregation of duties: creator cannot approve their own dataset.
 3. Immutability: approved datasets cannot be modified (except marked superseded).
 4. Content fingerprinting: SHA-256 integrity checks against Parquet storage.
+5. Accepted-attempt artifact verification on promotion.
 """
 
 from datetime import datetime, timezone
@@ -49,10 +50,10 @@ def promote_run_to_derived_dataset(
     if not run:
         raise not_found(f"Run '{run_id}' not found in project '{project_id}'.")
 
-    if run.status != "success":
+    if run.status not in ("success", "completed"):
         raise bad_request(
             f"Cannot promote run '{run_id}' with non-success status '{run.status}'. "
-            "Only completed runs with status='success' can be promoted."
+            "Only completed runs with status in ('success', 'completed') can be promoted."
         )
 
     # 2. Check name/version uniqueness in project
@@ -66,25 +67,54 @@ def promote_run_to_derived_dataset(
             f"Derived dataset '{dataset_name}' version '{dataset_version}' already exists in this project."
         )
 
-    # 3. Locate target artifact
-    artifact_query = db.query(RunArtifact).filter(
-        RunArtifact.run_id == run_id,
-        RunArtifact.artifact_type.in_(["outputs", "valuation_results", "cash_flows"]),
-    )
+    # 3. Locate target artifact from accepted attempt
+    canonical_types = ("outputs", "valuation_results", "cash_flows")
     if artifact_id:
-        artifact_query = artifact_query.filter(RunArtifact.id == artifact_id)
-    artifact = artifact_query.order_by(RunArtifact.created_at.desc()).first()
+        artifact = db.query(RunArtifact).filter(
+            RunArtifact.id == artifact_id,
+            RunArtifact.run_id == run_id,
+        ).first()
+        if not artifact:
+            raise not_found(f"Artifact '{artifact_id}' not found for run '{run_id}'.")
+        if artifact.artifact_type not in canonical_types:
+            raise bad_request(
+                f"Artifact '{artifact_id}' has unsupported type '{artifact.artifact_type}' for dataset promotion."
+            )
+        if run.accepted_attempt_number is not None and artifact.attempt_number is not None:
+            if artifact.attempt_number != run.accepted_attempt_number:
+                raise bad_request(
+                    f"Artifact '{artifact_id}' belongs to attempt {artifact.attempt_number}, "
+                    f"not accepted attempt {run.accepted_attempt_number}."
+                )
+    else:
+        artifact_query = db.query(RunArtifact).filter(
+            RunArtifact.run_id == run_id,
+            RunArtifact.artifact_type.in_(list(canonical_types)),
+        )
+        if run.accepted_attempt_number is not None:
+            artifact_query = artifact_query.filter(
+                RunArtifact.attempt_number == run.accepted_attempt_number
+            )
+        artifact = artifact_query.order_by(RunArtifact.created_at.desc()).first()
 
     if not artifact:
         raise not_found(f"No suitable analytical artifact found for run '{run_id}'.")
 
-    # 4. Inspect storage and verify rows / schema
+    # 4. Inspect storage, verify SHA-256 checksum, and verify rows / schema
     store = get_artifact_store()
     try:
         path = store.path_for_uri(artifact.storage_uri)
         if not path.exists():
             raise bad_request(f"Artifact storage file does not exist at '{artifact.storage_uri}'.")
+        raw_bytes = path.read_bytes()
+        computed_sha = hashlib.sha256(raw_bytes).hexdigest()
+        if artifact.checksum_sha256 and computed_sha != artifact.checksum_sha256:
+            raise bad_request(
+                f"Artifact storage SHA-256 mismatch during promotion: expected {artifact.checksum_sha256}, got {computed_sha}."
+            )
         df = pl.read_parquet(path)
+    except ServiceError:
+        raise
     except Exception as e:
         raise bad_request(f"Failed to inspect artifact Parquet file: {str(e)}")
 
@@ -139,7 +169,7 @@ def promote_run_to_derived_dataset(
         storage_backend="local",
         file_format="parquet",
         row_count=row_count,
-        fingerprint=artifact.checksum_sha256,
+        fingerprint=artifact.checksum_sha256 or computed_sha,
         dimensions_available=avail_dims,
         created_by=user_id,
         created_at=_now(),
@@ -221,7 +251,7 @@ def approve_derived_dataset(
     approved_by_user_id: str,
 ) -> DerivedDataset:
     """Approve a derived dataset for downstream production consumption.
-    
+
     Enforces four-eyes segregation of duties: creator cannot approve their own dataset.
     """
     dataset = get_derived_dataset(db, project_id, dataset_id)

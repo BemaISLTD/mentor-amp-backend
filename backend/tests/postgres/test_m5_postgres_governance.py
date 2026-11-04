@@ -1,4 +1,4 @@
-"""M5 PostgreSQL Governance, Immutability, Downgrade Fidelity & Dagster E2E Verification (P0-07 & P1-08).
+"""M5 PostgreSQL Governance, Immutability, Downgrade Fidelity & Dagster E2E Verification (P0-07, P1-08, V5-P0-B..V5-P1-I).
 
 Runs when MENTORAMP_TEST_POSTGRES_URL points to a disposable PostgreSQL database.
 
@@ -14,10 +14,13 @@ Verifies:
    - Multi-row downgrade backfills both STATUTORY/VM22/v1.0 and GAAP/LDTI/v2.1 accurately from parent runs.
    - Repeat upgrade/downgrade cycles (c9 -> b8 -> c9 -> b8 -> c9) preserve all rows intact.
 4. Foreign key constraints & hardened immutability triggers on derived_datasets and valuation_run_details.
-5. P0-07 Full 8-Stage Production Dagster Pipeline E2E Materialization & Production Asset Retry against
-   real disposable PostgreSQL.
+5. P0-07 & V5-P1-G Full 8-Stage Production Dagster Pipeline E2E Materialization & Post-Commit / Mid-Attempt
+   Retry Recovery against real disposable PostgreSQL (resuming the exact same `run_id` without duplicate `Run` rows,
+   preserving Attempt 1 evidence, promoting Attempt 2, and verifying two-period valuation rollforward and four-eyes
+   scoped benchmark reconciliation).
 """
 
+from decimal import Decimal
 import hashlib
 import os
 import sys
@@ -30,7 +33,7 @@ if BACKEND not in sys.path:
 
 from alembic import command
 from alembic.config import Config
-from dagster import DagsterEventType, materialize
+from dagster import DagsterEventType, DagsterInstance, materialize
 import psycopg2
 import pytest
 from sqlalchemy import create_engine, inspect, text
@@ -38,15 +41,15 @@ from sqlalchemy.orm import close_all_sessions, sessionmaker
 
 from app.config import settings
 from app.core.artifacts import get_artifact_store
+from app.core.execution import run_state
 from app.core.execution.fingerprints import fingerprint
 import app.db.database as db_mod
 from app.db.models.reconciliation import ExpectedResultSet, ReconciliationReport
 from app.db.models.rollforward import RollforwardSummary
 from app.db.models.run import Run
 from app.db.models.run_artifact import RunArtifact
-from app.db.models.run_package import RunPackage
+from app.db.models.run_package import RunAttempt, RunPackage
 from app.db.models.valuation_detail import ValuationRunDetail
-import app.orchestration.dagster.assets as assets_mod
 from app.orchestration.dagster.assets import (
     aggregation_asset,
     inforce_data_asset,
@@ -57,8 +60,15 @@ from app.orchestration.dagster.assets import (
     validation_asset,
     valuation_asset,
 )
-from app.services.common import ServiceError, now_utc
-from app.services.valuation_pipeline_service import execute_projection_simulation
+from app.services import run_execution_service
+from app.services.common import now_utc
+from app.services.valuation_pipeline_service import (
+    execute_cash_flow_aggregation,
+    execute_foundation_valuation,
+    execute_governed_reconciliation,
+    execute_reporting_manifest,
+    execute_rollforward_attribution,
+)
 from scripts.seed_demo import seed_myga
 
 RAW_URL = os.environ.get(
@@ -533,7 +543,8 @@ def test_m5_postgres_governance_and_immutability():
 
 
 def test_m5_postgres_dagster_e2e_and_production_retry(monkeypatch):
-    """P0-07: Full 8-stage Dagster pipeline E2E materialization & production asset retry against real PostgreSQL."""
+    """P0-07, V5-P0-B..V5-P1-I: Full 8-stage Dagster pipeline E2E materialization & post-commit / mid-attempt
+    retry recovery against real PostgreSQL."""
     postgres_url = _get_url()
     settings.database_url = postgres_url
 
@@ -548,22 +559,28 @@ def test_m5_postgres_dagster_e2e_and_production_retry(monkeypatch):
             proj_id = seeded["project"].id
             inforce_id = seeded["inforce"].id
             mv_id = seeded["version"].id
+            scen_id = seeded["scenarios"][0].id
             user_id = seeded["user"].id
+            reviewer_id = seeded["reviewer"].id
 
-        # 1. Execute full 8-stage Dagster materialization on PostgreSQL (with transient retry on attempt 1)
-        real_projection_fn = execute_projection_simulation
+        # V5-P1-G: Inject a REAL mid-execution PostgreSQL persistence fault AFTER Run, RunSet, RunPackage,
+        # and RunAttempt(attempt_number=1, status='running') are committed to PostgreSQL!
+        pg_proj_run_id = f"run-pg-dagster-proj-{uuid.uuid4().hex[:8]}"
+        real_execute_run = run_execution_service.execute_run
         attempts: list[int] = []
 
-        def pg_flaky_projection(*args, **kwargs):
-            attempt = len(attempts) + 1
-            attempts.append(attempt)
-            if attempt == 1:
-                raise ServiceError(503, "PG_LOCK_TIMEOUT", "Simulated transient PostgreSQL lock timeout on attempt 1")
-            return real_projection_fn(*args, **kwargs)
+        def pg_flaky_execute_run(db, run_id: str) -> str:
+            if run_id == pg_proj_run_id:
+                attempt = len(attempts) + 1
+                attempts.append(attempt)
+                if attempt == 1:
+                    # Claim attempt 1 in PostgreSQL so RunAttempt(attempt_number=1, status='running') is committed!
+                    run_execution_service.claim_run(db, run_id, worker_id="pg-worker-attempt-1")
+                    raise RuntimeError("Simulated PostgreSQL worker connection drop after committing RunPackage and RunAttempt 1")
+            return real_execute_run(db, run_id)
 
-        monkeypatch.setattr(assets_mod, "execute_projection_simulation", pg_flaky_projection)
+        monkeypatch.setattr(run_execution_service, "execute_run", pg_flaky_execute_run)
 
-        pg_proj_run_id = f"run-pg-dagster-proj-{uuid.uuid4().hex[:8]}"
         run_config = {
             "ops": {
                 "inforce_data_asset": {
@@ -578,6 +595,9 @@ def test_m5_postgres_dagster_e2e_and_production_retry(monkeypatch):
                         "project_id": proj_id,
                         "projection_months": 12,
                         "run_id": pg_proj_run_id,
+                        "model_version_id": mv_id,
+                        "scenario_id": scen_id,
+                        "valuation_date": "2026-12-31",
                     }
                 },
                 "valuation_asset": {
@@ -588,18 +608,27 @@ def test_m5_postgres_dagster_e2e_and_production_retry(monkeypatch):
                         "annual_discount_rate": 0.045,
                     }
                 },
+                "rollforward_asset": {
+                    "config": {
+                        "prior_valuation_run_id": None,
+                        "tolerance": 0.01,
+                    }
+                },
                 "reconciliation_report_asset": {
                     "config": {
                         "expected_result_set_id": None,
                         "target_metric": "present_value_reserve",
-                        "tolerance": 0.01,
-                        "rel_tol": 1e-4,
+                        "halt_on_reconciliation_failure": True,
+                    }
+                },
+                "reporting_asset": {
+                    "config": {
+                        "require_approved_reconciliation": False,
                     }
                 },
             }
         }
 
-        from dagster import DagsterInstance
         with DagsterInstance.ephemeral() as instance:
             result = materialize(ALL_PIPELINE_ASSETS, run_config=run_config, instance=instance)
         assert result.success is True
@@ -612,6 +641,8 @@ def test_m5_postgres_dagster_e2e_and_production_retry(monkeypatch):
 
         mat_events = {e.asset_key.path[-1]: e.materialization.metadata for e in result.get_asset_materialization_events()}
         assert len(mat_events) == 8
+        assert mat_events["projection_run_asset"]["accepted_attempt_number"].value == 2
+        assert mat_events["aggregation_asset"]["accepted_attempt_number"].value == 2
 
         store = get_artifact_store()
         proj_uri = mat_events["projection_run_asset"]["storage_uri"].value
@@ -625,16 +656,37 @@ def test_m5_postgres_dagster_e2e_and_production_retry(monkeypatch):
         rep_path = store.path_for_uri(rep_uri)
         assert rep_path.exists()
         assert hashlib.sha256(rep_path.read_bytes()).hexdigest() == rep_sha
+        assert mat_events["reporting_asset"]["governance_status"].value == "TECHNICAL_MATERIALIZATION_UNVERIFIED_NON_APPROVED"
+        assert mat_events["reporting_asset"]["is_approved_for_release"].value is False
 
-        # 2. Verify persisted PostgreSQL rows across all 8 stages
+        # 2. Verify persisted PostgreSQL rows across all 8 stages & V5-P1-G zero duplicate canonical runs
         with PgSessionLocal() as db:
-            db_proj_run = db.get(Run, pg_proj_run_id)
-            assert db_proj_run is not None
+            # Prove ZERO duplicate Run rows were minted for pg_proj_run_id!
+            matching_runs = db.query(Run).filter(Run.id.like(f"{pg_proj_run_id}%")).all()
+            assert len(matching_runs) == 1
+            db_proj_run = matching_runs[0]
+            assert db_proj_run.id == pg_proj_run_id
             assert db_proj_run.status in ("completed", "success")
+            assert db_proj_run.accepted_attempt_number == 2
+            assert db_proj_run.attempt_count == 2
             assert db_proj_run.model_version_id == mv_id
+
+            pg_attempts = (
+                db.query(RunAttempt)
+                .filter(RunAttempt.run_id == pg_proj_run_id)
+                .order_by(RunAttempt.attempt_number)
+                .all()
+            )
+            assert len(pg_attempts) == 2
+            assert pg_attempts[0].attempt_number == 1
+            assert pg_attempts[0].status == run_state.FAILED
+            assert pg_attempts[0].cleanup_status == "retained_noncanonical"
+            assert pg_attempts[1].attempt_number == 2
+            assert pg_attempts[1].status in ("completed", "success")
 
             db_proj_art = db.get(RunArtifact, mat_events["projection_run_asset"]["artifact_id"].value)
             assert db_proj_art is not None
+            assert db_proj_art.attempt_number == 2
             assert db_proj_art.checksum_sha256 == proj_fp
 
             val_run = (
@@ -646,6 +698,7 @@ def test_m5_postgres_dagster_e2e_and_production_retry(monkeypatch):
             assert val_run.status == "success"
             assert val_run.basis == "STATUTORY"
             assert val_run.methodology == "VM22"
+            assert val_run.accepted_attempt_number == 1
 
             val_pkg = db.query(RunPackage).filter(RunPackage.run_id == val_run.id).first()
             assert val_pkg is not None
@@ -655,19 +708,67 @@ def test_m5_postgres_dagster_e2e_and_production_retry(monkeypatch):
             val_detail = db.get(ValuationRunDetail, val_run.id)
             assert val_detail is not None
             reserve_val = float(val_detail.summary_results["present_value_reserve"])
+            cohort_val = str(val_detail.summary_results["cohort_id"])
             assert reserve_val > 0.0
 
-            rf_row = db.query(RollforwardSummary).filter(RollforwardSummary.run_id == val_run.id).first()
-            assert rf_row is not None
+            rf_rows = db.query(RollforwardSummary).filter(RollforwardSummary.run_id == val_run.id).all()
+            assert len(rf_rows) == 4
+            rf_row = rf_rows[0]
             assert rf_row.is_continuity_verified is True
             assert abs(float(rf_row.closing_balance) - reserve_val) <= 0.01
+            assert {r.component_name for r in rf_rows} == {
+                "opening_balance",
+                "discount_unwind_illustrative",
+                "period_cash_flow_release_illustrative",
+                "ending_balance",
+            }
 
             rec_row = db.query(ReconciliationReport).filter(ReconciliationReport.run_id == val_run.id).first()
             assert rec_row is not None
             assert rec_row.status == "NOT_VERIFIABLE"
 
-            # Also verify governed PASS reconciliation against an approved ExpectedResultSet in PostgreSQL
-            ers_rows = [{"present_value_reserve": reserve_val}]
+            # 3. Verify two-period persisted valuation comparison in PostgreSQL (V5-P0-E)
+            agg_pg = execute_cash_flow_aggregation(db=db, projection_run_id=pg_proj_run_id, project_id=proj_id)
+            cfs = agg_pg["aggregated_cash_flows"]
+            val_next = execute_foundation_valuation(
+                db=db,
+                upstream_run_id=pg_proj_run_id,
+                basis="STATUTORY",
+                methodology="VM22",
+                valuation_date="2027-01-31",
+                annual_discount_rate=0.045,
+                aggregated_cash_flows=cfs[1:],
+                project_id=proj_id,
+                cohort_id=cohort_val,
+            )
+            r_m = (1.0 + 0.045) ** (1.0 / 12.0) - 1.0
+            cf_next = float(cfs[1])
+            rf_two_period = execute_rollforward_attribution(
+                db=db,
+                valuation_run_id=val_next["valuation_run_id"],
+                project_id=proj_id,
+                prior_valuation_run_id=val_run.id,
+                movements={
+                    "discount_unwind_illustrative": Decimal(str(round(reserve_val * r_m, 4))),
+                    "period_cash_flow_release_illustrative": Decimal(str(round(-cf_next, 4))),
+                },
+            )
+            assert rf_two_period["attribution_mode"] == "MULTI_PERIOD_PERSISTED_VALUATION_COMPARISON"
+            assert rf_two_period["prior_valuation_run_id"] == val_run.id
+            assert rf_two_period["is_continuous"] is True
+
+            # 4. Verify governed PASS reconciliation & approved reporting manifest in PostgreSQL (V5-P0-F, V5-P1-I)
+            ers_rows = [
+                {
+                    "basis": "STATUTORY",
+                    "methodology": "VM22",
+                    "cohort_id": cohort_val,
+                    "valuation_date": "2026-12-31",
+                    "present_value_reserve": reserve_val,
+                    "abs_tol": 0.01,
+                    "rel_tol": 1e-4,
+                }
+            ]
             ers = ExpectedResultSet(
                 id=f"ers-pg-{uuid.uuid4().hex[:8]}",
                 project_id=proj_id,
@@ -676,29 +777,86 @@ def test_m5_postgres_dagster_e2e_and_production_retry(monkeypatch):
                 version_label="v1",
                 source_reference="PG_GOLDEN_SET",
                 row_count=1,
-                columns_detected=["present_value_reserve"],
+                columns_detected=["basis", "methodology", "cohort_id", "valuation_date", "present_value_reserve"],
                 rows_data=ers_rows,
                 status="approved",
                 fingerprint=fingerprint(ers_rows),
                 created_by=user_id,
-                approved_by=user_id,
+                approved_by=reviewer_id,  # Independent four-eyes approval!
                 approved_at=now_utc(),
             )
             db.add(ers)
             db.commit()
 
-            from app.services.valuation_pipeline_service import execute_governed_reconciliation
-
             pass_rep = execute_governed_reconciliation(
                 db=db,
                 valuation_run_id=val_run.id,
                 project_id=proj_id,
-                actual_reserve=reserve_val,
                 expected_result_set_id=ers.id,
-                tolerance=0.01,
             )
             assert pass_rep["status"] == "PASS"
             assert pass_rep["expected_result_set_id"] == ers.id
+
+            approved_manifest = execute_reporting_manifest(
+                db=db,
+                valuation_run_id=val_run.id,
+                project_id=proj_id,
+                valuation_result={
+                    "present_value_reserve": reserve_val,
+                    "basis": "STATUTORY",
+                    "methodology": "VM22",
+                    "valuation_date": "2026-12-31",
+                },
+                rollforward_result={"is_continuous": True, "summary_id": rf_row.id},
+                reconciliation_result=pass_rep,
+                require_approved_reconciliation=True,
+            )
+            assert approved_manifest["governance_status"] == "GOVERNED_RECONCILED_FOUNDATION_PACKAGE"
+            assert approved_manifest["is_approved_for_release"] is True
+            assert approved_manifest["artifact_type"] == "reporting"
+
+            import json
+            print(
+                "\n=== POSTGRESQL DAGSTER E2E & RETRY EVIDENCE SUMMARY ===\n"
+                + json.dumps(
+                    {
+                        "project_id": proj_id,
+                        "projection_run_id": pg_proj_run_id,
+                        "duplicate_runs_count": len(matching_runs),
+                        "accepted_attempt_number": db_proj_run.accepted_attempt_number,
+                        "attempts": [
+                            {
+                                "attempt_number": a.attempt_number,
+                                "status": a.status,
+                                "cleanup_status": a.cleanup_status,
+                            }
+                            for a in pg_attempts
+                        ],
+                        "projection_artifact_id": db_proj_art.id,
+                        "projection_parquet_sha256": proj_fp,
+                        "valuation_run_id": val_run.id,
+                        "valuation_run_package_fingerprint": val_pkg.fingerprint,
+                        "present_value_reserve": reserve_val,
+                        "two_period_rollforward": {
+                            "prior_valuation_run_id": val_run.id,
+                            "current_valuation_run_id": val_next["valuation_run_id"],
+                            "attribution_mode": rf_two_period["attribution_mode"],
+                            "is_continuous": rf_two_period["is_continuous"],
+                        },
+                        "reconciliation": {
+                            "expected_result_set_id": ers.id,
+                            "status": pass_rep["status"],
+                        },
+                        "approved_reporting_manifest": {
+                            "governance_status": approved_manifest["governance_status"],
+                            "is_approved_for_release": approved_manifest["is_approved_for_release"],
+                            "artifact_type": approved_manifest["artifact_type"],
+                            "manifest_sha256": approved_manifest["manifest_sha256"],
+                        },
+                    },
+                    indent=2,
+                )
+            )
     finally:
         close_all_sessions()
         pg_engine.dispose()

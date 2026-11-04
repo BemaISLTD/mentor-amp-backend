@@ -242,8 +242,13 @@ def submit_valuation_run(db: Session, payload: dict[str, Any], user: Any) -> dic
         raise ServiceError(422, "VALIDATION_ERROR", "Field 'methodology' is required.")
     methodology_version = payload.get("methodology_version", "v1.0")
 
-    val_date_raw = payload.get("valuation_date") or "2026-12-31"
-    val_date = date.fromisoformat(str(val_date_raw))
+    val_date_raw = payload.get("valuation_date")
+    val_date: date | None = None
+    if val_date_raw is not None and str(val_date_raw).strip() != "":
+        try:
+            val_date = date.fromisoformat(str(val_date_raw).strip())
+        except ValueError as exc:
+            raise ServiceError(400, "INVALID_VALUATION_DATE", f"Invalid valuation_date '{val_date_raw}'.") from exc
 
     run_id = str(uuid.uuid4())
     submitted_at = now_utc()
@@ -282,12 +287,14 @@ def submit_valuation_run(db: Session, payload: dict[str, Any], user: Any) -> dic
         derived_dataset_fingerprint=payload.get("derived_dataset_fingerprint"),
         source_artifact_fingerprint=payload.get("source_artifact_fingerprint"),
         discount_curve_fingerprint=payload.get("discount_curve_fingerprint"),
-        valuation_date=str(val_date),
+        valuation_date=str(val_date) if val_date is not None else None,
         valuation_parameters=payload.get("valuation_parameters"),
         model_id=payload.get("model_id"),
         model_version_id=payload.get("model_version_id"),
     )
 
+    resolved_val_date = date.fromisoformat(str(package.configuration["valuation_date"]))
+    run.valuation_date = resolved_val_date
     run.model_version_id = package.configuration["model_version"]["id"]
     run.run_package_fingerprint = package.fingerprint
     db.add(run)
@@ -308,7 +315,7 @@ def submit_valuation_run(db: Session, payload: dict[str, Any], user: Any) -> dic
     from app.db.models.valuation_detail import ValuationRunDetail
     detail = ValuationRunDetail(
         run_id=run.id,
-        valuation_date=val_date,
+        valuation_date=resolved_val_date,
         discount_curve_fingerprint=payload.get("discount_curve_fingerprint"),
         configuration=package.configuration.get("valuation", {}),
         summary_results={},

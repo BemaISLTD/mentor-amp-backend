@@ -45,34 +45,45 @@ DEFAULT_RETRY_POLICY = RetryPolicy(max_retries=3, delay=1, backoff=None)
 
 
 class InforceConfig(Config):
-    project_id: str = "proj-m5-valuation-default"
-    policy_block: str = "BLOCK_MYGA_2026"
+    project_id: str | None = None
+    policy_block: str | None = None
     inforce_file_id: str | None = None
 
 
 class ProjectionConfig(Config):
-    project_id: str = "proj-m5-valuation-default"
+    project_id: str | None = None
     projection_months: int = 12
     annual_credited_rate: float = 0.045
     annual_surrender_rate: float = 0.02
-    run_id: str = "run-m5-dagster-projection-001"
+    run_id: str | None = None
     projection_set_id: str | None = None
     model_version_id: str | None = None
     scenario_id: str | None = None
+    valuation_date: str | None = None
 
 
 class ValuationConfig(Config):
     basis: str = "STATUTORY"
     methodology: str = "VM22"
-    valuation_date: str = "2026-12-31"
+    valuation_date: str | None = None
     annual_discount_rate: float = 0.045
+
+
+class RollforwardConfig(Config):
+    prior_valuation_run_id: str | None = None
+    tolerance: float = 0.01
 
 
 class ReconciliationConfig(Config):
     expected_result_set_id: str | None = None
     target_metric: str = "present_value_reserve"
-    tolerance: float = 0.01
-    rel_tol: float = 1e-4
+    tolerance: float | None = None
+    rel_tol: float | None = None
+    halt_on_reconciliation_failure: bool = True
+
+
+class ReportingConfig(Config):
+    require_approved_reconciliation: bool = False
 
 
 @asset(
@@ -90,7 +101,7 @@ def inforce_data_asset(
         try:
             payload = execute_inforce_import(
                 db=db,
-                project_id=config.project_id,
+                project_id=config.project_id or "",
                 policy_block=config.policy_block,
                 inforce_file_id=config.inforce_file_id,
             )
@@ -162,7 +173,7 @@ def projection_run_asset(
 ) -> Output[dict[str, Any]]:
     """Run projection simulation via shared engine, persist real Parquet file, and emit persisted lineage."""
     context.log.info(f"Invoking projection service for {config.projection_months} months.")
-    project_id = validation_asset.get("project_id", config.project_id)
+    project_id = config.project_id or validation_asset.get("project_id") or ""
     with db_mod.SessionLocal() as db:
         try:
             result = execute_projection_simulation(
@@ -176,6 +187,7 @@ def projection_run_asset(
                 projection_set_id=config.projection_set_id,
                 model_version_id=config.model_version_id,
                 scenario_id=config.scenario_id,
+                valuation_date=config.valuation_date,
             )
         except ServiceError as e:
             if e.status_code >= 500:
@@ -189,6 +201,7 @@ def projection_run_asset(
         metadata={
             "run_id": MetadataValue.text(result["run_id"]),
             "artifact_id": MetadataValue.text(result["artifact_id"]),
+            "accepted_attempt_number": MetadataValue.int(result["accepted_attempt_number"]),
             "model_id": MetadataValue.text(result["model_id"]),
             "model_version_id": MetadataValue.text(result["model_version_id"]),
             "time_steps": MetadataValue.int(result["time_steps"]),
@@ -233,6 +246,7 @@ def aggregation_asset(
         metadata={
             "upstream_run_id": MetadataValue.text(result["upstream_run_id"]),
             "verified_artifact_id": MetadataValue.text(result["verified_artifact_id"]),
+            "accepted_attempt_number": MetadataValue.int(result["accepted_attempt_number"]),
             "total_cash_flow_sum": MetadataValue.float(result["total_cash_flow_sum"]),
             "ending_stock": MetadataValue.float(result["ending_account_value_stock"]),
             "cohort_id": MetadataValue.text(result["cohort_id"]),
@@ -262,10 +276,11 @@ def valuation_asset(
                 upstream_run_id=aggregation_asset["upstream_run_id"],
                 basis=config.basis,
                 methodology=config.methodology,
-                valuation_date=config.valuation_date,
+                valuation_date=config.valuation_date or "",
                 annual_discount_rate=config.annual_discount_rate,
                 aggregated_cash_flows=aggregation_asset["aggregated_cash_flows"],
                 project_id=aggregation_asset["project_id"],
+                cohort_id=aggregation_asset.get("cohort_id"),
             )
         except ServiceError as e:
             if e.status_code >= 500:
@@ -298,6 +313,7 @@ def valuation_asset(
 )
 def rollforward_asset(
     context: AssetExecutionContext,
+    config: RollforwardConfig,
     valuation_asset: dict[str, Any],
     aggregation_asset: dict[str, Any],
 ) -> Output[dict[str, Any]]:
@@ -309,7 +325,8 @@ def rollforward_asset(
                 db=db,
                 valuation_run_id=valuation_asset["valuation_run_id"],
                 project_id=valuation_asset["project_id"],
-                tolerance=Decimal("0.01"),
+                prior_valuation_run_id=config.prior_valuation_run_id,
+                tolerance=Decimal(str(config.tolerance)),
             )
         except ServiceError as e:
             if e.status_code >= 500:
@@ -328,6 +345,7 @@ def rollforward_asset(
             "cohort_id": MetadataValue.text(result["cohort_id"]),
             "basis": MetadataValue.text(result["basis"]),
             "methodology": MetadataValue.text(result["methodology"]),
+            "attribution_mode": MetadataValue.text(result["attribution_mode"]),
             "summary_id": MetadataValue.text(result["summary_id"]),
             "started_at": MetadataValue.text(result["started_at"]),
             "completed_at": MetadataValue.text(result["completed_at"]),
@@ -348,14 +366,12 @@ def reconciliation_report_asset(
 ) -> Output[dict[str, Any]]:
     """Generate three-state reconciliation report (PASS, FAIL, NOT_VERIFIABLE) via domain service."""
     context.log.info("Invoking governed reconciliation service.")
-    actual_reserve = valuation_asset["present_value_reserve"]
     with db_mod.SessionLocal() as db:
         try:
             report = execute_governed_reconciliation(
                 db=db,
                 valuation_run_id=valuation_asset["valuation_run_id"],
                 project_id=valuation_asset["project_id"],
-                actual_reserve=actual_reserve,
                 expected_result_set_id=config.expected_result_set_id,
                 target_metric=config.target_metric,
                 tolerance=config.tolerance,
@@ -371,7 +387,7 @@ def reconciliation_report_asset(
     report_metadata: dict[str, Any] = {
         "report_id": MetadataValue.text(report["report_id"]),
         "reconciliation_status": MetadataValue.text(report["status"]),
-        "actual_value": MetadataValue.float(actual_reserve),
+        "actual_value": MetadataValue.float(report["actual_value"]),
         "difference": MetadataValue.float(report["difference"]),
         "started_at": MetadataValue.text(report["started_at"]),
         "completed_at": MetadataValue.text(report["completed_at"]),
@@ -380,6 +396,17 @@ def reconciliation_report_asset(
         report_metadata["expected_result_set_id"] = MetadataValue.text(report["expected_result_set_id"])
     if report.get("expected_benchmark") is not None:
         report_metadata["expected_benchmark"] = MetadataValue.float(report["expected_benchmark"])
+
+    if report["status"] == "FAIL" and config.halt_on_reconciliation_failure:
+        raise Failure(
+            description=(
+                f"Reconciliation FAILED against governed benchmark '{report.get('expected_result_set_id')}': "
+                f"actual={report['actual_value']}, expected={report.get('expected_benchmark')}, "
+                f"difference={report['difference']}."
+            ),
+            allow_retries=False,
+            metadata=report_metadata,
+        )
 
     return Output(
         value=report,
@@ -394,6 +421,7 @@ def reconciliation_report_asset(
 )
 def reporting_asset(
     context: AssetExecutionContext,
+    config: ReportingConfig,
     valuation_asset: dict[str, Any],
     rollforward_asset: dict[str, Any],
     reconciliation_report_asset: dict[str, Any],
@@ -409,6 +437,7 @@ def reporting_asset(
                 valuation_result=valuation_asset,
                 rollforward_result=rollforward_asset,
                 reconciliation_result=reconciliation_report_asset,
+                require_approved_reconciliation=config.require_approved_reconciliation,
             )
         except ServiceError as e:
             if e.status_code >= 500:
@@ -422,6 +451,9 @@ def reporting_asset(
         metadata={
             "package_id": MetadataValue.text(package["package_id"]),
             "artifact_id": MetadataValue.text(package["artifact_id"]),
+            "artifact_type": MetadataValue.text(package["artifact_type"]),
+            "governance_status": MetadataValue.text(package["governance_status"]),
+            "is_approved_for_release": MetadataValue.bool(package["is_approved_for_release"]),
             "rollforward_verified": MetadataValue.bool(package["rollforward_verified"]),
             "reconciliation_status": MetadataValue.text(package["reconciliation_status"]),
             "manifest_sha256": MetadataValue.text(package["manifest_sha256"]),

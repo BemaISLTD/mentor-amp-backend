@@ -1,12 +1,13 @@
-"""Tests for M5 Valuation RunPackage provenance and reproducibility (Directives 3 & 16, P0-03).
+"""Tests for M5 Valuation RunPackage provenance and reproducibility (Directives 3 & 16, P0-03, V5-P0-C, V5-P0-D).
 
 Verifies:
 1. Pure reproducibility: Identical valuation inputs produce identical package fingerprints bit-for-bit.
 2. Material sensitivity: Mutating ANY valuation provenance field alters the package fingerprint.
 3. Envelope integrity: verify_envelope detects mismatches between run row and frozen valuation package.
 4. Concrete governed valuation run package artifact verification.
-5. P0-03: Trusted provenance enforcement (mandatory DB session, authoritative upstream source,
-   no caller fallback model_id/model_version_id fabrication, rejection of unapproved/foreign/mismatched models).
+5. P0-03 & V5-P0-C / V5-P0-D: Trusted provenance enforcement (mandatory DB session, authoritative upstream source,
+   accepted-attempt artifact verification, DerivedDataset physical artifact + DB Model/ModelVersion verification,
+   four-eyes dataset approval, product family match, and zero synthetic model/version fallbacks).
 """
 
 import copy
@@ -287,7 +288,7 @@ def test_tampered_package_fails_verification():
 
 
 # =============================================================================
-# Production Service Integration Tests (Directive 2, Blocker 2, & P0-03)
+# Production Service Integration Tests (Directive 2, Blocker 2, P0-03, V5-P0-C, V5-P0-D)
 # =============================================================================
 
 
@@ -313,13 +314,14 @@ def seeded_val_env(db_session_val):
     proj1 = Project(id="proj-val-1", name="Valuation Project 1")
     proj2 = Project(id="proj-val-2", name="Valuation Project 2")
     user = User(id="user-val-actuary", email="val@mentoramp.com", full_name="Val Actuary", password_hash="pwd")
-    db_session_val.add_all([proj1, proj2, user])
+    reviewer = User(id="user-val-reviewer", email="reviewer@mentoramp.com", full_name="Val Reviewer", password_hash="pwd")
+    db_session_val.add_all([proj1, proj2, user, reviewer])
     db_session_val.commit()
     mem1 = ProjectMember(project_id=proj1.id, user_id=user.id, role="owner")
     mem2 = ProjectMember(project_id=proj2.id, user_id=user.id, role="owner")
     db_session_val.add_all([mem1, mem2])
     db_session_val.commit()
-    return {"session": db_session_val, "proj1": proj1, "proj2": proj2, "user": user}
+    return {"session": db_session_val, "proj1": proj1, "proj2": proj2, "user": user, "reviewer": reviewer}
 
 
 def _ensure_governed_spia_model(
@@ -338,6 +340,7 @@ def _ensure_governed_spia_model(
             name="SPIA VM-22 Model" if model_id == "model-spia-01" else f"Model {model_id}",
             product_code=product_code,
             status="approved",
+            created_by="user-val-actuary",
         )
         db.add(model)
         db.flush()
@@ -350,6 +353,8 @@ def _ensure_governed_spia_model(
             status=mv_status,
             basis="STATUTORY",
             methodology="VM22",
+            created_by="user-val-actuary",
+            approved_by="user-val-reviewer" if mv_status in ("approved", "published") else None,
             approved_at=now_utc() if mv_status in ("approved", "published") else None,
         )
         db.add(mv)
@@ -357,7 +362,7 @@ def _ensure_governed_spia_model(
     return model, mv
 
 
-def _seed_source_projection_run(db, project_id, run_id="run-src-proj-1", status="success"):
+def _seed_source_projection_run(db, project_id, run_id="run-src-proj-1", status="success", accepted_attempt=1):
     _ensure_governed_spia_model(db, project_id)
     store = get_artifact_store()
     rows = [{"policy_id": "P1", "month": 1, "cash_flow": 100.0, "reserve": 5000.0}]
@@ -411,6 +416,8 @@ def _seed_source_projection_run(db, project_id, run_id="run-src-proj-1", status=
         horizon_months=12,
         valuation_date=date(2026, 12, 31),
         run_package_fingerprint=sealed["fingerprint"],
+        accepted_attempt_number=accepted_attempt if status in ("success", "completed") else None,
+        attempt_count=max(accepted_attempt or 0, 1),
     )
     db.add(src_run)
     db.flush()
@@ -579,6 +586,8 @@ def test_service_freeze_foreign_derived_dataset_fails(seeded_val_env):
         status="approved",
         fingerprint="a" * 64,
         created_by="user-1",
+        approved_by="user-2",
+        approved_at=now_utc(),
     )
     db.add(foreign_ds)
     db.commit()
@@ -651,6 +660,8 @@ def test_service_freeze_dataset_fingerprint_mismatch_fails(seeded_val_env):
         status="approved",
         fingerprint="c" * 64,
         created_by="user-1",
+        approved_by="user-2",
+        approved_at=now_utc(),
     )
     db.add(approved_ds)
     db.commit()
@@ -1140,3 +1151,335 @@ def test_p0_03_fabricated_foreign_unapproved_and_mismatched_model_selectors_reje
         )
     assert exc_mismatch.value.status_code == 400
     assert exc_mismatch.value.code in ("MODEL_LINEAGE_MISMATCH", "MODEL_VERSION_LINEAGE_MISMATCH")
+
+
+def test_v5_p0_c_derived_dataset_provenance_physical_and_model_verification(seeded_val_env):
+    """V5-P0-C: DerivedDataset provenance requires four-eyes approval, physical Parquet verification,
+    authoritative DB Model/ModelVersion rows (no 'M5'/'v1.0' fallbacks), and product family agreement."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+
+    src_run, _, src_art = _seed_source_projection_run(db, proj1.id, run_id="run-src-ds-v5")
+
+    # 1. Self-approved DerivedDataset -> 400 SELF_APPROVED_DATASET_FORBIDDEN
+    self_ds = DerivedDataset(
+        id="ds-self-approved",
+        project_id=proj1.id,
+        source_run_id=src_run.id,
+        source_artifact_id=src_art.id,
+        source_model_id="model-spia-01",
+        source_model_version_id="mv-spia-v1",
+        name="self_approved_ds",
+        dataset_type="projection_output",
+        version_number=1,
+        product_code="SPIA",
+        status="approved",
+        storage_uri=src_art.storage_uri,
+        file_format="parquet",
+        row_count=src_art.row_count,
+        fingerprint=src_art.checksum_sha256,
+        created_by="user-val-actuary",
+        approved_by="user-val-actuary",
+        approved_at=now_utc(),
+    )
+    db.add(self_ds)
+    db.commit()
+
+    with pytest.raises(ServiceError) as exc_self:
+        freeze_valuation_run_package(
+            db=db,
+            project=proj1,
+            run=Run(id="r-ds-self", project_id=proj1.id),
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
+            derived_dataset_id=self_ds.id,
+            valuation_date="2026-12-31",
+        )
+    assert exc_self.value.status_code == 400
+    assert exc_self.value.code == "SELF_APPROVED_DATASET_FORBIDDEN"
+
+    # 2. Approved DerivedDataset with missing source_artifact_id AND missing storage_uri -> 400 DATASET_ARTIFACT_REQUIRED
+    no_art_ds = DerivedDataset(
+        id="ds-no-art",
+        project_id=proj1.id,
+        source_run_id=src_run.id,
+        source_artifact_id=None,
+        source_model_id="model-spia-01",
+        source_model_version_id="mv-spia-v1",
+        name="no_art_ds",
+        dataset_type="projection_output",
+        version_number=1,
+        product_code="SPIA",
+        status="approved",
+        storage_uri=None,
+        file_format="parquet",
+        row_count=1,
+        fingerprint=src_art.checksum_sha256,
+        created_by="user-val-actuary",
+        approved_by="user-val-reviewer",
+        approved_at=now_utc(),
+    )
+    db.add(no_art_ds)
+    db.commit()
+
+    with pytest.raises(ServiceError) as exc_no_art:
+        freeze_valuation_run_package(
+            db=db,
+            project=proj1,
+            run=Run(id="r-ds-no-art", project_id=proj1.id),
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
+            derived_dataset_id=no_art_ds.id,
+            valuation_date="2026-12-31",
+        )
+    assert exc_no_art.value.status_code == 400
+    assert exc_no_art.value.code in ("DATASET_ARTIFACT_REQUIRED", "PHYSICAL_ARTIFACT_MISSING")
+
+    # 3. Approved DerivedDataset referencing absent DB Model/ModelVersion -> 400 MODEL_NOT_FOUND (no 'M5'/'v1.0' fallback!)
+    absent_model_ds = DerivedDataset(
+        id="ds-absent-model",
+        project_id=proj1.id,
+        source_run_id=src_run.id,
+        source_artifact_id=src_art.id,
+        source_model_id="model-ghost-999",
+        source_model_version_id="mv-ghost-999",
+        name="absent_model_ds",
+        dataset_type="projection_output",
+        version_number=1,
+        product_code="SPIA",
+        status="approved",
+        storage_uri=src_art.storage_uri,
+        file_format="parquet",
+        row_count=src_art.row_count,
+        fingerprint=src_art.checksum_sha256,
+        created_by="user-val-actuary",
+        approved_by="user-val-reviewer",
+        approved_at=now_utc(),
+    )
+    db.add(absent_model_ds)
+    db.commit()
+
+    with pytest.raises(ServiceError) as exc_ghost_m:
+        submit_valuation_run(
+            db,
+            {
+                "project_id": proj1.id,
+                "name": "Ghost Model Dataset Valuation",
+                "basis": "STATUTORY",
+                "methodology": "VM22",
+                "methodology_version": "v2024.1",
+                "valuation_date": "2026-12-31",
+                "derived_dataset_id": absent_model_ds.id,
+            },
+            user,
+        )
+    assert exc_ghost_m.value.status_code == 400
+    assert exc_ghost_m.value.code == "MODEL_NOT_FOUND"
+
+    # 4. Approved DerivedDataset with product_code mismatch vs Model.product_code -> 400 PRODUCT_MODEL_MISMATCH
+    prod_mismatch_ds = DerivedDataset(
+        id="ds-prod-mismatch",
+        project_id=proj1.id,
+        source_run_id=src_run.id,
+        source_artifact_id=src_art.id,
+        source_model_id="model-spia-01",
+        source_model_version_id="mv-spia-v1",
+        name="prod_mismatch_ds",
+        dataset_type="projection_output",
+        version_number=1,
+        product_code="FIA",  # Model is SPIA!
+        status="approved",
+        storage_uri=src_art.storage_uri,
+        file_format="parquet",
+        row_count=src_art.row_count,
+        fingerprint=src_art.checksum_sha256,
+        created_by="user-val-actuary",
+        approved_by="user-val-reviewer",
+        approved_at=now_utc(),
+    )
+    db.add(prod_mismatch_ds)
+    db.commit()
+
+    with pytest.raises(ServiceError) as exc_prod_mm:
+        freeze_valuation_run_package(
+            db=db,
+            project=proj1,
+            run=Run(id="r-ds-prod-mm", project_id=proj1.id),
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
+            derived_dataset_id=prod_mismatch_ds.id,
+            valuation_date="2026-12-31",
+        )
+    assert exc_prod_mm.value.status_code == 400
+    assert exc_prod_mm.value.code == "PRODUCT_MODEL_MISMATCH"
+
+    # 5. Valid four-eyes approved DerivedDataset succeeds end-to-end through submit_valuation_run
+    valid_ds = DerivedDataset(
+        id="ds-valid-spia",
+        project_id=proj1.id,
+        source_run_id=src_run.id,
+        source_artifact_id=src_art.id,
+        source_model_id="model-spia-01",
+        source_model_version_id="mv-spia-v1",
+        name="valid_spia_ds",
+        dataset_type="projection_output",
+        version_number=1,
+        product_code="SPIA",
+        status="approved",
+        storage_uri=src_art.storage_uri,
+        file_format="parquet",
+        row_count=src_art.row_count,
+        fingerprint=src_art.checksum_sha256,
+        created_by="user-val-actuary",
+        approved_by="user-val-reviewer",
+        approved_at=now_utc(),
+    )
+    db.add(valid_ds)
+    db.commit()
+
+    sub_res = submit_valuation_run(
+        db,
+        {
+            "project_id": proj1.id,
+            "name": "Governed DerivedDataset Valuation",
+            "basis": "STATUTORY",
+            "methodology": "VM22",
+            "methodology_version": "v2024.1",
+            "valuation_date": "2026-12-31",
+            "derived_dataset_id": valid_ds.id,
+        },
+        user,
+    )
+    assert sub_res["run"]["derived_dataset_id"] == valid_ds.id
+    val_pkg = db.get(RunPackage, sub_res["run"]["run_package_id"])
+    assert val_pkg.package["configuration"]["model"]["id"] == "model-spia-01"
+    assert val_pkg.package["configuration"]["model_version"]["id"] == "mv-spia-v1"
+    assert val_pkg.package["configuration"]["valuation"]["derived_dataset_fingerprint"] == src_art.checksum_sha256
+    assert val_pkg.package["configuration"]["valuation"]["source_artifact_fingerprint"] == src_art.checksum_sha256
+
+
+def test_v5_p0_d_source_run_accepted_attempt_and_artifact_type_verification(seeded_val_env):
+    """V5-P0-D: Valuation RunPackage freeze rejects missing accepted_attempt_number, stale attempt artifacts,
+    and non-canonical artifact types."""
+    db = seeded_val_env["session"]
+    proj1 = seeded_val_env["proj1"]
+    user = seeded_val_env["user"]
+
+    src_run, _, src_art = _seed_source_projection_run(db, proj1.id, run_id="run-src-attempt-v5", accepted_attempt=2)
+
+    # Create a canonical artifact for attempt 2 as well so we can test selecting attempt 1 vs attempt 2
+    store = get_artifact_store()
+    stored_att2 = store.write_rows(
+        run_id=src_run.id,
+        artifact_type="outputs",
+        rows=[{"policy_id": "P1", "month": 1, "cash_flow": 200.0, "reserve": 5100.0}],
+        attempt_number=2,
+        schema_version="m2-v1",
+    )
+    art_att2 = RunArtifact(
+        id="art-att2-canonical",
+        run_id=src_run.id,
+        attempt_number=2,
+        artifact_type="outputs",
+        storage_uri=stored_att2.uri,
+        storage_backend="local",
+        file_format="parquet",
+        schema_version="m2-v1",
+        row_count=stored_att2.row_count,
+        checksum_sha256=stored_att2.checksum_sha256,
+    )
+    stored_log_att2 = store.write_rows(
+        run_id=src_run.id,
+        artifact_type="log",
+        rows=[{"policy_id": "P1", "month": 1, "cash_flow": 200.0, "reserve": 5100.0}],
+        attempt_number=2,
+        schema_version="m2-v1",
+    )
+    art_log_att2 = RunArtifact(
+        id="art-att2-log",
+        run_id=src_run.id,
+        attempt_number=2,
+        artifact_type="log",
+        storage_uri=stored_log_att2.uri,
+        storage_backend="local",
+        file_format="parquet",
+        schema_version="m2-v1",
+        row_count=stored_log_att2.row_count,
+        checksum_sha256=stored_log_att2.checksum_sha256,
+    )
+    db.add_all([art_att2, art_log_att2])
+    db.commit()
+
+    # 1. Passing stale attempt 1 artifact ID when accepted_attempt_number == 2 -> 400 ARTIFACT_ATTEMPT_MISMATCH
+    with pytest.raises(ServiceError) as exc_stale:
+        freeze_valuation_run_package(
+            db=db,
+            project=proj1,
+            run=Run(id="r-stale-att", project_id=proj1.id),
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
+            source_projection_run_id=src_run.id,
+            source_artifact_id=src_art.id,  # attempt 1!
+            valuation_date="2026-12-31",
+        )
+    assert exc_stale.value.status_code == 400
+    assert exc_stale.value.code == "ARTIFACT_ATTEMPT_MISMATCH"
+
+    # 2. Passing non-canonical artifact_type='log' -> 400 INVALID_ARTIFACT_TYPE
+    with pytest.raises(ServiceError) as exc_type:
+        freeze_valuation_run_package(
+            db=db,
+            project=proj1,
+            run=Run(id="r-bad-type", project_id=proj1.id),
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
+            source_projection_run_id=src_run.id,
+            source_artifact_id=art_log_att2.id,
+            valuation_date="2026-12-31",
+        )
+    assert exc_type.value.status_code == 400
+    assert exc_type.value.code == "INVALID_ARTIFACT_TYPE"
+
+    # 3. Omitting source_artifact_id automatically selects the accepted attempt 2 canonical artifact (never attempt 1!)
+    pkg_att2 = freeze_valuation_run_package(
+        db=db,
+        project=proj1,
+        run=Run(id="r-auto-att2", project_id=proj1.id),
+        user=user,
+        basis="STATUTORY",
+        methodology="VM22",
+        methodology_version="v2024.1",
+        source_projection_run_id=src_run.id,
+        valuation_date="2026-12-31",
+    )
+    assert pkg_att2.configuration["valuation"]["source_artifact_id"] == art_att2.id
+    assert pkg_att2.configuration["valuation"]["source_artifact_fingerprint"] == art_att2.checksum_sha256
+
+    # 4. Source run with accepted_attempt_number = None -> 400 ACCEPTED_ATTEMPT_MISSING
+    src_run.accepted_attempt_number = None
+    db.commit()
+    with pytest.raises(ServiceError) as exc_no_acc:
+        freeze_valuation_run_package(
+            db=db,
+            project=proj1,
+            run=Run(id="r-no-acc", project_id=proj1.id),
+            user=user,
+            basis="STATUTORY",
+            methodology="VM22",
+            methodology_version="v2024.1",
+            source_projection_run_id=src_run.id,
+            valuation_date="2026-12-31",
+        )
+    assert exc_no_acc.value.status_code == 400
+    assert exc_no_acc.value.code == "ACCEPTED_ATTEMPT_MISSING"

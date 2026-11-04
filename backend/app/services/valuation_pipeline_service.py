@@ -1,4 +1,4 @@
-"""Actuarial Valuation Pipeline Domain Service (M5 Directives & V5 Senior Review).
+"""Actuarial Valuation Pipeline Domain Service (M5 Directives & V6 Senior Review).
 
 Orchestration Invariant:
     All actuarial formulas, data persistence, and calculations live in domain services
@@ -7,14 +7,17 @@ Orchestration Invariant:
     emitting lineage metadata, and routing failures/retries.
 
 Sequence:
-    1. Governed Inforce Import / Ingestion (from validated/approved InforceFile & InforceRecord)
+    1. Governed Inforce Import / Ingestion (explicit InforceFile & InforceRecord; no latest-file fallback)
     2. Governed Inforce Validation (via shared inforce validator + integrity checks)
-    3. Governed Projection Execution (via shared projection engine, ProjectionSet, ModelVersion, FormulaRegistry)
-    4. Verified Columnar Aggregation (Polars from verified RunArtifact Parquet; flows sum, stocks end-of-period)
+    3. Governed Projection Execution (explicit ModelVersion/ProjectionSet, Scenario, ValuationDate;
+       idempotent recovery on same run_id across partial persistence / execution / finalization faults)
+    4. Verified Columnar Aggregation (Polars strictly from accepted-attempt canonical RunArtifact Parquet)
     5. Foundation Valuation (Time-value-of-money generic PV discounting; gated VM21/VM22)
-    6. Valuation-Linked Rollforward Attribution (Decimal continuity validation & component persistence)
-    7. Governed Reconciliation (Approved ExpectedResultSet only: PASS, FAIL, NOT_VERIFIABLE)
-    8. Reporting & Audit Manifest Export
+    6. Valuation-Linked Rollforward Attribution (Illustrative generic PV separated from regulatory verticals;
+       supports explicit prior/current valuation run period comparison; rejects balancing plugs)
+    7. Governed Reconciliation (Persisted ValuationRunDetail actuals, four-eyes approved ExpectedResultSet,
+       scoped key matching, governed tolerances: PASS, FAIL, NOT_VERIFIABLE)
+    8. Reporting & Audit Manifest Export (Technical materialization vs governance acceptance)
 """
 
 from __future__ import annotations
@@ -44,11 +47,11 @@ from app.core.valuation.primitives import (
     present_value,
 )
 from app.core.valuation.rollforward import (
-    get_methodology_template,
     record_rollforward_summary,
     validate_continuity,
 )
 from app.core.valuation.taxonomy import (
+    ValuationTaxonomyError,
     validate_basis,
     validate_basis_methodology_pair,
     validate_methodology,
@@ -57,28 +60,49 @@ from app.data.validation.inforce_validator import validate_inforce
 from app.db.models.assumption import AssumptionSet, AssumptionTable
 from app.db.models.factor import FactorSet, FactorTable
 from app.db.models.inforce import InforceFile, InforceRecord
-from app.db.models.modeling import Model, ModelVersion
+from app.db.models.modeling import Model, ModelPublishedOutput, ModelVersion
 from app.db.models.project import Project
 from app.db.models.projection import ProjectionSet, RunSet
 from app.db.models.reconciliation import ExpectedResultSet, ReconciliationReport
 from app.db.models.rollforward import RollforwardSummary
 from app.db.models.run import Run
 from app.db.models.run_artifact import RunArtifact
-from app.db.models.run_package import RunPackage
+from app.db.models.run_package import RunAttempt, RunPackage
 from app.db.models.scenario import ScenarioSet, ScenarioTable
 from app.db.models.user import User
 from app.db.models.valuation_detail import ValuationRunDetail
 from app.services import (
     projection_set_service,
     run_execution_service,
+    run_finalization,
     run_package_service,
 )
 from app.services.common import ServiceError, iso, now_utc
 from app.services.run_package_service import freeze_valuation_run_package
 
 
+FORBIDDEN_DEFAULT_PROJECT_IDS = frozenset({"proj-m5-valuation-default"})
+FORBIDDEN_DEFAULT_RUN_IDS = frozenset({"run-m5-dagster-projection-001"})
+CANONICAL_OUTPUT_ARTIFACT_TYPES = ("outputs", "cash_flows")
+FORBIDDEN_RESIDUAL_MOVEMENT_NAMES = frozenset({
+    "unexplained_residual",
+    "unexplained_movement",
+    "balancing_residual",
+    "balancing_plug",
+    "plug",
+    "residual",
+})
+GOVERNED_DEFAULT_ABS_TOL = 0.01
+GOVERNED_DEFAULT_REL_TOL = 1e-4
+
+
+def _after_initial_run_commit_hook(db: Session, run_id: str) -> None:
+    """Seam invoked after initial Run/RunPackage commit and before engine execution (for partial-write retry tests)."""
+    return None
+
+
 def _normalize_product_family(code: str | None) -> str:
-    if not code:
+    if not code or not str(code).strip():
         return "UNKNOWN"
     low = str(code).strip().lower()
     if "myga" in low:
@@ -89,65 +113,64 @@ def _normalize_product_family(code: str | None) -> str:
         return "FIA"
     if "rila" in low:
         return "RILA"
-    return str(code).strip().upper()
+    return "UNKNOWN"
+
+
+def _parse_governed_date(raw_date: str | date | None, field_name: str = "valuation_date") -> date:
+    if raw_date is None or (isinstance(raw_date, str) and not raw_date.strip()):
+        raise ServiceError(
+            400,
+            "VALUATION_DATE_REQUIRED",
+            f"Governed execution requires an explicit '{field_name}' (YYYY-MM-DD); implicit date defaults are forbidden.",
+        )
+    if isinstance(raw_date, date) and not isinstance(raw_date, datetime):
+        return raw_date
+    try:
+        return date.fromisoformat(str(raw_date).strip())
+    except (ValueError, TypeError) as exc:
+        raise ServiceError(
+            400,
+            "INVALID_VALUATION_DATE",
+            f"Invalid {field_name} '{raw_date}': expected ISO YYYY-MM-DD date.",
+        ) from exc
 
 
 def execute_inforce_import(
     db: Session,
     project_id: str,
     inforce_file_id: str | None = None,
-    policy_block: str = "BLOCK_MYGA_2026",
+    policy_block: str | None = None,
 ) -> dict[str, Any]:
-    """Load and verify a governed InforceFile and its InforceRecords from PostgreSQL."""
+    """Load and verify a governed InforceFile and its InforceRecords from PostgreSQL (V5-P0-B: no implicit file selection)."""
     started_at = datetime.now(timezone.utc).isoformat()
 
     if db is None:
         raise ServiceError(500, "DATABASE_REQUIRED", "Governed inforce import requires an active database session.")
 
+    if not project_id or not str(project_id).strip() or str(project_id).strip() in FORBIDDEN_DEFAULT_PROJECT_IDS:
+        raise ServiceError(
+            400,
+            "PROJECT_ID_REQUIRED",
+            "Governed inforce import requires an explicit project_id; default project identities are forbidden.",
+        )
+
     project = db.get(Project, project_id)
     if not project:
         raise ServiceError(404, "PROJECT_NOT_FOUND", f"Project '{project_id}' not found.")
 
-    inforce_file: InforceFile | None = None
-    if inforce_file_id:
-        inforce_file = db.get(InforceFile, inforce_file_id)
-        if inforce_file is None or inforce_file.project_id != project_id:
-            raise ServiceError(
-                404, "INFORCE_NOT_FOUND",
-                f"Inforce file '{inforce_file_id}' not found in project '{project_id}'.",
-            )
-    else:
-        # Resolve by filename/version_label matching policy_block, or active governed file in project
-        q = db.query(InforceFile).filter(InforceFile.project_id == project_id)
-        if policy_block and policy_block != "BLOCK_MYGA_2026":
-            inforce_file = (
-                q.filter(
-                    (InforceFile.id == policy_block)
-                    | (InforceFile.filename == policy_block)
-                    | (InforceFile.version_label == policy_block)
-                )
-                .order_by(InforceFile.uploaded_at.desc())
-                .first()
-            )
-            if inforce_file is None:
-                raise ServiceError(
-                    404, "INFORCE_NOT_FOUND",
-                    f"Inforce file matching '{policy_block}' not found in project '{project_id}'.",
-                )
-        else:
-            inforce_file = (
-                q.filter(InforceFile.status.in_(lifecycle.RUNNABLE_INPUT_STATUSES))
-                .order_by(InforceFile.uploaded_at.desc())
-                .first()
-            )
-            if inforce_file is None:
-                inforce_file = q.order_by(InforceFile.uploaded_at.desc()).first()
+    if not inforce_file_id or not str(inforce_file_id).strip():
+        raise ServiceError(
+            400,
+            "INFORCE_FILE_REQUIRED",
+            "Governed inforce import requires an explicit 'inforce_file_id'; implicit latest-file selection is forbidden.",
+        )
 
-        if inforce_file is None:
-            raise ServiceError(
-                404, "INFORCE_NOT_FOUND",
-                f"No governed InforceFile found in project '{project_id}'. Import and approve an inforce dataset first.",
-            )
+    inforce_file = db.get(InforceFile, inforce_file_id)
+    if inforce_file is None or inforce_file.project_id != project_id:
+        raise ServiceError(
+            404, "INFORCE_NOT_FOUND",
+            f"Inforce file '{inforce_file_id}' not found in project '{project_id}'.",
+        )
 
     if inforce_file.status not in lifecycle.RUNNABLE_INPUT_STATUSES:
         raise ServiceError(
@@ -238,6 +261,10 @@ def execute_inforce_validation(
             errors.append(f"Row {idx}: Invalid or duplicate policy_id '{pid}'")
         seen_ids.add(pid)
 
+        fam = _normalize_product_family(p.get("product_type") or p.get("product_code"))
+        if fam == "UNKNOWN":
+            errors.append(f"Row {idx} ({pid}): Missing or unrecognized product_type/product_code")
+
         age_raw = p.get("issue_age")
         try:
             age = int(float(age_raw)) if age_raw is not None else None
@@ -255,7 +282,6 @@ def execute_inforce_validation(
                 except (ValueError, TypeError):
                     errors.append(f"Row {idx} ({pid}): Non-numeric {num_field} {p[num_field]}")
 
-    # Also invoke the canonical inforce validator when standard columns are present
     validator_errors = validate_inforce(policies)
     for verr in validator_errors:
         errors.append(str(verr))
@@ -306,17 +332,43 @@ def execute_projection_simulation(
     projection_set_id: str | None = None,
     model_version_id: str | None = None,
     scenario_id: str | None = None,
+    valuation_date: str | date | None = None,
 ) -> dict[str, Any]:
-    """Execute governed projection via shared projection engine, ModelVersion, FormulaRegistry, and RunPackage."""
+    """Execute governed projection via shared projection engine, ModelVersion, FormulaRegistry, and RunPackage.
+
+    Enforces V5-P0-B & V5-P1-G:
+    - Explicit project_id, run_id, product_code, model_version_id/projection_set_id, scenario_id, and valuation_date.
+    - Idempotent retry/recovery on the same run_id without minting duplicate canonical Run rows.
+    """
     started_at = datetime.now(timezone.utc).isoformat()
     if db is None:
         raise ServiceError(500, "DATABASE_REQUIRED", "Governed projection execution requires an active database session.")
+
+    if not project_id or not str(project_id).strip() or str(project_id).strip() in FORBIDDEN_DEFAULT_PROJECT_IDS:
+        raise ServiceError(
+            400,
+            "PROJECT_ID_REQUIRED",
+            "Governed projection requires an explicit project_id; default project identities are forbidden.",
+        )
+
+    if not run_id or not str(run_id).strip() or str(run_id).strip() in FORBIDDEN_DEFAULT_RUN_IDS:
+        raise ServiceError(
+            400,
+            "RUN_ID_REQUIRED",
+            "Governed projection requires an explicit run_id; default run identities are forbidden.",
+        )
+    effective_run_id = str(run_id).strip()
 
     project = db.get(Project, project_id)
     if not project:
         raise ServiceError(404, "PROJECT_NOT_FOUND", f"Project '{project_id}' not found.")
 
-    policies = validated_inforce.get("validated_policies") or validated_inforce.get("policies") or []
+    policies = (
+        validated_inforce.get("validated_policies")
+        or validated_inforce.get("policies")
+        or validated_inforce.get("records")
+        or []
+    )
     if not policies:
         raise ServiceError(422, "INFORCE_VALIDATION_EMPTY", "Cannot execute projection on empty inforce block.")
 
@@ -332,20 +384,33 @@ def execute_projection_simulation(
     if inforce_file.status not in lifecycle.RUNNABLE_INPUT_STATUSES:
         raise ServiceError(400, "INFORCE_NOT_APPROVED", f"Inforce file '{inforce_file_id}' is not validated/approved.")
 
-    # Determine product family from validated inforce records
-    policy_families = {
+    # V5-P0-B: Strictly require explicit product code on every policy record (zero MYGA fallback)
+    raw_families = [
         _normalize_product_family(p.get("product_type") or p.get("product_code"))
         for p in policies
-    }
-    policy_families.discard("UNKNOWN")
+    ]
+    if any(fam == "UNKNOWN" for fam in raw_families):
+        raise ServiceError(
+            400,
+            "PRODUCT_CODE_REQUIRED",
+            "All inforce records must specify a recognized product_type/product_code; implicit product family fallback is forbidden.",
+        )
+    policy_families = set(raw_families)
     if len(policy_families) > 1:
         raise ServiceError(
             400, "HETEROGENEOUS_INFORCE_BLOCK",
             f"Inforce block contains mixed product families: {sorted(policy_families)}.",
         )
-    inforce_family = next(iter(policy_families)) if policy_families else "MYGA"
+    inforce_family = next(iter(policy_families))
 
-    # Resolve ProjectionSet / ModelVersion / Model from PostgreSQL
+    # V5-P0-B: Require explicit projection_set_id or explicit model_version_id (no silent scan for first model)
+    if not projection_set_id and not model_version_id:
+        raise ServiceError(
+            400,
+            "MODEL_IDENTITY_REQUIRED",
+            "Governed projection execution requires an explicit 'projection_set_id' or 'model_version_id'; implicit model selection is forbidden.",
+        )
+
     ps: ProjectionSet | None = None
     mv: ModelVersion | None = None
     model: Model | None = None
@@ -361,6 +426,11 @@ def execute_projection_simulation(
             raise ServiceError(
                 400, "PROJECTION_SET_NOT_VALIDATED",
                 f"ProjectionSet '{projection_set_id}' is not validated (status: {ps.status}).",
+            )
+        if inforce_file.id not in (ps.inforce_file_ids or []):
+            raise ServiceError(
+                400, "PROJECTION_SET_INFORCE_MISMATCH",
+                f"ProjectionSet '{projection_set_id}' is not bound to inforce_file_id '{inforce_file.id}'.",
             )
         if model_version_id and ps.model_version_id != model_version_id:
             raise ServiceError(
@@ -381,36 +451,9 @@ def execute_projection_simulation(
             )
 
     if mv is None:
-        # Find active governed Model + ModelVersion in project matching the inforce product family
-        project_models = (
-            db.query(Model)
-            .filter(Model.project_id == project_id, Model.deleted_at.is_(None))
-            .all()
-        )
-        matching_models = [
-            m for m in project_models
-            if _normalize_product_family(m.product_code) == inforce_family
-        ]
-        candidate_models = matching_models or project_models
-        for cand_m in candidate_models:
-            cand_mv = (
-                db.query(ModelVersion)
-                .filter(
-                    ModelVersion.model_id == cand_m.id,
-                    ModelVersion.deleted_at.is_(None),
-                )
-                .order_by(ModelVersion.is_current.desc(), ModelVersion.version_number.desc())
-                .first()
-            )
-            if cand_mv is not None:
-                mv = cand_mv
-                model = cand_m
-                break
-
-    if mv is None:
         raise ServiceError(
             404, "MODEL_VERSION_NOT_FOUND",
-            f"No governed ModelVersion found in project '{project_id}'.",
+            f"ModelVersion not found in project '{project_id}'.",
         )
     if model is None:
         model = db.get(Model, mv.model_id)
@@ -421,12 +464,22 @@ def execute_projection_simulation(
         )
     if model.deleted_at is not None or mv.deleted_at is not None:
         raise ServiceError(400, "MODEL_DELETED", f"Model '{model.id}' or version '{mv.id}' is deleted.")
+    if model.status not in ("active", "validated", "approved", "published"):
+        raise ServiceError(
+            400, "MODEL_NOT_APPROVED",
+            f"Model '{model.id}' (status: '{model.status}') is not in a runnable governance state.",
+        )
 
-    # Require approved / published (or validated with approval evidence) ModelVersion
-    if mv.status not in ("approved", "published") and mv.approved_at is None:
+    # Require approved / published ModelVersion with independent approval evidence
+    if mv.status not in ("approved", "published") or mv.approved_at is None:
         raise ServiceError(
             400, "MODEL_VERSION_NOT_APPROVED",
             f"ModelVersion '{mv.id}' (status: '{mv.status}') must be approved for governed execution.",
+        )
+    if mv.approved_by and mv.created_by and mv.approved_by == mv.created_by:
+        raise ServiceError(
+            400, "SELF_APPROVED_MODEL_FORBIDDEN",
+            f"ModelVersion '{mv.id}' violates four-eyes governance (created_by == approved_by).",
         )
 
     # Enforce strict product family match between inforce policies and Model.product_code (P0-02)
@@ -437,25 +490,85 @@ def execute_projection_simulation(
             f"Inforce product family '{inforce_family}' mismatches Model '{model.id}' product_code '{model.product_code}' ({model_family}).",
         )
 
-    # Resolve actor
+    # Resolve scenario & valuation_date explicitly (V5-P0-B: no silent first-scenario or hardcoded 2026-12-31)
+    effective_scenario_id: str | None = None
+    if scenario_id and str(scenario_id).strip():
+        effective_scenario_id = str(scenario_id).strip()
+        scen_row = db.get(ScenarioTable, effective_scenario_id)
+        scen_set = db.get(ScenarioSet, scen_row.set_id) if scen_row else None
+        if scen_row is None or scen_set is None or scen_set.project_id != project_id:
+            raise ServiceError(
+                404, "SCENARIO_NOT_FOUND",
+                f"Scenario '{effective_scenario_id}' not found in project '{project_id}'.",
+            )
+        if scen_row.status not in lifecycle.RUNNABLE_INPUT_STATUSES:
+            raise ServiceError(
+                400, "SCENARIO_NOT_APPROVED",
+                f"Scenario '{effective_scenario_id}' has status '{scen_row.status}'; must be validated/approved.",
+            )
+        if ps is not None and ps.scenario_ids and effective_scenario_id not in ps.scenario_ids:
+            raise ServiceError(
+                400, "SCENARIO_MISMATCH",
+                f"Scenario '{effective_scenario_id}' is not configured on ProjectionSet '{ps.id}'.",
+            )
+    elif ps is not None:
+        ps_scens = list(ps.scenario_ids or [])
+        if len(ps_scens) == 0:
+            raise ServiceError(400, "SCENARIO_REQUIRED", f"ProjectionSet '{ps.id}' has no scenarios configured.")
+        if len(ps_scens) > 1:
+            raise ServiceError(
+                400,
+                "AMBIGUOUS_SCENARIO_SELECTION",
+                f"ProjectionSet '{ps.id}' has {len(ps_scens)} scenarios; an explicit 'scenario_id' is required.",
+            )
+        effective_scenario_id = ps_scens[0]
+    else:
+        raise ServiceError(
+            400,
+            "SCENARIO_REQUIRED",
+            "Governed projection without projection_set_id requires an explicit 'scenario_id'; implicit scenario selection is forbidden.",
+        )
+
+    if valuation_date is not None and str(valuation_date).strip() != "":
+        parsed_val_date = _parse_governed_date(valuation_date, "valuation_date")
+        if ps is not None and ps.valuation_date and ps.valuation_date != parsed_val_date:
+            raise ServiceError(
+                400,
+                "VALUATION_DATE_MISMATCH",
+                f"Requested valuation_date '{parsed_val_date}' conflicts with ProjectionSet valuation_date '{ps.valuation_date}'.",
+            )
+    elif ps is not None and ps.valuation_date is not None:
+        parsed_val_date = ps.valuation_date
+    else:
+        raise ServiceError(
+            400,
+            "VALUATION_DATE_REQUIRED",
+            "Governed projection requires an explicit 'valuation_date' (YYYY-MM-DD); implicit date defaults are forbidden.",
+        )
+
     actor = db.get(User, project.created_by) if project.created_by else None
     if actor is None:
         actor = db.query(User).first()
 
-    # Resolve or build governed ProjectionSet bound to the verified inforce file and model version
-    if ps is None:
-        ps = (
-            db.query(ProjectionSet)
-            .filter(
-                ProjectionSet.project_id == project_id,
-                ProjectionSet.model_version_id == mv.id,
+    # V5-P1-G: Check if effective_run_id already exists from an interrupted/retried execution
+    existing_run = db.get(Run, effective_run_id)
+    if existing_run is not None:
+        if (
+            existing_run.project_id != project_id
+            or existing_run.run_type != "projection"
+            or existing_run.model_version_id != mv.id
+            or existing_run.scenario_id != effective_scenario_id
+            or existing_run.valuation_date != parsed_val_date
+            or existing_run.horizon_months != projection_months
+        ):
+            raise ServiceError(
+                409,
+                "RUN_ID_CONFLICT",
+                f"Run '{effective_run_id}' already exists with different governed parameters.",
             )
-            .order_by(ProjectionSet.created_at.desc())
-            .first()
-        )
+        ps = db.get(ProjectionSet, existing_run.projection_set_id) if existing_run.projection_set_id else ps
 
-    # Ensure assumption tables, factor tables, and scenarios are resolved from the project
-    if ps is None or ps.inforce_file_ids != [inforce_file.id] or ps.horizon_months != projection_months:
+    if ps is None or ps.inforce_file_ids != [inforce_file.id] or ps.horizon_months != projection_months or ps.valuation_date != parsed_val_date:
         assumption_tables = (
             db.query(AssumptionTable)
             .join(AssumptionSet, AssumptionTable.set_id == AssumptionSet.id)
@@ -474,22 +587,6 @@ def execute_projection_simulation(
             )
             .all()
         )
-        scenarios = (
-            db.query(ScenarioTable)
-            .join(ScenarioSet, ScenarioTable.set_id == ScenarioSet.id)
-            .filter(
-                ScenarioSet.project_id == project_id,
-                ScenarioTable.status.in_(lifecycle.RUNNABLE_INPUT_STATUSES),
-            )
-            .order_by(ScenarioTable.created_at.asc())
-            .all()
-        )
-        if not scenarios:
-            raise ServiceError(
-                400, "SCENARIO_NOT_FOUND",
-                f"No runnable ScenarioTable found in project '{project_id}'.",
-            )
-        from app.db.models.modeling import ModelPublishedOutput
         pub_outputs = [
             r.variable_name
             for r in db.query(ModelPublishedOutput)
@@ -506,8 +603,8 @@ def execute_projection_simulation(
             inforce_file_ids=[inforce_file.id],
             assumption_table_ids=[t.id for t in assumption_tables],
             factor_table_ids=[t.id for t in factor_tables],
-            scenario_ids=[s.id for s in scenarios],
-            valuation_date=date(2026, 12, 31),
+            scenario_ids=[effective_scenario_id],
+            valuation_date=parsed_val_date,
             horizon_months=projection_months,
             time_step="monthly",
             output_variables=pub_outputs,
@@ -526,96 +623,156 @@ def execute_projection_simulation(
             )
         db.refresh(ps)
 
-    effective_scenario_id = scenario_id or (ps.scenario_ids[0] if ps.scenario_ids else None)
-    if not effective_scenario_id:
-        raise ServiceError(400, "SCENARIO_REQUIRED", "ProjectionSet has no scenarios configured.")
+    pkg_row: RunPackage | None = None
+    if existing_run is None:
+        run_set_id = f"rs-{uuid.uuid4().hex[:12]}"
+        frozen_pkg = run_package_service.freeze(
+            db=db,
+            project=project,
+            projection_set=ps,
+            scenario_id=effective_scenario_id,
+            user=actor,
+            run_id=effective_run_id,
+            run_set_id=run_set_id,
+        )
 
-    effective_run_id = run_id or f"run-proj-{uuid.uuid4().hex[:12]}"
-    # If a run with effective_run_id already exists from a previous distinct execution, ensure unique ID
-    existing_run = db.get(Run, effective_run_id)
-    if existing_run is not None:
-        effective_run_id = f"{effective_run_id}-{uuid.uuid4().hex[:6]}"
+        submitted_at = now_utc()
+        run_set = RunSet(
+            id=run_set_id,
+            project_id=project_id,
+            name=f"Pipeline Run Set {effective_run_id}",
+            projection_set_ids=[ps.id],
+            scenario_ids=[effective_scenario_id],
+            resolution={
+                "requested_scenario_ids": [effective_scenario_id],
+                "projection_sets": [
+                    {
+                        "projection_set_id": ps.id,
+                        "scenario_source": "pipeline",
+                        "scenario_ids": [effective_scenario_id],
+                        "runs": [{"run_id": effective_run_id, "scenario_id": effective_scenario_id}],
+                    }
+                ],
+            },
+            status=run_state.RUN_SET_QUEUED,
+            created_by=actor.id if actor else None,
+            submitted_at=submitted_at,
+        )
+        db.add(run_set)
+        db.flush()
 
-    run_set_id = f"rs-{uuid.uuid4().hex[:12]}"
-    frozen_pkg = run_package_service.freeze(
-        db=db,
-        project=project,
-        projection_set=ps,
-        scenario_id=effective_scenario_id,
-        user=actor,
-        run_id=effective_run_id,
-        run_set_id=run_set_id,
-    )
+        conf = frozen_pkg.configuration
+        run_obj = Run(
+            id=effective_run_id,
+            project_id=project_id,
+            name=f"{ps.name} · {conf['scenario']['name']}",
+            projection_key=f"{ps.name}@{ps.version_label}",
+            status=run_state.PENDING,
+            run_type="projection",
+            run_set_id=run_set.id,
+            projection_set_id=ps.id,
+            model_version_id=mv.id,
+            scenario_id=effective_scenario_id,
+            valuation_date=date.fromisoformat(conf["valuation_date"]),
+            horizon_months=conf["horizon_months"],
+            illustrative=bool(conf["model_version"].get("illustrative", False)),
+            triggered_by=actor.id if actor else None,
+            run_package_fingerprint=frozen_pkg.fingerprint,
+            attempt_count=0,
+        )
+        db.add(run_obj)
+        db.flush()
 
-    submitted_at = now_utc()
-    run_set = RunSet(
-        id=run_set_id,
-        project_id=project_id,
-        name=f"Pipeline Run Set {effective_run_id}",
-        projection_set_ids=[ps.id],
-        scenario_ids=[effective_scenario_id],
-        resolution={
-            "requested_scenario_ids": [effective_scenario_id],
-            "projection_sets": [
-                {
-                    "projection_set_id": ps.id,
-                    "scenario_source": "pipeline",
-                    "scenario_ids": [effective_scenario_id],
-                    "runs": [{"run_id": effective_run_id, "scenario_id": effective_scenario_id}],
-                }
-            ],
-        },
-        status=run_state.RUN_SET_QUEUED,
-        created_by=actor.id if actor else None,
-        submitted_at=submitted_at,
-    )
-    db.add(run_set)
-    db.flush()
+        pkg_row = RunPackage(
+            id=frozen_pkg.document["identity"]["package_id"],
+            run_id=run_obj.id,
+            project_id=project_id,
+            schema_version=frozen_pkg.document["schema_version"],
+            fingerprint_algorithm=frozen_pkg.document["fingerprint_algorithm"],
+            fingerprint=frozen_pkg.fingerprint,
+            package=frozen_pkg.document,
+            created_by=actor.id if actor else None,
+        )
+        db.add(pkg_row)
+        db.commit()
+    else:
+        # V5-P1-G: Recover or resume existing_run on the SAME immutable run_id without creating duplicates
+        run_obj = existing_run
+        pkg_row = db.query(RunPackage).filter(RunPackage.run_id == run_obj.id).first()
+        if pkg_row is None:
+            frozen_pkg = run_package_service.freeze(
+                db=db,
+                project=project,
+                projection_set=ps,
+                scenario_id=effective_scenario_id,
+                user=actor,
+                run_id=run_obj.id,
+                run_set_id=run_obj.run_set_id,
+            )
+            run_obj.run_package_fingerprint = frozen_pkg.fingerprint
+            pkg_row = RunPackage(
+                id=frozen_pkg.document["identity"]["package_id"],
+                run_id=run_obj.id,
+                project_id=project_id,
+                schema_version=frozen_pkg.document["schema_version"],
+                fingerprint_algorithm=frozen_pkg.document["fingerprint_algorithm"],
+                fingerprint=frozen_pkg.fingerprint,
+                package=frozen_pkg.document,
+                created_by=actor.id if actor else None,
+            )
+            db.add(pkg_row)
+            db.commit()
 
-    conf = frozen_pkg.configuration
-    run_obj = Run(
-        id=effective_run_id,
-        project_id=project_id,
-        name=f"{ps.name} · {conf['scenario']['name']}",
-        projection_key=f"{ps.name}@{ps.version_label}",
-        status=run_state.PENDING,
-        run_type="projection",
-        run_set_id=run_set.id,
-        projection_set_id=ps.id,
-        model_version_id=mv.id,
-        scenario_id=effective_scenario_id,
-        valuation_date=date.fromisoformat(conf["valuation_date"]),
-        horizon_months=conf["horizon_months"],
-        illustrative=bool(conf["model_version"].get("illustrative", False)),
-        triggered_by=actor.id if actor else None,
-        run_package_fingerprint=frozen_pkg.fingerprint,
-        attempt_count=0,
-    )
-    db.add(run_obj)
-    db.flush()
+        if run_obj.status == run_state.RUNNING:
+            rec_res = run_finalization.recover_run_finalization(db, run_obj.id)
+            if rec_res.state in ("finalized", "already_finalized"):
+                db.refresh(run_obj)
+            else:
+                # Interrupted mid-calculation before intended_outcome was recorded: mark attempt failed and reopen run as PENDING
+                running_attempts = (
+                    db.query(RunAttempt)
+                    .filter(RunAttempt.run_id == run_obj.id, RunAttempt.status == run_state.RUNNING)
+                    .all()
+                )
+                for att in running_attempts:
+                    att.status = run_state.FAILED
+                    att.completed_at = now_utc()
+                    att.cleanup_status = "retained_noncanonical"
+                    att.error_type = "TRANSIENT_INTERRUPTION"
+                    att.error_message = "Attempt interrupted prior to terminal outcome; superseded by retry."
+                run_obj.status = run_state.PENDING
+                run_obj.accepted_attempt_number = None
+                run_obj.completed_at = None
+                db.commit()
+        elif run_obj.status == run_state.FAILED:
+            # Preserve failed RunAttempt rows as noncanonical audit evidence and reopen run for retry attempt
+            run_obj.status = run_state.PENDING
+            run_obj.accepted_attempt_number = None
+            run_obj.completed_at = None
+            db.commit()
 
-    pkg_row = RunPackage(
-        id=frozen_pkg.document["identity"]["package_id"],
-        run_id=run_obj.id,
-        project_id=project_id,
-        schema_version=frozen_pkg.document["schema_version"],
-        fingerprint_algorithm=frozen_pkg.document["fingerprint_algorithm"],
-        fingerprint=frozen_pkg.fingerprint,
-        package=frozen_pkg.document,
-        created_by=actor.id if actor else None,
-    )
-    db.add(pkg_row)
-    db.commit()
-    db.expunge_all()
+    pkg_id = pkg_row.id
+    pkg_fp = pkg_row.fingerprint
 
-    # Execute via the shared projection engine
-    final_status = run_execution_service.execute_run(db, effective_run_id)
+    # Seam for testing partial-write fault after initial Run/RunPackage commit
+    _after_initial_run_commit_hook(db, effective_run_id)
+
     run_obj = db.get(Run, effective_run_id)
-    if run_obj is None or (final_status not in ("completed", "success") and run_obj.status not in ("completed", "success")):
-        status_str = getattr(run_obj, "status", "missing")
+    if run_obj.status not in ("completed", "success") or not run_finalization.evidence_consistent(db, run_obj):
+        db.expunge_all()
+        final_status = run_execution_service.execute_run(db, effective_run_id)
+        run_obj = db.get(Run, effective_run_id)
+        if run_obj is None or (final_status not in ("completed", "success") and run_obj.status not in ("completed", "success")):
+            status_str = getattr(run_obj, "status", "missing")
+            raise ServiceError(
+                500, "PROJECTION_EXECUTION_FAILED",
+                f"Shared projection engine failed for run '{effective_run_id}' (status: {status_str}, final_status: {final_status}).",
+            )
+
+    if run_obj.accepted_attempt_number is None or run_obj.accepted_attempt_number < 1:
         raise ServiceError(
-            500, "PROJECTION_EXECUTION_FAILED",
-            f"Shared projection engine failed for run '{effective_run_id}' (status: {status_str}, final_status: {final_status}).",
+            500, "ACCEPTED_ATTEMPT_MISSING",
+            f"Projection run '{run_obj.id}' completed without setting accepted_attempt_number.",
         )
 
     art_obj = (
@@ -623,22 +780,24 @@ def execute_projection_simulation(
         .filter(
             RunArtifact.run_id == run_obj.id,
             RunArtifact.artifact_type == "outputs",
-            RunArtifact.attempt_number == (run_obj.accepted_attempt_number or 1),
+            RunArtifact.attempt_number == run_obj.accepted_attempt_number,
         )
         .first()
     )
     if art_obj is None:
         raise ServiceError(
             500, "PROJECTION_ARTIFACT_MISSING",
-            f"Projection run '{run_obj.id}' completed without persisting an 'outputs' RunArtifact.",
+            f"Projection run '{run_obj.id}' completed without persisting an 'outputs' RunArtifact for accepted attempt {run_obj.accepted_attempt_number}.",
         )
 
     completed_at = datetime.now(timezone.utc).isoformat()
     return {
         "run_id": run_obj.id,
         "artifact_id": art_obj.id,
-        "run_package_id": pkg_row.id,
-        "run_package_fingerprint": frozen_pkg.fingerprint,
+        "accepted_attempt_number": run_obj.accepted_attempt_number,
+        "attempt_count": run_obj.attempt_count,
+        "run_package_id": pkg_id,
+        "run_package_fingerprint": pkg_fp,
         "model_id": model.id,
         "model_version_id": mv.id,
         "product_code": model.product_code,
@@ -646,6 +805,7 @@ def execute_projection_simulation(
         "projection_set_id": ps.id,
         "inforce_file_id": inforce_file.id,
         "inforce_fingerprint": inforce_file.fingerprint,
+        "valuation_date": str(run_obj.valuation_date),
         "time_steps": run_obj.horizon_months,
         "row_count": art_obj.row_count,
         "artifact_fingerprint": art_obj.checksum_sha256,
@@ -663,7 +823,7 @@ def execute_cash_flow_aggregation(
     artifact_id: str | None = None,
     project_id: str | None = None,
 ) -> dict[str, Any]:
-    """Aggregate flows and stocks using Polars strictly from verified persisted Parquet RunArtifact (P0-04)."""
+    """Aggregate flows and stocks using Polars strictly from the accepted-attempt canonical RunArtifact (V5-P0-D)."""
     started_at = datetime.now(timezone.utc).isoformat()
     if db is None:
         raise ServiceError(500, "DATABASE_REQUIRED", "Governed aggregation execution requires an active database session.")
@@ -678,9 +838,15 @@ def execute_cash_flow_aggregation(
             f"Projection run '{projection_run_id}' must be in completed/success status (got '{proj_run.status}').",
         )
 
-    expected_attempt = proj_run.accepted_attempt_number or proj_run.attempt_count or 1
+    # V5-P0-D: Require explicit accepted_attempt_number on the completed Run (never guess attempt_count or 1)
+    if proj_run.accepted_attempt_number is None or proj_run.accepted_attempt_number < 1:
+        raise ServiceError(
+            400, "ACCEPTED_ATTEMPT_MISSING",
+            f"Projection run '{projection_run_id}' does not have a verified accepted_attempt_number.",
+        )
+    expected_attempt = proj_run.accepted_attempt_number
 
-    # Resolve persisted RunArtifact from PostgreSQL
+    # Resolve persisted RunArtifact from PostgreSQL strictly for the accepted attempt and canonical output type
     if artifact_id:
         art = db.get(RunArtifact, artifact_id)
         if art is None:
@@ -690,30 +856,31 @@ def execute_cash_flow_aggregation(
                 400, "ARTIFACT_RUN_MISMATCH",
                 f"RunArtifact '{artifact_id}' belongs to run '{art.run_id}', not '{proj_run.id}'.",
             )
+        if art.attempt_number != expected_attempt:
+            raise ServiceError(
+                400, "ARTIFACT_ATTEMPT_MISMATCH",
+                f"RunArtifact '{artifact_id}' belongs to attempt {art.attempt_number}, not accepted attempt {expected_attempt}.",
+            )
+        if art.artifact_type not in CANONICAL_OUTPUT_ARTIFACT_TYPES:
+            raise ServiceError(
+                400, "INVALID_ARTIFACT_TYPE",
+                f"RunArtifact '{artifact_id}' has type '{art.artifact_type}'; expected one of {CANONICAL_OUTPUT_ARTIFACT_TYPES}.",
+            )
     else:
         art = (
             db.query(RunArtifact)
             .filter(
                 RunArtifact.run_id == proj_run.id,
                 RunArtifact.attempt_number == expected_attempt,
-                RunArtifact.artifact_type.in_(("outputs", "cash_flows")),
+                RunArtifact.artifact_type.in_(CANONICAL_OUTPUT_ARTIFACT_TYPES),
             )
             .first()
         )
-        if art is None:
-            art = (
-                db.query(RunArtifact)
-                .filter(
-                    RunArtifact.run_id == proj_run.id,
-                    RunArtifact.artifact_type.in_(("outputs", "cash_flows")),
-                )
-                .first()
-            )
 
     if art is None:
         raise ServiceError(
-            404, "ARTIFACT_NOT_FOUND",
-            f"No persisted cash-flow/outputs RunArtifact found in database for run '{projection_run_id}'.",
+            404, "ACCEPTED_ARTIFACT_NOT_FOUND",
+            f"No canonical output RunArtifact found in database for run '{projection_run_id}' accepted attempt {expected_attempt}.",
         )
 
     if storage_uri and storage_uri != art.storage_uri:
@@ -758,7 +925,6 @@ def execute_cash_flow_aggregation(
     wide_required = {"policy_id", "projection_month", "cash_flow", "ending_av"}
 
     if narrow_required.issubset(cols):
-        # Canonical projection engine output schema
         records = df.to_dicts()
         by_month_var: dict[tuple[int, str], float] = {}
         months_seen: set[int] = set()
@@ -779,7 +945,6 @@ def execute_cash_flow_aggregation(
 
         max_m = sorted_months[-1]
         if "liability_outgo" in variables_seen or "account_value_close" in variables_seen:
-            # MYGA / accumulation product outputs
             flow_var = "liability_outgo" if "liability_outgo" in variables_seen else "net_cash_flow"
             monthly_cfs = []
             for m in sorted_months:
@@ -790,7 +955,6 @@ def execute_cash_flow_aggregation(
             opening_stock = float(by_month_var.get((1, "account_value_open"), 0.0))
             ending_stock = float(by_month_var.get((max_m, "account_value_close"), 0.0))
         elif "expected_payment" in variables_seen:
-            # SPIA / payout product outputs
             monthly_cfs = [float(by_month_var.get((m, "expected_payment"), 0.0)) for m in sorted_months]
             opening_stock = float(by_month_var.get((0, "reserve"), by_month_var.get((1, "reserve"), 0.0)))
             ending_stock = float(by_month_var.get((max_m, "reserve"), 0.0))
@@ -820,7 +984,6 @@ def execute_cash_flow_aggregation(
 
     total_flow_sum = float(sum(monthly_cfs))
 
-    # Derive cohort_id from the persisted projection RunPackage
     cohort_id = f"COHORT_{proj_run.id[:12]}"
     proj_pkg = db.query(RunPackage).filter(RunPackage.run_id == proj_run.id).first()
     if proj_pkg and isinstance(proj_pkg.package, dict):
@@ -839,6 +1002,7 @@ def execute_cash_flow_aggregation(
         "upstream_run_id": projection_run_id,
         "artifact_id": art.id,
         "verified_artifact_id": art.id,
+        "accepted_attempt_number": expected_attempt,
         "artifact_fingerprint": actual_sha,
         "project_id": proj_run.project_id,
         "total_cash_flow_sum": total_flow_sum,
@@ -852,41 +1016,18 @@ def execute_cash_flow_aggregation(
     }
 
 
-def _build_methodology_movements(
-    methodology: str,
-    interest_unwind: Decimal,
+def _build_illustrative_generic_pv_movements(
+    discount_unwind: Decimal,
     cash_flow_release: Decimal,
 ) -> dict[str, Decimal]:
-    """Map valuation reserve movements onto the governed methodology template's movement components."""
-    template = get_methodology_template(methodology)
-    movement_specs = [c for c in template.components if c.is_movement]
-    movements: dict[str, Decimal] = {c.name: Decimal("0.0000") for c in movement_specs}
+    """Return explicitly labeled non-regulatory illustrative generic PV rollforward components (V5-P0-E).
 
-    if methodology == "VM22":
-        movements["contractual_cash_flows"] = cash_flow_release
-        movements["economic_revaluation"] = interest_unwind
-    elif methodology == "LDTI":
-        movements["expected_change"] = interest_unwind
-        movements["experience_variance"] = cash_flow_release
-    elif methodology == "VM21":
-        movements["inforce_cash_flows"] = cash_flow_release
-        movements["market_movement_impact"] = interest_unwind
-    elif methodology == "DAC":
-        movements["amortization_expense"] = cash_flow_release
-        movements["terminations_adjustments"] = interest_unwind
-    elif methodology == "MRB":
-        movements["benefit_payments"] = cash_flow_release
-        movements["change_in_fair_value_ni"] = interest_unwind
-    elif methodology == "ASC815":
-        movements["host_debt_carrying_value"] = cash_flow_release
-        movements["embedded_derivative_fair_value"] = interest_unwind
-    elif len(movement_specs) >= 2:
-        movements[movement_specs[0].name] = cash_flow_release
-        movements[movement_specs[1].name] = interest_unwind
-    elif len(movement_specs) == 1:
-        movements[movement_specs[0].name] = cash_flow_release + interest_unwind
-
-    return movements
+    Never fabricates VM21, VM22, LDTI, DAC, MRB, or ASC815 accounting movement names from generic PV math.
+    """
+    return {
+        "discount_unwind_illustrative": discount_unwind,
+        "period_cash_flow_release_illustrative": cash_flow_release,
+    }
 
 
 def execute_foundation_valuation(
@@ -900,17 +1041,22 @@ def execute_foundation_valuation(
     project_id: str,
     cohort_id: str | None = None,
 ) -> dict[str, Any]:
-    """Calculate foundation present value reserve and persist canonical Valuation Run & RunPackage."""
+    """Calculate foundation present value reserve and persist canonical Valuation Run & RunPackage (V5-P0-E, V5-P1-H)."""
     started_at = datetime.now(timezone.utc).isoformat()
     if db is None:
         raise ServiceError(500, "DATABASE_REQUIRED", "Governed valuation execution requires an active database session.")
 
-    clean_basis = validate_basis(basis)
-    clean_method = validate_methodology(methodology)
-    validate_basis_methodology_pair(clean_basis, clean_method)
-
-    if clean_basis == "TAX":
+    if str(basis or "").strip().upper() == "TAX":
         raise ServiceError(400, "UNSUPPORTED_VALUATION_BASIS", "TAX basis is explicitly not supported at launch.")
+
+    try:
+        clean_basis = validate_basis(basis)
+        clean_method = validate_methodology(methodology)
+        validate_basis_methodology_pair(clean_basis, clean_method)
+    except ValuationTaxonomyError as exc:
+        raise ServiceError(400, "INVALID_VALUATION_TAXONOMY", str(exc)) from exc
+
+    val_date_obj = _parse_governed_date(valuation_date, "valuation_date")
 
     upstream_run = db.get(Run, upstream_run_id)
     if upstream_run is None or upstream_run.project_id != project_id:
@@ -920,7 +1066,8 @@ def execute_foundation_valuation(
         raise ServiceError(422, "EMPTY_CASH_FLOWS", "Cannot execute valuation on empty aggregated cash flows.")
 
     # Compute opening reserve V_0 (at t=0 across m=1..T) and closing reserve V_1 (at t=1 across remaining m=2..T)
-    # By exact discounting identity: V_1 = V_0 * (1 + r_m) - CF_1  =>  V_0 + (V_0 * r_m) + (-CF_1) = V_1
+    # V5-P0-E: Both V_0, V_1, discount_unwind (V_0 * r_m), and cash_flow_release (-CF_1) are computed INDEPENDENTLY
+    # from their formulas — NEVER as a balancing residual `closing - opening - cf_release`.
     n_months = len(aggregated_cash_flows)
     factors_t0 = [
         annual_to_monthly_discount_factor(annual_discount_rate, m)
@@ -942,13 +1089,12 @@ def execute_foundation_valuation(
     opening_dec = Decimal(str(round(v0_float, 4)))
     closing_dec = Decimal(str(round(v1_float, 4)))
     cf_release_dec = Decimal(str(round(-cf_1, 4)))
-    # Interest accretion / discount unwind over the period
-    interest_unwind_dec = closing_dec - opening_dec - cf_release_dec
+    # Independent discount unwind from V_0 * r_monthly (not a balancing plug!)
+    discount_unwind_dec = Decimal(str(round(v0_float * r_monthly, 4)))
 
-    movements_dec = _build_methodology_movements(clean_method, interest_unwind_dec, cf_release_dec)
+    movements_dec = _build_illustrative_generic_pv_movements(discount_unwind_dec, cf_release_dec)
     pv_res = float(closing_dec)
 
-    # Resolve cohort_id from upstream RunPackage if not passed
     resolved_cohort = cohort_id
     if not resolved_cohort:
         src_pkg = db.query(RunPackage).filter(RunPackage.run_id == upstream_run.id).first()
@@ -960,9 +1106,7 @@ def execute_foundation_valuation(
             )
         resolved_cohort = resolved_cohort or upstream_run.projection_key or f"COHORT_{upstream_run.id[:8]}"
 
-    # 1. Create canonical valuation Run
     val_run_id = f"run-val-{uuid.uuid4().hex[:12]}"
-    val_date_obj = date.fromisoformat(str(valuation_date)) if isinstance(valuation_date, str) else valuation_date
     val_run = Run(
         id=val_run_id,
         project_id=project_id,
@@ -974,13 +1118,15 @@ def execute_foundation_valuation(
         methodology=clean_method,
         methodology_version="v1.0",
         source_projection_run_id=upstream_run_id,
+        scenario_id=upstream_run.scenario_id,
         valuation_date=val_date_obj,
         horizon_months=upstream_run.horizon_months or n_months,
+        accepted_attempt_number=1,
+        attempt_count=1,
     )
     db.add(val_run)
     db.flush()
 
-    # 2. Freeze and persist RunPackage using trusted PostgreSQL source Run lineage
     pkg = freeze_valuation_run_package(
         db=db,
         project=project_id,
@@ -1011,14 +1157,16 @@ def execute_foundation_valuation(
         "present_value_reserve": pv_res,
         "opening_reserve": float(opening_dec),
         "closing_reserve": float(closing_dec),
+        "illustrative_generic_pv_movements": {k: float(v) for k, v in movements_dec.items()},
         "attributed_movements": {k: float(v) for k, v in movements_dec.items()},
+        "attribution_mode": "ILLUSTRATIVE_GENERIC_PV_NON_REGULATORY",
+        "regulatory_accounting_asserted": False,
         "cohort_id": str(resolved_cohort),
         "basis": clean_basis,
         "methodology": clean_method,
         "annual_discount_rate": annual_discount_rate,
     }
 
-    # 3. Persist ValuationRunDetail
     val_detail = ValuationRunDetail(
         run_id=val_run.id,
         valuation_date=val_date_obj,
@@ -1041,6 +1189,8 @@ def execute_foundation_valuation(
         "opening_reserve": float(opening_dec),
         "closing_reserve": float(closing_dec),
         "attributed_movements": {k: float(v) for k, v in movements_dec.items()},
+        "attribution_mode": "ILLUSTRATIVE_GENERIC_PV_NON_REGULATORY",
+        "regulatory_accounting_asserted": False,
         "discount_rate": annual_discount_rate,
         "run_package_id": val_pkg.id,
         "run_package_fingerprint": pkg.fingerprint,
@@ -1061,8 +1211,20 @@ def execute_rollforward_attribution(
     methodology: str | None = None,
     cohort_id: str | None = None,
     tolerance: Decimal = Decimal("0.01"),
+    prior_valuation_run_id: str | None = None,
 ) -> dict[str, Any]:
-    """Execute valuation-linked attribution framework and persist component-by-component RollforwardSummary rows (P0-05)."""
+    """Execute valuation-linked attribution framework and persist RollforwardSummary rows (V5-P0-E, V5-P1-H).
+
+    Supports:
+    1. Multi-period valuation comparison when `prior_valuation_run_id` is supplied:
+       - Independently loads opening measure from `prior_valuation_run_id`'s persisted ValuationRunDetail.
+       - Independently loads closing measure from `valuation_run_id`'s persisted ValuationRunDetail.
+       - Verifies project, basis, methodology, cohort, and period date ordering across both runs.
+       - Evaluates configured movements without ever computing a balancing residual to force continuity.
+    2. Intra-run illustrative generic PV continuity when `prior_valuation_run_id` is None:
+       - Uses independently calculated opening PV, illustrative generic PV movements, and closing PV.
+       - Explicitly labels attribution_mode as 'ILLUSTRATIVE_GENERIC_PV_NON_REGULATORY'.
+    """
     started_at = datetime.now(timezone.utc).isoformat()
     if db is None:
         raise ServiceError(500, "DATABASE_REQUIRED", "Governed rollforward execution requires an active database session.")
@@ -1110,42 +1272,144 @@ def execute_rollforward_attribution(
         or val_run.projection_key
         or f"COHORT_{val_run.id[:8]}"
     )
-
-    resolved_opening = opening if opening is not None else persisted_summary.get("opening_reserve")
-    resolved_movements = movements if movements is not None else persisted_summary.get("attributed_movements")
-    resolved_ending = (
-        ending
-        if ending is not None
-        else persisted_summary.get("closing_reserve", persisted_summary.get("present_value_reserve"))
-    )
-
-    if resolved_opening is None or resolved_movements is None or resolved_ending is None:
-        raise ServiceError(
-            400, "ROLLFORWARD_INPUTS_MISSING",
-            f"Valuation run '{valuation_run_id}' does not have complete opening, movements, and closing balances.",
-        )
-
-    opening_dec = Decimal(str(resolved_opening))
-    movements_dec = {k: Decimal(str(v)) for k, v in resolved_movements.items()}
-    ending_dec = Decimal(str(resolved_ending))
     tol_dec = Decimal(str(tolerance))
+    attribution_mode = persisted_summary.get("attribution_mode", "ILLUSTRATIVE_GENERIC_PV_NON_REGULATORY")
 
-    # Verify against persisted valuation closing reserve if present
-    persisted_closing = persisted_summary.get("closing_reserve", persisted_summary.get("present_value_reserve"))
-    if persisted_closing is not None:
-        persisted_closing_dec = Decimal(str(persisted_closing))
-        if abs(ending_dec - persisted_closing_dec) > tol_dec:
+    if prior_valuation_run_id:
+        if prior_valuation_run_id == valuation_run_id:
+            raise ServiceError(
+                400, "INVALID_PRIOR_VALUATION_RUN",
+                "prior_valuation_run_id must reference a distinct prior-period valuation run.",
+            )
+        prior_run = db.get(Run, prior_valuation_run_id)
+        if prior_run is None or prior_run.project_id != project_id:
+            raise ServiceError(
+                404, "RUN_NOT_FOUND",
+                f"Prior valuation run '{prior_valuation_run_id}' not found in project '{project_id}'.",
+            )
+        if prior_run.run_type != "valuation" or prior_run.status not in ("completed", "success"):
+            raise ServiceError(
+                400, "INVALID_PRIOR_RUN_STATUS",
+                f"Prior valuation run '{prior_valuation_run_id}' must be a completed valuation run.",
+            )
+        if prior_run.basis != clean_b:
+            raise ServiceError(
+                400, "ROLLFORWARD_BASIS_MISMATCH",
+                f"Prior valuation run basis '{prior_run.basis}' mismatches current valuation run basis '{clean_b}'.",
+            )
+        if prior_run.methodology != clean_m:
+            raise ServiceError(
+                400, "ROLLFORWARD_METHODOLOGY_MISMATCH",
+                f"Prior valuation run methodology '{prior_run.methodology}' mismatches current valuation run methodology '{clean_m}'.",
+            )
+        prior_detail = db.get(ValuationRunDetail, prior_valuation_run_id)
+        if prior_detail is None or not prior_detail.summary_results:
+            raise ServiceError(
+                400, "PRIOR_VALUATION_DETAIL_MISSING",
+                f"Prior valuation run '{prior_valuation_run_id}' has no persisted ValuationRunDetail.",
+            )
+        prior_summary = prior_detail.summary_results or {}
+        prior_cohort = prior_summary.get("cohort_id") or prior_run.projection_key
+        if prior_cohort and str(prior_cohort) != str(effective_cohort):
+            raise ServiceError(
+                400, "ROLLFORWARD_COHORT_MISMATCH",
+                f"Prior valuation cohort '{prior_cohort}' mismatches current valuation cohort '{effective_cohort}'.",
+            )
+        if val_detail and prior_detail.valuation_date and val_detail.valuation_date:
+            if prior_detail.valuation_date > val_detail.valuation_date:
+                raise ServiceError(
+                    400, "ROLLFORWARD_PERIOD_ORDER_INVALID",
+                    f"Prior valuation_date ({prior_detail.valuation_date}) cannot be after current valuation_date ({val_detail.valuation_date}).",
+                )
+
+        prior_closing = prior_summary.get("closing_reserve", prior_summary.get("present_value_reserve"))
+        current_closing = persisted_summary.get("closing_reserve", persisted_summary.get("present_value_reserve"))
+        if prior_closing is None or current_closing is None:
+            raise ServiceError(
+                400, "ROLLFORWARD_INPUTS_MISSING",
+                "Prior or current valuation run is missing persisted reserve balance.",
+            )
+        independent_opening_dec = Decimal(str(prior_closing))
+        independent_ending_dec = Decimal(str(current_closing))
+
+        if opening is not None and abs(Decimal(str(opening)) - independent_opening_dec) > tol_dec:
+            raise ServiceError(
+                422, "ROLLFORWARD_OPENING_MISMATCH",
+                f"Supplied opening balance ({opening}) disagrees with prior valuation run reserve ({independent_opening_dec}).",
+            )
+        if ending is not None and abs(Decimal(str(ending)) - independent_ending_dec) > tol_dec:
             raise ServiceError(
                 422, "ROLLFORWARD_DISCONTINUITY",
-                f"Rollforward closing balance ({ending_dec}) disagrees with persisted valuation reserve ({persisted_closing_dec}) beyond tolerance ({tol_dec}).",
+                f"Supplied closing balance ({ending}) disagrees with current valuation run reserve ({independent_ending_dec}).",
             )
 
+        opening_dec = independent_opening_dec
+        ending_dec = independent_ending_dec
+        resolved_movements = movements if movements is not None else persisted_summary.get("period_movements")
+        if resolved_movements is None:
+            raise ServiceError(
+                400, "ROLLFORWARD_MOVEMENTS_REQUIRED",
+                "Cross-period valuation rollforward requires explicit observed period movements; automatic residual balancing is forbidden.",
+            )
+        attribution_mode = "MULTI_PERIOD_PERSISTED_VALUATION_COMPARISON"
+    else:
+        resolved_opening = opening if opening is not None else persisted_summary.get("opening_reserve")
+        resolved_movements = (
+            movements
+            if movements is not None
+            else persisted_summary.get("illustrative_generic_pv_movements", persisted_summary.get("attributed_movements"))
+        )
+        resolved_ending = (
+            ending
+            if ending is not None
+            else persisted_summary.get("closing_reserve", persisted_summary.get("present_value_reserve"))
+        )
+
+        if resolved_opening is None or resolved_movements is None or resolved_ending is None:
+            raise ServiceError(
+                400, "ROLLFORWARD_INPUTS_MISSING",
+                f"Valuation run '{valuation_run_id}' does not have complete opening, movements, and closing balances.",
+            )
+
+        opening_dec = Decimal(str(resolved_opening))
+        ending_dec = Decimal(str(resolved_ending))
+
+        persisted_opening = persisted_summary.get("opening_reserve")
+        if persisted_opening is not None and abs(opening_dec - Decimal(str(persisted_opening))) > tol_dec:
+            raise ServiceError(
+                422, "ROLLFORWARD_DISCONTINUITY",
+                f"Rollforward opening balance ({opening_dec}) disagrees with persisted opening reserve ({persisted_opening}).",
+            )
+
+        persisted_closing = persisted_summary.get("closing_reserve", persisted_summary.get("present_value_reserve"))
+        if persisted_closing is not None:
+            persisted_closing_dec = Decimal(str(persisted_closing))
+            if abs(ending_dec - persisted_closing_dec) > tol_dec:
+                raise ServiceError(
+                    422, "ROLLFORWARD_DISCONTINUITY",
+                    f"Rollforward closing balance ({ending_dec}) disagrees with persisted valuation reserve ({persisted_closing_dec}) beyond tolerance ({tol_dec}).",
+                )
+
+    # V5-P0-E: Reject any movement bucket that attempts to disguise an unexplained residual as a named movement
+    movements_dec: dict[str, Decimal] = {}
+    for k, v in resolved_movements.items():
+        norm_key = str(k).strip().lower()
+        if norm_key in FORBIDDEN_RESIDUAL_MOVEMENT_NAMES:
+            raise ServiceError(
+                422,
+                "UNEXPLAINED_MOVEMENT_FORBIDDEN",
+                f"Movement component '{k}' is a forbidden balancing/residual plug; unexplained movements cannot masquerade as attributed movements.",
+            )
+        movements_dec[str(k)] = Decimal(str(v))
+
     continuity = validate_continuity(opening_dec, movements_dec, ending_dec, tolerance=tol_dec)
+    unexplained_residual = ending_dec - (opening_dec + continuity.sum_of_movements)
+
     if not continuity.is_continuous:
         raise ServiceError(
             422,
             "ROLLFORWARD_DISCONTINUITY",
-            f"Actuarial rollforward assertion failure: {continuity.error_message}",
+            f"Actuarial rollforward assertion failure (unexplained_residual={unexplained_residual}): {continuity.error_message}",
         )
 
     records = record_rollforward_summary(
@@ -1164,15 +1428,19 @@ def execute_rollforward_attribution(
         "component_ids": [r.id for r in records],
         "component_count": len(records),
         "valuation_run_id": valuation_run_id,
+        "prior_valuation_run_id": prior_valuation_run_id,
         "project_id": project_id,
         "cohort_id": str(effective_cohort),
         "basis": clean_b,
         "methodology": clean_m,
+        "attribution_mode": attribution_mode,
+        "regulatory_accounting_asserted": False,
         "is_continuous": continuity.is_continuous,
         "opening_balance": float(opening_dec),
         "sum_of_movements": float(continuity.sum_of_movements),
         "ending_balance": float(ending_dec),
         "difference": float(continuity.difference),
+        "unexplained_residual": float(unexplained_residual),
         "movements": {k: float(v) for k, v in movements_dec.items()},
         "started_at": started_at,
         "completed_at": completed_at,
@@ -1183,14 +1451,25 @@ def execute_governed_reconciliation(
     db: Session,
     valuation_run_id: str,
     project_id: str,
-    actual_reserve: float,
+    actual_reserve: float | None = None,
     expected_result_set_id: str | None = None,
     expected_benchmark: float | None = None,
-    tolerance: float = 0.01,
-    rel_tol: float = 1e-4,
+    tolerance: float | None = None,
+    rel_tol: float | None = None,
     target_metric: str = "present_value_reserve",
 ) -> dict[str, Any]:
-    """Execute three-state reconciliation strictly against an approved ExpectedResultSet (P0-06)."""
+    """Execute three-state reconciliation strictly against an independently approved ExpectedResultSet (V5-P0-F).
+
+    Enforces:
+    1. Raw `expected_benchmark` is unconditionally forbidden (even if `expected_result_set_id` is passed).
+    2. Authoritative `actual_value` is loaded directly from persisted `ValuationRunDetail.summary_results[target_metric]`;
+       caller spoofing of `actual_reserve` is rejected (`400 ACTUAL_VALUE_SPOOF_FORBIDDEN`).
+    3. `ExpectedResultSet` must be in active `approved` status with Four-Eyes separation (`created_by != approved_by`).
+    4. Benchmark rows are matched strictly by scoped keys (`product_code`, `basis`, `methodology`, `cohort_id`,
+       `valuation_date`, `scenario_id`, and exact `target_metric`) with zero fallback to unrelated keys or blind `rows_data[-1]`.
+    5. Governed tolerances come from the approved benchmark row (or platform governed maximum `0.01` / `1e-4`);
+       inflated caller tolerances are rejected (`400 UNGOVERNED_TOLERANCE_OVERRIDE_FORBIDDEN`).
+    """
     started_at = datetime.now(timezone.utc).isoformat()
     if db is None:
         raise ServiceError(500, "DATABASE_REQUIRED", "Governed reconciliation execution requires an active database session.")
@@ -1199,18 +1478,68 @@ def execute_governed_reconciliation(
     if val_run is None or val_run.project_id != project_id:
         raise ServiceError(404, "RUN_NOT_FOUND", f"Valuation run '{valuation_run_id}' not found in project '{project_id}'.")
 
-    # P0-06: Ungoverned caller benchmark float cannot be used to force PASS
-    if expected_benchmark is not None and not expected_result_set_id:
+    # 1. Unconditionally reject raw caller benchmark overrides
+    if expected_benchmark is not None:
         raise ServiceError(
             400, "UNGOVERNED_BENCHMARK_FORBIDDEN",
-            "Raw caller-supplied 'expected_benchmark' is forbidden for governed reconciliation; supply an approved 'expected_result_set_id'.",
+            "Raw caller-supplied 'expected_benchmark' is unconditionally forbidden; governed reconciliation must use an approved ExpectedResultSet.",
         )
 
+    # 2. Load authoritative actual value from persisted ValuationRunDetail
+    val_detail = db.get(ValuationRunDetail, valuation_run_id)
+    if val_detail is None or not isinstance(val_detail.summary_results, dict):
+        raise ServiceError(
+            400, "VALUATION_DETAIL_MISSING",
+            f"Valuation run '{valuation_run_id}' has no persisted ValuationRunDetail summary_results.",
+        )
+
+    persisted_summary = val_detail.summary_results
+    if not target_metric or target_metric not in persisted_summary or persisted_summary[target_metric] is None:
+        raise ServiceError(
+            400, "INVALID_TARGET_METRIC",
+            f"Persisted ValuationRunDetail for run '{valuation_run_id}' does not contain target_metric '{target_metric}'.",
+        )
+
+    persisted_actual = float(persisted_summary[target_metric])
+    if actual_reserve is not None and abs(float(actual_reserve) - persisted_actual) > 1e-6:
+        raise ServiceError(
+            400, "ACTUAL_VALUE_SPOOF_FORBIDDEN",
+            f"Caller-supplied actual_reserve ({actual_reserve}) disagrees with persisted ValuationRunDetail.{target_metric} ({persisted_actual}).",
+        )
+
+    # Extract valuation run's authoritative dimensions for scoped benchmark matching
+    val_pkg = db.query(RunPackage).filter(RunPackage.run_id == val_run.id).first()
+    pkg_cfg = (val_pkg.package.get("configuration", {}) if val_pkg and isinstance(val_pkg.package, dict) else {}) or {}
+    db_model_prod = None
+    if val_run.model_version_id:
+        val_mv = db.get(ModelVersion, val_run.model_version_id)
+        if val_mv is not None:
+            val_mod = db.get(Model, val_mv.model_id)
+            if val_mod is not None:
+                db_model_prod = val_mod.product_code
+    run_product = _normalize_product_family(
+        pkg_cfg.get("model", {}).get("product_code")
+        or db_model_prod
+        or persisted_summary.get("product_code")
+    )
+    run_basis = str(val_run.basis or persisted_summary.get("basis") or "").strip().upper()
+    run_method = str(val_run.methodology or persisted_summary.get("methodology") or "").strip().upper()
+    run_cohort = str(persisted_summary.get("cohort_id") or val_run.projection_key or "").strip()
+    run_val_date = str(val_detail.valuation_date) if val_detail.valuation_date else str(val_run.valuation_date or "")
+    run_scenario_id = str(pkg_cfg.get("scenario", {}).get("id") or val_run.scenario_id or "").strip()
+
     benchmark_val: float | None = None
+    effective_abs_tol = GOVERNED_DEFAULT_ABS_TOL
+    effective_rel_tol = GOVERNED_DEFAULT_REL_TOL
     ers_fp = ""
     ers_version = "v1"
     reason: str | None = None
     failures: list[dict[str, Any]] = []
+
+    if tolerance is not None and float(tolerance) < 0:
+        raise ServiceError(400, "UNGOVERNED_TOLERANCE_OVERRIDE_FORBIDDEN", "Negative tolerance is invalid.")
+    if rel_tol is not None and float(rel_tol) < 0:
+        raise ServiceError(400, "UNGOVERNED_TOLERANCE_OVERRIDE_FORBIDDEN", "Negative relative tolerance is invalid.")
 
     if not expected_result_set_id:
         status = "NOT_VERIFIABLE"
@@ -1223,10 +1552,16 @@ def execute_governed_reconciliation(
                 404, "BENCHMARK_NOT_FOUND",
                 f"ExpectedResultSet '{expected_result_set_id}' not found in project '{project_id}'.",
             )
-        if ers.status != "approved" or not ers.approved_by or ers.superseded_by_id is not None:
+        if ers.status != "approved" or not ers.approved_by or not ers.approved_at or ers.superseded_by_id is not None:
             raise ServiceError(
                 400, "BENCHMARK_NOT_APPROVED",
                 f"ExpectedResultSet '{expected_result_set_id}' must be in active 'approved' status with independent approver (status: {ers.status}).",
+            )
+        # 3. Enforce Four-Eyes independent approval on ExpectedResultSet
+        if not ers.created_by or ers.approved_by == ers.created_by:
+            raise ServiceError(
+                400, "SELF_APPROVED_BENCHMARK_FORBIDDEN",
+                f"ExpectedResultSet '{expected_result_set_id}' violates four-eyes governance: created_by ('{ers.created_by}') must differ from approved_by ('{ers.approved_by}').",
             )
 
         computed_ers_fp = compute_fp(ers.rows_data)
@@ -1236,31 +1571,98 @@ def execute_governed_reconciliation(
                 f"ExpectedResultSet '{expected_result_set_id}' rows do not match recorded fingerprint.",
             )
 
+        # Verify product family agreement
+        ers_product = _normalize_product_family(ers.product_code)
+        if ers_product != "UNKNOWN" and run_product != "UNKNOWN" and ers_product != run_product:
+            raise ServiceError(
+                400, "BENCHMARK_PRODUCT_MISMATCH",
+                f"ExpectedResultSet product '{ers.product_code}' ({ers_product}) mismatches valuation run product '{run_product}'.",
+            )
+
         ers_fp = ers.fingerprint
         ers_version = ers.version_label
 
-        if ers.rows_data and len(ers.rows_data) > 0:
-            # Extract scoped benchmark metric from approved rows
-            row0 = ers.rows_data[-1]
-            for candidate_key in (target_metric, "present_value_reserve", "reserve", "expected_value", "account_value_close"):
-                if candidate_key in row0 and row0[candidate_key] is not None:
-                    benchmark_val = float(row0[candidate_key])
-                    break
+        rows = list(ers.rows_data or [])
+        matching_rows: list[dict[str, Any]] = []
+        scope_keys = ("basis", "methodology", "cohort_id", "valuation_date", "scenario_id")
 
-        if benchmark_val is None:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            # If multi-row benchmark, each row must carry at least one explicit scoping key so we never blindly pick last row
+            if len(rows) > 1 and not any(k in row and row[k] is not None for k in scope_keys):
+                raise ServiceError(
+                    400, "AMBIGUOUS_BENCHMARK_ROWS",
+                    f"Multi-row ExpectedResultSet '{ers.id}' contains unscoped rows without basis/methodology/cohort_id/valuation_date/scenario_id.",
+                )
+
+            if row.get("basis") is not None and str(row["basis"]).strip().upper() != run_basis:
+                continue
+            if row.get("methodology") is not None and str(row["methodology"]).strip().upper() != run_method:
+                continue
+            if row.get("cohort_id") is not None and run_cohort and str(row["cohort_id"]).strip() != run_cohort:
+                continue
+            if row.get("valuation_date") is not None and run_val_date and str(row["valuation_date"]).strip() != run_val_date:
+                continue
+            if row.get("scenario_id") is not None and run_scenario_id and str(row["scenario_id"]).strip() != run_scenario_id:
+                continue
+
+            # Exact metric matching only (NO fallback to unrelated keys like account_value_close or reserve)
+            if "metric_name" in row:
+                if str(row.get("metric_name")) != target_metric or row.get("expected_value") is None:
+                    continue
+            else:
+                if target_metric not in row or row[target_metric] is None:
+                    continue
+
+            matching_rows.append(row)
+
+        if len(matching_rows) > 1:
+            raise ServiceError(
+                400, "AMBIGUOUS_BENCHMARK_ROWS",
+                f"ExpectedResultSet '{ers.id}' matched {len(matching_rows)} ambiguous rows for metric '{target_metric}'.",
+            )
+
+        if len(matching_rows) == 0:
             status = "NOT_VERIFIABLE"
             diff = 0.0
-            reason = f"Approved ExpectedResultSet '{ers.id}' does not contain target metric '{target_metric}'."
+            reason = (
+                f"Approved ExpectedResultSet '{ers.id}' contains no scoped row matching "
+                f"(metric={target_metric}, basis={run_basis}, methodology={run_method}, cohort={run_cohort}, valuation_date={run_val_date})."
+            )
         else:
-            diff = abs(float(actual_reserve) - benchmark_val)
-            allowed = float(tolerance) + float(rel_tol) * abs(benchmark_val)
+            matched_row = matching_rows[0]
+            raw_expected = matched_row["expected_value"] if "metric_name" in matched_row else matched_row[target_metric]
+            benchmark_val = float(raw_expected)
+
+            row_abs_tol = matched_row.get("tolerance_abs", matched_row.get("abs_tol"))
+            row_rel_tol = matched_row.get("tolerance_rel", matched_row.get("rel_tol"))
+            governed_abs_tol = float(row_abs_tol) if row_abs_tol is not None else GOVERNED_DEFAULT_ABS_TOL
+            governed_rel_tol = float(row_rel_tol) if row_rel_tol is not None else GOVERNED_DEFAULT_REL_TOL
+
+            if tolerance is not None and float(tolerance) > governed_abs_tol + 1e-12:
+                raise ServiceError(
+                    400, "UNGOVERNED_TOLERANCE_OVERRIDE_FORBIDDEN",
+                    f"Caller absolute tolerance ({tolerance}) exceeds governed benchmark tolerance ({governed_abs_tol}).",
+                )
+            if rel_tol is not None and float(rel_tol) > governed_rel_tol + 1e-12:
+                raise ServiceError(
+                    400, "UNGOVERNED_TOLERANCE_OVERRIDE_FORBIDDEN",
+                    f"Caller relative tolerance ({rel_tol}) exceeds governed benchmark relative tolerance ({governed_rel_tol}).",
+                )
+
+            effective_abs_tol = float(tolerance) if tolerance is not None else governed_abs_tol
+            effective_rel_tol = float(rel_tol) if rel_tol is not None else governed_rel_tol
+
+            diff = abs(persisted_actual - benchmark_val)
+            allowed = effective_abs_tol + effective_rel_tol * abs(benchmark_val)
             if diff <= allowed:
                 status = "PASS"
             else:
                 status = "FAIL"
                 failures.append({
                     "metric": target_metric,
-                    "actual": float(actual_reserve),
+                    "actual": persisted_actual,
                     "expected": benchmark_val,
                     "difference": diff,
                     "allowed_tolerance": allowed,
@@ -1275,11 +1677,11 @@ def execute_governed_reconciliation(
         expected_result_fingerprint=ers_fp,
         expected_result_version=ers_version,
         status=status,
-        abs_tol=tolerance,
-        rel_tol=rel_tol,
+        abs_tol=effective_abs_tol,
+        rel_tol=effective_rel_tol,
         disposition_status="auto_evaluated",
         summary={
-            "actual": float(actual_reserve),
+            "actual": persisted_actual,
             "expected": benchmark_val,
             "difference": diff,
             "reason": reason,
@@ -1297,10 +1699,11 @@ def execute_governed_reconciliation(
         "expected_result_set_id": expected_result_set_id,
         "expected_result_fingerprint": ers_fp,
         "status": status,
-        "actual_value": float(actual_reserve),
+        "actual_value": persisted_actual,
         "expected_benchmark": benchmark_val,
         "difference": diff,
-        "tolerance": tolerance,
+        "tolerance": effective_abs_tol,
+        "rel_tol": effective_rel_tol,
         "reason": reason,
         "not_verifiable_reason": reason,
         "started_at": started_at,
@@ -1315,8 +1718,9 @@ def execute_reporting_manifest(
     valuation_result: dict[str, Any],
     rollforward_result: dict[str, Any],
     reconciliation_result: dict[str, Any],
+    require_approved_reconciliation: bool = False,
 ) -> dict[str, Any]:
-    """Assemble final disclosure package, persist export artifact to disk and RunArtifact to DB."""
+    """Assemble reporting manifest, explicitly distinguishing technical materialization from governance acceptance (V5-P1-I)."""
     started_at = datetime.now(timezone.utc).isoformat()
     if db is None:
         raise ServiceError(500, "DATABASE_REQUIRED", "Governed reporting export requires an active database session.")
@@ -1325,6 +1729,38 @@ def execute_reporting_manifest(
     if val_run is None or val_run.project_id != project_id:
         raise ServiceError(404, "RUN_NOT_FOUND", f"Valuation run '{valuation_run_id}' not found in project '{project_id}'.")
 
+    rec_status = str(reconciliation_result.get("status") or "NOT_VERIFIABLE")
+    rf_ok = bool(rollforward_result.get("is_continuous", False))
+
+    if rec_status == "FAIL" or not rf_ok:
+        governance_status = "REJECTED_NON_APPROVED"
+        is_approved_for_release = False
+        artifact_type = "reporting_quarantined"
+        filename = "quarantined_diagnostic_manifest.json"
+        package_id = f"QUARANTINED-{valuation_run_id}"
+    elif rec_status != "PASS":
+        governance_status = "TECHNICAL_MATERIALIZATION_UNVERIFIED_NON_APPROVED"
+        is_approved_for_release = False
+        artifact_type = "reporting_unverified"
+        filename = "unverified_technical_manifest.json"
+        package_id = f"UNVERIFIED-{valuation_run_id}"
+    else:
+        governance_status = "GOVERNED_RECONCILED_FOUNDATION_PACKAGE"
+        is_approved_for_release = True
+        artifact_type = "reporting"
+        filename = "disclosure_package.json"
+        package_id = f"DISCLOSURE-{valuation_run_id}"
+
+    if require_approved_reconciliation and not is_approved_for_release:
+        raise ServiceError(
+            422,
+            "REPORTING_APPROVAL_GATE_FAILED",
+            f"Cannot emit approved disclosure package: reconciliation_status='{rec_status}', rollforward_verified={rf_ok} (governance_status='{governance_status}').",
+        )
+
+    val_date_str = valuation_result.get("valuation_date") or (
+        val_run.valuation_date.isoformat() if val_run.valuation_date is not None else None
+    )
     summary_package = {
         "valuation_run_id": valuation_run_id,
         "upstream_projection_run_id": valuation_result.get("upstream_run_id"),
@@ -1332,22 +1768,26 @@ def execute_reporting_manifest(
         "basis": valuation_result["basis"],
         "methodology": valuation_result["methodology"],
         "cohort_id": valuation_result.get("cohort_id"),
-        "valuation_date": valuation_result["valuation_date"],
+        "valuation_date": val_date_str,
         "run_package_id": valuation_result.get("run_package_id"),
         "run_package_fingerprint": valuation_result.get("run_package_fingerprint"),
         "reserve": valuation_result["present_value_reserve"],
+        "governance_status": governance_status,
+        "is_approved_for_release": is_approved_for_release,
+        "regulatory_compliance_claimed": False,
         "rollforward": {
             "summary_id": rollforward_result.get("summary_id"),
-            "is_continuous": rollforward_result["is_continuous"],
-            "opening": rollforward_result["opening_balance"],
+            "is_continuous": rf_ok,
+            "attribution_mode": rollforward_result.get("attribution_mode", "ILLUSTRATIVE_GENERIC_PV_NON_REGULATORY"),
+            "opening": rollforward_result.get("opening_balance"),
             "movements": rollforward_result.get("movements", {}),
-            "ending": rollforward_result["ending_balance"],
-            "difference": rollforward_result["difference"],
+            "ending": rollforward_result.get("ending_balance"),
+            "difference": rollforward_result.get("difference"),
         },
         "reconciliation": {
             "report_id": reconciliation_result.get("report_id"),
             "expected_result_set_id": reconciliation_result.get("expected_result_set_id"),
-            "status": reconciliation_result["status"],
+            "status": rec_status,
             "difference": reconciliation_result["difference"],
             "reason": reconciliation_result.get("reason"),
         },
@@ -1356,21 +1796,19 @@ def execute_reporting_manifest(
     manifest_bytes = json.dumps(summary_package, sort_keys=True).encode("utf-8")
     actual_manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
 
-    # 1. Persist physical reporting artifact to disk
     store = get_artifact_store()
     stored = store.write_bytes(
         namespace=valuation_run_id,
-        artifact_type="reporting",
-        filename="disclosure_package.json",
+        artifact_type=artifact_type,
+        filename=filename,
         content=manifest_bytes,
     )
 
-    # 2. Persist RunArtifact in database
     rep_art = RunArtifact(
         id=f"art-rep-{uuid.uuid4().hex[:12]}",
         run_id=valuation_run_id,
         attempt_number=1,
-        artifact_type="reporting",
+        artifact_type=artifact_type,
         storage_uri=stored.uri,
         storage_backend="local",
         file_format="json",
@@ -1383,11 +1821,15 @@ def execute_reporting_manifest(
 
     completed_at = datetime.now(timezone.utc).isoformat()
     return {
-        "package_id": f"DISCLOSURE-{valuation_run_id}",
+        "package_id": package_id,
         "artifact_id": rep_art.id,
+        "artifact_type": artifact_type,
         "valuation_run_id": valuation_run_id,
-        "rollforward_verified": rollforward_result["is_continuous"],
-        "reconciliation_status": reconciliation_result["status"],
+        "governance_status": governance_status,
+        "is_approved_for_release": is_approved_for_release,
+        "regulatory_compliance_claimed": False,
+        "rollforward_verified": rf_ok,
+        "reconciliation_status": rec_status,
         "manifest_sha256": actual_manifest_sha256,
         "storage_uri": stored.uri,
         "summary": summary_package,
