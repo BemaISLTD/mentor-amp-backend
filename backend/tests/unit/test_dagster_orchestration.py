@@ -1056,6 +1056,35 @@ def test_p0_06_and_v5_p0_f_governed_benchmark_reconciliation_and_v5_p1_i_reporti
                 "cohort_id": "COHORT_MYGA_2026",
             },
         )
+        from app.core.execution import run_package as core_pkg
+        pkg_doc = core_pkg.seal(
+            identity={
+                "package_id": f"pkg-{val_run_id}",
+                "frozen_for_run_id": val_run_id,
+                "project_id": proj_id,
+                "created_at": "2026-11-04T00:00:00Z",
+                "created_by": {"id": user_id},
+            },
+            governance={"governance_mode": "governed"},
+            configuration={
+                "basis": "STATUTORY",
+                "methodology": "VM22",
+                "cohort_id": "COHORT_MYGA_2026",
+                "valuation_date": "2026-12-31",
+                "model_version": {"id": mv_id},
+            },
+        )
+        r.run_package_fingerprint = pkg_doc["fingerprint"]
+        val_pkg = RunPackage(
+            id=f"pkg-{val_run_id}",
+            run_id=val_run_id,
+            project_id=proj_id,
+            schema_version=pkg_doc["schema_version"],
+            fingerprint_algorithm=pkg_doc["fingerprint_algorithm"],
+            fingerprint=pkg_doc["fingerprint"],
+            package=pkg_doc,
+        )
+
         rf_summary = RollforwardSummary(
             id=f"rf-test-{uuid.uuid4().hex[:8]}",
             run_id=val_run_id,
@@ -1071,9 +1100,9 @@ def test_p0_06_and_v5_p0_f_governed_benchmark_reconciliation_and_v5_p1_i_reporti
             closing_balance=actual_reserve,
             is_continuity_verified=True,
             continuity_difference=0.0,
-            trace_identifier="trace-01",
+            trace_identifier="VERIFIED:tol-policy-m5-standard:trace-01",
         )
-        db.add_all([r, detail, rf_summary])
+        db.add_all([r, detail, val_pkg, rf_summary])
 
         # 1. Seed four-eyes approved multi-row scoped ExpectedResultSet (matching row + other cohort row)
         ers_scoped_rows = [

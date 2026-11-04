@@ -94,6 +94,23 @@ FORBIDDEN_RESIDUAL_MOVEMENT_NAMES = frozenset({
     "residual",
 })
 GOVERNED_DEFAULT_ABS_TOL = 0.01
+
+# Governed Approved Tolerance Policies (V8-P0-02)
+GOVERNED_APPROVED_TOLERANCE_POLICIES: dict[str, dict[str, Any]] = {
+    "tol-policy-m5-standard": {
+        "policy_id": "tol-policy-m5-standard",
+        "description": "Milestone 5 governed standard attribution tolerance (max 0.05)",
+        "max_tolerance": Decimal("0.05"),
+        "status": "approved",
+    },
+    "tol-policy-strict-zero": {
+        "policy_id": "tol-policy-strict-zero",
+        "description": "Milestone 5 zero-tolerance exact attribution (max 0.0001)",
+        "max_tolerance": Decimal("0.0001"),
+        "status": "approved",
+    },
+}
+
 GOVERNED_DEFAULT_REL_TOL = 1e-4
 
 
@@ -1242,6 +1259,7 @@ def execute_rollforward_attribution(
     cohort_id: str | None = None,
     tolerance: Decimal = Decimal("0.01"),
     prior_valuation_run_id: str | None = None,
+    tolerance_policy_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute valuation-linked attribution framework and persist RollforwardSummary rows (V5-P0-E, V5-P1-H).
 
@@ -1302,8 +1320,16 @@ def execute_rollforward_attribution(
         or val_run.projection_key
         or f"COHORT_{val_run.id[:8]}"
     )
-    # V6-P0-03: Governed, bounded rollforward continuity tolerances
-    MAX_GOVERNED_ROLLFORWARD_TOLERANCE = Decimal("0.05")
+    # V6-P0-03 & V8-P0-02: Governed, bounded rollforward continuity tolerances & policy approval
+    effective_policy_id = tolerance_policy_id or "tol-policy-m5-standard"
+    if effective_policy_id not in GOVERNED_APPROVED_TOLERANCE_POLICIES:
+        raise ServiceError(
+            400, "TOLERANCE_POLICY_NOT_APPROVED",
+            f"Tolerance policy '{effective_policy_id}' is not an approved governed tolerance policy.",
+        )
+    governed_policy = GOVERNED_APPROVED_TOLERANCE_POLICIES[effective_policy_id]
+    max_policy_tol = governed_policy["max_tolerance"]
+
     try:
         f_tol = float(tolerance)
         if not math.isfinite(f_tol) or f_tol < 0.0:
@@ -1323,10 +1349,10 @@ def execute_rollforward_attribution(
             f"Rollforward tolerance must be a finite, non-negative number; got '{tolerance}'.",
         ) from exc
 
-    if tol_dec > MAX_GOVERNED_ROLLFORWARD_TOLERANCE:
+    if tol_dec > max_policy_tol:
         raise ServiceError(
             400, "GOVERNED_TOLERANCE_EXCEEDED",
-            f"Requested rollforward tolerance {tol_dec} exceeds maximum governed policy threshold of {MAX_GOVERNED_ROLLFORWARD_TOLERANCE}.",
+            f"Requested rollforward tolerance {tol_dec} exceeds maximum governed policy threshold of {max_policy_tol} for policy '{effective_policy_id}'.",
         )
     attribution_mode = persisted_summary.get("attribution_mode", "ILLUSTRATIVE_GENERIC_PV_NON_REGULATORY")
 
@@ -1445,10 +1471,36 @@ def execute_rollforward_attribution(
                     f"Rollforward closing balance ({ending_dec}) disagrees with persisted valuation reserve ({persisted_closing_dec}) beyond tolerance ({tol_dec}).",
                 )
 
-    # V5-P0-E & V6-P0-03: Validate source attribution of movements and reject forbidden residuals/non-finites
+    # V5-P0-E, V6-P0-03 & V8-P0-02: Validate source attribution of movements, amounts, and policy
     movements_dec: dict[str, Decimal] = {}
     has_unverified_movement_source = False
-    persisted_movements = persisted_summary.get("period_movements", {}) if prior_valuation_run_id else {}
+
+    if prior_valuation_run_id:
+        persisted_movements = (persisted_summary.get("period_movements") or {})
+        if movements is not None:
+            if set(resolved_movements.keys()) != set(persisted_movements.keys()):
+                has_unverified_movement_source = True
+            else:
+                for k, v in resolved_movements.items():
+                    persisted_v = Decimal(str(persisted_movements[k]))
+                    if abs(Decimal(str(v)) - persisted_v) > tol_dec:
+                        has_unverified_movement_source = True
+    else:
+        # Intra-run path:
+        persisted_movements = (
+            persisted_summary.get("illustrative_generic_pv_movements")
+            or persisted_summary.get("attributed_movements")
+            or {}
+        )
+        if movements is not None:
+            if set(resolved_movements.keys()) != set(persisted_movements.keys()):
+                has_unverified_movement_source = True
+            else:
+                for k, v in resolved_movements.items():
+                    persisted_v = Decimal(str(persisted_movements[k]))
+                    if abs(Decimal(str(v)) - persisted_v) > tol_dec:
+                        has_unverified_movement_source = True
+
     for k, v in resolved_movements.items():
         norm_key = str(k).strip().lower()
         if norm_key in FORBIDDEN_RESIDUAL_MOVEMENT_NAMES:
@@ -1467,10 +1519,6 @@ def execute_rollforward_attribution(
         except (ValueError, TypeError, ArithmeticError) as exc:
             raise ServiceError(400, "INVALID_ROLLFORWARD_MOVEMENT", f"Movement component '{k}' has invalid numeric value '{v}'.") from exc
 
-        # If caller passed custom movement in multi-period comparison without a verified source:
-        if prior_valuation_run_id and movements is not None and k not in persisted_movements:
-            has_unverified_movement_source = True
-
         movements_dec[str(k)] = dec_v
 
     continuity = validate_continuity(opening_dec, movements_dec, ending_dec, tolerance=tol_dec)
@@ -1483,6 +1531,13 @@ def execute_rollforward_attribution(
             f"Actuarial rollforward assertion failure (unexplained_residual={unexplained_residual}): {continuity.error_message}",
         )
 
+    # Encode verified vs unverified provenance and tolerance policy into trace_identifier (V8-P0-02)
+    trace_token = uuid.uuid4().hex[:12]
+    if has_unverified_movement_source:
+        trace_id = f"UNVERIFIED_SOURCE:{trace_token}"
+    else:
+        trace_id = f"VERIFIED:{effective_policy_id}:{trace_token}"
+
     records = record_rollforward_summary(
         db=db,
         run_id=valuation_run_id,
@@ -1491,7 +1546,51 @@ def execute_rollforward_attribution(
         methodology=clean_m,
         basis=clean_b,
         continuity_result=continuity,
+        trace_id=trace_id,
     )
+
+    # Persist immutable rollforward summary RunArtifact (V8-P0-02)
+    rf_doc = {
+        "valuation_run_id": valuation_run_id,
+        "project_id": project_id,
+        "cohort_id": str(effective_cohort),
+        "is_continuous": continuity.is_continuous,
+        "has_unverified_movement_source": has_unverified_movement_source,
+        "tolerance_policy_id": effective_policy_id,
+        "trace_identifier": trace_id,
+        "opening_balance": float(opening_dec),
+        "ending_balance": float(ending_dec),
+        "movements": {k: float(v) for k, v in movements_dec.items()},
+        "difference": float(continuity.difference),
+        "tolerance": float(tol_dec),
+    }
+    rf_bytes = json.dumps(rf_doc, sort_keys=True).encode("utf-8")
+    store = get_artifact_store()
+    stored_rf = store.write_bytes(
+        namespace=valuation_run_id,
+        artifact_type="rollforward_summary",
+        filename="rollforward_summary.json",
+        content=rf_bytes,
+    )
+    rf_art = RunArtifact(
+        id=f"art-rf-{uuid.uuid4().hex[:12]}",
+        run_id=valuation_run_id,
+        attempt_number=val_run.accepted_attempt_number or 1,
+        artifact_type="rollforward_summary",
+        storage_uri=stored_rf.uri,
+        storage_backend="local",
+        file_format="json",
+        schema_version="m2-v1",
+        row_count=len(records),
+        checksum_sha256=hashlib.sha256(rf_bytes).hexdigest(),
+        partition={
+            "has_unverified_movement_source": has_unverified_movement_source,
+            "tolerance_policy_id": effective_policy_id,
+            "trace_identifier": trace_id,
+        },
+    )
+    db.add(rf_art)
+    db.commit()
 
     completed_at = datetime.now(timezone.utc).isoformat()
     return {
@@ -1513,8 +1612,9 @@ def execute_rollforward_attribution(
         "difference": float(continuity.difference),
         "unexplained_residual": float(unexplained_residual),
         "tolerance": float(tol_dec),
-        "tolerance_policy_id": "tol-policy-m5-standard",
+        "tolerance_policy_id": effective_policy_id,
         "has_unverified_movement_source": has_unverified_movement_source,
+        "trace_identifier": trace_id,
         "movements": {k: float(v) for k, v in movements_dec.items()},
         "started_at": started_at,
         "completed_at": completed_at,
@@ -1693,10 +1793,26 @@ def execute_governed_reconciliation(
                 continue
             if str(row_val_date).strip() != run_val_date:
                 continue
-            if row.get("cohort_id") is not None and run_cohort and str(row["cohort_id"]).strip() != run_cohort:
-                continue
-            if row.get("scenario_id") is not None and run_scenario_id and str(row["scenario_id"]).strip() != run_scenario_id:
-                continue
+            # V8-P0-03: Strict dimensional contract: exact cohort and scenario matching unless benchmark explicitly declares aggregate scope
+            is_aggregate_contract = (
+                str(row.get("scope_level", "")).upper() in ("PORTFOLIO", "AGGREGATE")
+                or str(row.get("benchmark_scope", "")).upper() in ("PORTFOLIO", "AGGREGATE")
+                or str(getattr(ers, "scope_level", "")).upper() in ("PORTFOLIO", "AGGREGATE")
+            )
+            if not is_aggregate_contract:
+                if run_cohort:
+                    row_cohort = row.get("cohort_id")
+                    if not row_cohort or str(row_cohort).strip() != run_cohort:
+                        continue
+                elif row.get("cohort_id") is not None and str(row.get("cohort_id")).strip() != "":
+                    continue
+
+                if run_scenario_id:
+                    row_scen = row.get("scenario_id")
+                    if not row_scen or str(row_scen).strip() != run_scenario_id:
+                        continue
+                elif row.get("scenario_id") is not None and str(row.get("scenario_id")).strip() != "":
+                    continue
 
             # Exact metric matching only (NO fallback to unrelated keys like account_value_close or reserve)
             if "metric_name" in row:
@@ -1820,7 +1936,7 @@ def execute_reporting_manifest(
     if val_run is None or val_run.project_id != project_id:
         raise ServiceError(404, "RUN_NOT_FOUND", f"Valuation run '{valuation_run_id}' not found in project '{project_id}'.")
 
-    # V6-P0-02: Derive release/approval status ONLY from verified persisted database rows!
+    # V6-P0-02, V7-P0-01, V8-P0-01: Derive release/approval status ONLY from verified persisted database rows!
     val_detail = db.get(ValuationRunDetail, valuation_run_id)
     val_pkg = db.query(RunPackage).filter(RunPackage.run_id == valuation_run_id).first()
 
@@ -1839,16 +1955,21 @@ def execute_reporting_manifest(
             except (ValueError, TypeError):
                 val_detail_consistent = False
 
+    # V8-P0-01: RunPackage is mandatory for release approval; cannot approve without frozen verified RunPackage!
     pkg_consistent = True
-    if val_pkg is not None:
+    if val_pkg is None:
+        pkg_consistent = False
+    else:
         if val_pkg.project_id != project_id:
+            pkg_consistent = False
+        try:
+            core_run_pkg.verify(val_pkg.package, val_pkg.fingerprint)
+        except Exception:
             pkg_consistent = False
         if valuation_result.get("run_package_id") and valuation_result["run_package_id"] != val_pkg.id:
             pkg_consistent = False
         if valuation_result.get("run_package_fingerprint") and valuation_result["run_package_fingerprint"] != val_pkg.fingerprint:
             pkg_consistent = False
-    elif valuation_result.get("run_package_id"):
-        pkg_consistent = False
 
     rec_report_id = reconciliation_result.get("report_id")
     rec_row = db.get(ReconciliationReport, rec_report_id) if rec_report_id else None
@@ -1861,29 +1982,76 @@ def execute_reporting_manifest(
         persisted_rec_status = rec_row.status
         actual_rec_diff = float((rec_row.summary or {}).get("difference") or 0.0)
         actual_rec_reason = (rec_row.summary or {}).get("reason") or rec_row.disposition_notes or ""
-        # Reconciling reserve is mandatory for authorized release of reserves
-        target_var = rec_row.variables_requested[0] if rec_row.variables_requested else target_metric
+
+        # V8-P2-06: Fix undefined target_metric variable safely; absent/empty metric fails closed
+        target_var = rec_row.variables_requested[0] if (rec_row.variables_requested and len(rec_row.variables_requested) > 0) else None
         is_material_metric = target_var in ("present_value_reserve", "closing_reserve")
-        rec_verified = (rec_row.status == "PASS" and is_material_metric)
-        if reconciliation_result.get("status") != rec_row.status:
-            rec_verified = False
 
-    rf_summary_id = rollforward_result.get("summary_id")
-    rf_row = db.get(RollforwardSummary, rf_summary_id) if rf_summary_id else None
-    if rf_row is None:
-        rf_row = db.query(RollforwardSummary).filter(
-            RollforwardSummary.run_id == valuation_run_id,
-            RollforwardSummary.project_id == project_id,
-        ).first()
+        # V8-P0-01: Mandate independently approved, four-eyes verified, fingerprint-checked ExpectedResultSet
+        ers_verified = False
+        if rec_row.expected_result_set_id:
+            ers = db.get(ExpectedResultSet, rec_row.expected_result_set_id)
+            if (
+                ers is not None
+                and ers.project_id == project_id
+                and ers.status == "approved"
+                and ers.approved_by is not None
+                and ers.created_by is not None
+                and ers.approved_by != ers.created_by
+            ):
+                computed_ers_fp = compute_fp(ers.rows_data)
+                if ers.fingerprint == computed_ers_fp:
+                    ers_verified = True
 
-    if rf_row is None or rf_row.project_id != project_id or rf_row.run_id != valuation_run_id:
+        # V8-P0-01 & V8-P0-03: Contradictory report rejection: Any non-PASS report for the run disqualifies release
+        all_rec_reports = db.query(ReconciliationReport).filter(
+            ReconciliationReport.run_id == valuation_run_id,
+            ReconciliationReport.project_id == project_id,
+        ).all()
+        has_failing_rec = any(r.status in ("FAIL", "ERROR") for r in all_rec_reports)
+
+        # Require that the prescribed material reserve metric has a passing report
+        has_passing_reserve_report = any(
+            r.status == "PASS" and any(v in ("present_value_reserve", "closing_reserve") for v in (r.variables_requested or []))
+            for r in all_rec_reports
+        )
+
+        rec_verified = (
+            rec_row.status == "PASS"
+            and is_material_metric
+            and ers_verified
+            and not has_failing_rec
+            and has_passing_reserve_report
+            and reconciliation_result.get("status") == rec_row.status
+        )
+
+    # V8-P0-02: Read rollforward verification and movement provenance strictly from persisted database rows
+    rf_rows = db.query(RollforwardSummary).filter(
+        RollforwardSummary.run_id == valuation_run_id,
+        RollforwardSummary.project_id == project_id,
+    ).all()
+
+    if not rf_rows:
         persisted_rf_ok = False
         rf_verified = False
     else:
-        persisted_rf_ok = bool(rf_row.is_continuity_verified)
-        has_unverified_source = bool(rollforward_result.get("has_unverified_movement_source", False))
-        rf_verified = persisted_rf_ok and not has_unverified_source
-        if bool(rollforward_result.get("is_continuous")) != bool(rf_row.is_continuity_verified):
+        all_continuous = all(bool(r.is_continuity_verified) for r in rf_rows)
+        has_unverified_provenance = any(
+            r.trace_identifier.startswith("UNVERIFIED_SOURCE")
+            or not r.trace_identifier.startswith("VERIFIED:")
+            for r in rf_rows
+        )
+        for r in rf_rows:
+            if r.trace_identifier.startswith("VERIFIED:"):
+                parts = r.trace_identifier.split(":")
+                if len(parts) >= 2:
+                    pol_id = parts[1]
+                    if pol_id not in GOVERNED_APPROVED_TOLERANCE_POLICIES:
+                        has_unverified_provenance = True
+
+        persisted_rf_ok = all_continuous
+        rf_verified = all_continuous and not has_unverified_provenance
+        if bool(rollforward_result.get("is_continuous")) != all_continuous:
             rf_verified = False
 
     if not val_detail_consistent or not pkg_consistent:
@@ -1919,35 +2087,48 @@ def execute_reporting_manifest(
             f"rollforward_verified={persisted_rf_ok} (governance_status='{governance_status}').",
         )
 
-    val_date_str = valuation_result.get("valuation_date") or (
-        val_run.valuation_date.isoformat() if val_run.valuation_date is not None else None
+    val_date_str = (
+        val_run.valuation_date.isoformat()
+        if val_run and val_run.valuation_date is not None
+        else valuation_result.get("valuation_date")
     )
+
+    rf_primary = rf_rows[0] if rf_rows else None
+    rf_persisted_movements = {
+        r.component_name: float(r.movement_amount)
+        for r in rf_rows if r.is_movement
+    }
+
     summary_package = {
         "valuation_run_id": valuation_run_id,
-        "upstream_projection_run_id": valuation_result.get("upstream_run_id"),
+        "upstream_projection_run_id": val_run.source_projection_run_id if val_run else valuation_result.get("upstream_run_id"),
         "project_id": project_id,
-        "basis": valuation_result["basis"],
-        "methodology": valuation_result["methodology"],
-        "cohort_id": valuation_result.get("cohort_id"),
+        "basis": val_run.basis if val_run and val_run.basis else valuation_result.get("basis"),
+        "methodology": val_run.methodology if val_run and val_run.methodology else valuation_result.get("methodology"),
+        "cohort_id": (rf_primary.cohort_id if rf_primary else val_run.projection_key if val_run else valuation_result.get("cohort_id")),
         "valuation_date": val_date_str,
-        "run_package_id": val_pkg.id if val_pkg else valuation_result.get("run_package_id"),
-        "run_package_fingerprint": val_pkg.fingerprint if val_pkg else valuation_result.get("run_package_fingerprint"),
+        "run_package_id": val_pkg.id if val_pkg else None,
+        "run_package_fingerprint": val_pkg.fingerprint if val_pkg else None,
         "reserve": persisted_reserve if persisted_reserve is not None else valuation_result.get("present_value_reserve"),
         "governance_status": governance_status,
         "is_approved_for_release": is_approved_for_release,
         "regulatory_compliance_claimed": False,
         "rollforward": {
-            "summary_id": rf_row.id if rf_row else rollforward_result.get("summary_id"),
+            "summary_id": rf_primary.id if rf_primary else None,
             "is_continuous": persisted_rf_ok,
-            "attribution_mode": rollforward_result.get("attribution_mode", "ILLUSTRATIVE_GENERIC_PV_NON_REGULATORY"),
-            "opening": rollforward_result.get("opening_balance"),
-            "movements": rollforward_result.get("movements", {}),
-            "ending": rollforward_result.get("ending_balance"),
-            "difference": rollforward_result.get("difference"),
+            "attribution_mode": (
+                "MULTI_PERIOD_PERSISTED_VALUATION_COMPARISON"
+                if val_run and getattr(val_run, "prior_valuation_run_id", None)
+                else "ILLUSTRATIVE_GENERIC_PV_NON_REGULATORY"
+            ),
+            "opening": float(rf_primary.opening_balance) if rf_primary else None,
+            "movements": rf_persisted_movements if rf_persisted_movements else rollforward_result.get("movements", {}),
+            "ending": float(rf_primary.closing_balance) if rf_primary else None,
+            "difference": float(rf_primary.continuity_difference) if rf_primary else 0.0,
         },
         "reconciliation": {
-            "report_id": rec_row.id if rec_row else reconciliation_result.get("report_id"),
-            "expected_result_set_id": getattr(rec_row, "expected_result_set_id", None) or reconciliation_result.get("expected_result_set_id"),
+            "report_id": rec_row.id if rec_row else None,
+            "expected_result_set_id": getattr(rec_row, "expected_result_set_id", None),
             "status": persisted_rec_status,
             "difference": actual_rec_diff,
             "reason": actual_rec_reason,

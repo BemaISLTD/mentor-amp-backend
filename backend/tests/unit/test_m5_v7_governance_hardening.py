@@ -38,7 +38,7 @@ from app.db.models.user import User
 from app.db.models.valuation_detail import ValuationRunDetail
 from app.core.valuation.rollforward import validate_continuity
 from app.services.common import ServiceError, now_utc
-from app.services.derived_dataset_service import approve_derived_dataset, promote_run_to_derived_dataset
+from app.services.derived_dataset_service import approve_derived_dataset, promote_run_to_derived_dataset, validate_derived_dataset
 from app.services.valuation_pipeline_service import (
     execute_cash_flow_aggregation,
     execute_governed_reconciliation,
@@ -187,15 +187,46 @@ def test_v6_p0_01_retry_inforce_lineage_immutability(v7_db):
 # =========================================================================
 
 def test_v6_p0_02_reporting_approval_persisted_record_verification(v7_db):
-    """P0-02: Proves reporting asset approval is derived strictly from persisted, verified DB records."""
+    """V8-P0-01 & V8-P2-06: Release approval requires frozen RunPackage, independently approved ExpectedResultSet, passing reports, and verified rollforward."""
+    from app.core.execution import run_package as core_pkg
     Session = v7_db["Session"]
     proj_id = v7_db["project_id"]
     mv_id = v7_db["model_version_id"]
-    val_run_id = f"run-v7-rep-{uuid.uuid4().hex[:8]}"
+    user_id = v7_db["user_id"]
+    reviewer_id = v7_db["reviewer_id"]
+    val_run_id = f"run-v8-rep-{uuid.uuid4().hex[:8]}"
     actual_reserve = 125000.0
 
     with Session() as db:
-        # Seed Run & ValuationRunDetail
+        # 1. Seed sealed frozen RunPackage
+        pkg_doc = core_pkg.seal(
+            identity={
+                "package_id": f"pkg-{val_run_id}",
+                "frozen_for_run_id": val_run_id,
+                "project_id": proj_id,
+                "created_at": "2026-11-04T00:00:00Z",
+                "created_by": {"id": user_id},
+            },
+            governance={"governance_mode": "governed"},
+            configuration={
+                "basis": "STATUTORY",
+                "methodology": "VM22",
+                "cohort_id": "COHORT_MYGA_2026",
+                "valuation_date": "2026-12-31",
+                "model_version": {"id": mv_id},
+            },
+        )
+        run_pkg = RunPackage(
+            id=f"pkg-{val_run_id}",
+            run_id=val_run_id,
+            project_id=proj_id,
+            schema_version=pkg_doc["schema_version"],
+            fingerprint_algorithm=pkg_doc["fingerprint_algorithm"],
+            fingerprint=pkg_doc["fingerprint"],
+            package=pkg_doc,
+        )
+
+        # 2. Seed Run & ValuationRunDetail
         run = Run(
             id=val_run_id,
             project_id=proj_id,
@@ -207,6 +238,7 @@ def test_v6_p0_02_reporting_approval_persisted_record_verification(v7_db):
             methodology="VM22",
             methodology_version="v1",
             valuation_date=date(2026, 12, 31),
+            run_package_fingerprint=pkg_doc["fingerprint"],
         )
         detail = ValuationRunDetail(
             run_id=val_run_id,
@@ -214,7 +246,35 @@ def test_v6_p0_02_reporting_approval_persisted_record_verification(v7_db):
             configuration={"basis": "STATUTORY", "methodology": "VM22", "cohort_id": "COHORT_MYGA_2026"},
             summary_results={"present_value_reserve": actual_reserve, "closing_reserve": actual_reserve},
         )
-        # Seed verified RollforwardSummary
+
+        # 3. Seed four-eyes approved ExpectedResultSet
+        ers_rows = [{
+            "basis": "STATUTORY",
+            "methodology": "VM22",
+            "cohort_id": "COHORT_MYGA_2026",
+            "valuation_date": "2026-12-31",
+            "present_value_reserve": actual_reserve,
+            "abs_tol": 0.01,
+            "rel_tol": 1e-4,
+        }]
+        ers = ExpectedResultSet(
+            id=f"ers-appr-{uuid.uuid4().hex[:8]}",
+            project_id=proj_id,
+            name="Approved VM22 Benchmark",
+            product_code="MYGA",
+            version_label="v1",
+            source_reference="ACTUARIAL_BENCHMARK",
+            row_count=1,
+            columns_detected=["basis", "methodology", "cohort_id", "valuation_date", "present_value_reserve"],
+            rows_data=ers_rows,
+            status="approved",
+            fingerprint=fingerprint(ers_rows),
+            created_by=user_id,
+            approved_by=reviewer_id,
+            approved_at=now_utc(),
+        )
+
+        # 4. Seed verified RollforwardSummary with VERIFIED trace
         rf_summary = RollforwardSummary(
             id=f"rf-{uuid.uuid4().hex[:8]}",
             run_id=val_run_id,
@@ -230,29 +290,23 @@ def test_v6_p0_02_reporting_approval_persisted_record_verification(v7_db):
             closing_balance=actual_reserve,
             is_continuity_verified=True,
             continuity_difference=0.0,
-            trace_identifier="trace-01",
+            trace_identifier=f"VERIFIED:tol-policy-m5-standard:{uuid.uuid4().hex[:12]}",
         )
-        # Seed passing ReconciliationReport
+
+        # 5. Seed passing ReconciliationReport linked to approved ExpectedResultSet
         rec_pass = ReconciliationReport(
             id=f"rec-{uuid.uuid4().hex[:8]}",
             project_id=proj_id,
             run_id=val_run_id,
+            expected_result_set_id=ers.id,
             level="policy_month",
             variables_requested=["present_value_reserve"],
+            expected_result_fingerprint=ers.fingerprint,
+            expected_result_version=ers.version_label,
             status="PASS",
-            summary={"difference": 0.001, "reason": "Match"},
+            summary={"difference": 0.0, "reason": "Exact match"},
         )
-        # Seed failing ReconciliationReport
-        rec_fail = ReconciliationReport(
-            id=f"rec-fail-{uuid.uuid4().hex[:8]}",
-            project_id=proj_id,
-            run_id=val_run_id,
-            level="policy_month",
-            variables_requested=["present_value_reserve"],
-            status="FAIL",
-            summary={"difference": 5000.0, "reason": "Threshold exceeded"},
-        )
-        db.add_all([run, detail, rf_summary, rec_pass, rec_fail])
+        db.add_all([run_pkg, run, detail, ers, rf_summary, rec_pass])
         db.commit()
 
         val_result = {
@@ -261,63 +315,160 @@ def test_v6_p0_02_reporting_approval_persisted_record_verification(v7_db):
             "present_value_reserve": actual_reserve,
             "basis": "STATUTORY",
             "methodology": "VM22",
+            "run_package_id": run_pkg.id,
+            "run_package_fingerprint": run_pkg.fingerprint,
         }
         rf_result = {"is_continuous": True, "summary_id": rf_summary.id}
 
-        # 1. Positive: Persisted PASS report & continuous rollforward -> Approved release
+        # Positive Case: Frozen RunPackage + Approved ExpectedResultSet + PASS report + Verified rollforward -> Approved release
         pass_rep = execute_reporting_manifest(
             db=db,
             valuation_run_id=val_run_id,
             project_id=proj_id,
             valuation_result=val_result,
             rollforward_result=rf_result,
-            reconciliation_result={"report_id": rec_pass.id, "status": "PASS", "difference": 0.001},
+            reconciliation_result={"report_id": rec_pass.id, "status": "PASS", "difference": 0.0},
             require_approved_reconciliation=True,
         )
         assert pass_rep["is_approved_for_release"] is True
         assert pass_rep["governance_status"] == "GOVERNED_RECONCILED_FOUNDATION_PACKAGE"
         assert pass_rep["artifact_type"] == "reporting"
+        assert pass_rep["package_id"] == f"DISCLOSURE-{val_run_id}"
 
-        # 2. Negative: Forged caller status='PASS' with no persisted report in DB -> NOT_VERIFIABLE & unverified artifact
-        unverified_rep = execute_reporting_manifest(
+        # Acceptance Test (a): Manufactured PASS row without RunPackage -> nonapproval
+        no_pkg_val_run_id = f"run-no-pkg-{uuid.uuid4().hex[:8]}"
+        run_no_pkg = Run(
+            id=no_pkg_val_run_id,
+            project_id=proj_id,
+            projection_key="COHORT_MYGA_2026",
+            status="success",
+            run_type="valuation",
+            model_version_id=mv_id,
+            basis="STATUTORY",
+            methodology="VM22",
+            valuation_date=date(2026, 12, 31),
+        )
+        detail_no_pkg = ValuationRunDetail(
+            run_id=no_pkg_val_run_id,
+            valuation_date=date(2026, 12, 31),
+            configuration={"basis": "STATUTORY", "methodology": "VM22", "cohort_id": "COHORT_MYGA_2026"},
+            summary_results={"present_value_reserve": actual_reserve},
+        )
+        rf_no_pkg = RollforwardSummary(
+            id=f"rf-nopkg-{uuid.uuid4().hex[:8]}",
+            run_id=no_pkg_val_run_id,
+            project_id=proj_id,
+            cohort_id="COHORT_MYGA_2026",
+            methodology="VM22",
+            basis="STATUTORY",
+            component_name="ending_reserve",
+            component_order=99,
+            is_movement=False,
+            closing_balance=actual_reserve,
+            is_continuity_verified=True,
+            trace_identifier=f"VERIFIED:tol-policy-m5-standard:{uuid.uuid4().hex[:12]}",
+        )
+        rec_pass_no_pkg = ReconciliationReport(
+            id=f"rec-nopkg-{uuid.uuid4().hex[:8]}",
+            project_id=proj_id,
+            run_id=no_pkg_val_run_id,
+            expected_result_set_id=ers.id,
+            variables_requested=["present_value_reserve"],
+            status="PASS",
+        )
+        db.add_all([run_no_pkg, detail_no_pkg, rf_no_pkg, rec_pass_no_pkg])
+        db.commit()
+
+        rep_no_pkg = execute_reporting_manifest(
+            db=db,
+            valuation_run_id=no_pkg_val_run_id,
+            project_id=proj_id,
+            valuation_result={"valuation_run_id": no_pkg_val_run_id, "project_id": proj_id, "present_value_reserve": actual_reserve, "basis": "STATUTORY", "methodology": "VM22"},
+            rollforward_result={"is_continuous": True, "summary_id": rf_no_pkg.id},
+            reconciliation_result={"report_id": rec_pass_no_pkg.id, "status": "PASS"},
+            require_approved_reconciliation=False,
+        )
+        assert rep_no_pkg["is_approved_for_release"] is False
+        assert rep_no_pkg["governance_status"] == "REJECTED_NON_APPROVED"
+        assert rep_no_pkg["artifact_type"] == "reporting_quarantined"
+
+        # Acceptance Test (b): PASS row without approved ExpectedResultSet -> nonapproval
+        rec_unapproved_ers = ReconciliationReport(
+            id=f"rec-unappr-{uuid.uuid4().hex[:8]}",
+            project_id=proj_id,
+            run_id=val_run_id,
+            expected_result_set_id=None,  # No approved ExpectedResultSet!
+            variables_requested=["present_value_reserve"],
+            status="PASS",
+        )
+        db.add(rec_unapproved_ers)
+        db.commit()
+
+        rep_unappr_ers = execute_reporting_manifest(
             db=db,
             valuation_run_id=val_run_id,
             project_id=proj_id,
             valuation_result=val_result,
             rollforward_result=rf_result,
-            reconciliation_result={"report_id": "rec-nonexistent-id", "status": "PASS"},
+            reconciliation_result={"report_id": rec_unapproved_ers.id, "status": "PASS"},
             require_approved_reconciliation=False,
         )
-        assert unverified_rep["is_approved_for_release"] is False
-        assert unverified_rep["governance_status"] == "TECHNICAL_MATERIALIZATION_UNVERIFIED_NON_APPROVED"
-        assert unverified_rep["artifact_type"] == "reporting_unverified"
+        assert rep_unappr_ers["is_approved_for_release"] is False
+        assert rep_unappr_ers["governance_status"] == "TECHNICAL_MATERIALIZATION_UNVERIFIED_NON_APPROVED"
 
-        # When require_approved_reconciliation=True, unverified report raises 422
-        with pytest.raises(ServiceError) as exc_gate_unverified:
-            execute_reporting_manifest(
-                db=db,
-                valuation_run_id=val_run_id,
-                project_id=proj_id,
-                valuation_result=val_result,
-                rollforward_result=rf_result,
-                reconciliation_result={"report_id": "rec-nonexistent-id", "status": "PASS"},
-                require_approved_reconciliation=True,
-            )
-        assert exc_gate_unverified.value.status_code == 422
+        # Acceptance Test (c): Contradictory reports: Failed mandatory reserve report for same run -> nonapproval
+        rec_failing = ReconciliationReport(
+            id=f"rec-fail-{uuid.uuid4().hex[:8]}",
+            project_id=proj_id,
+            run_id=val_run_id,
+            expected_result_set_id=ers.id,
+            variables_requested=["present_value_reserve"],
+            status="FAIL",
+            summary={"difference": 5000.0, "reason": "Breached tolerance"},
+        )
+        db.add(rec_failing)
+        db.commit()
 
-        # 3. Negative: Caller claims 'PASS' but DB row has status='FAIL' -> Quarantined
-        quarantined_rep = execute_reporting_manifest(
+        # Even if caller points to passing rec_pass.id, existence of failing report disqualifies release!
+        rep_with_fail = execute_reporting_manifest(
             db=db,
             valuation_run_id=val_run_id,
             project_id=proj_id,
             valuation_result=val_result,
             rollforward_result=rf_result,
-            reconciliation_result={"report_id": rec_fail.id, "status": "PASS"},  # Caller lies!
+            reconciliation_result={"report_id": rec_pass.id, "status": "PASS"},
             require_approved_reconciliation=False,
         )
-        assert quarantined_rep["is_approved_for_release"] is False
-        assert quarantined_rep["governance_status"] == "REJECTED_NON_APPROVED"
-        assert quarantined_rep["artifact_type"] == "reporting_quarantined"
+        assert rep_with_fail["is_approved_for_release"] is False
+        assert rep_with_fail["governance_status"] == "TECHNICAL_MATERIALIZATION_UNVERIFIED_NON_APPROVED"
+
+        # V8-P2-06: Empty variables_requested in ReconciliationReport fails closed without NameError
+        db.delete(rec_failing)
+        db.commit()
+
+        rec_empty_vars = ReconciliationReport(
+            id=f"rec-empty-vars-{uuid.uuid4().hex[:8]}",
+            project_id=proj_id,
+            run_id=val_run_id,
+            expected_result_set_id=ers.id,
+            variables_requested=[],  # Empty variables list!
+            status="PASS",
+        )
+        db.add(rec_empty_vars)
+        db.commit()
+
+        rep_empty_vars = execute_reporting_manifest(
+            db=db,
+            valuation_run_id=val_run_id,
+            project_id=proj_id,
+            valuation_result=val_result,
+            rollforward_result=rf_result,
+            reconciliation_result={"report_id": rec_empty_vars.id, "status": "PASS"},
+            require_approved_reconciliation=False,
+        )
+        # Must fail closed safely without raising NameError ('target_metric' is not defined)
+        assert rep_empty_vars["is_approved_for_release"] is False
+        assert rep_empty_vars["governance_status"] == "TECHNICAL_MATERIALIZATION_UNVERIFIED_NON_APPROVED"
 
 
 # =========================================================================
@@ -329,6 +480,7 @@ def test_v6_p0_03_bounded_rollforward_tolerances_and_movements(v7_db):
     Session = v7_db["Session"]
     proj_id = v7_db["project_id"]
     mv_id = v7_db["model_version_id"]
+    user_id = v7_db["user_id"]
 
     # 1. validate_continuity core rejection of negative, NaN, and Inf tolerances
     with pytest.raises(ValueError, match="finite, non-negative"):
@@ -408,7 +560,7 @@ def test_v6_p0_03_bounded_rollforward_tolerances_and_movements(v7_db):
         assert exc_nan_mov.value.status_code == 400
         assert exc_nan_mov.value.code == "INVALID_ROLLFORWARD_MOVEMENT"
 
-        # Valid bounded rollforward succeeds
+        # Valid bounded rollforward succeeds with approved policy
         rf_ok = execute_rollforward_attribution(
             db=db,
             valuation_run_id=run_id,
@@ -417,9 +569,111 @@ def test_v6_p0_03_bounded_rollforward_tolerances_and_movements(v7_db):
             ending=125000.0,
             movements={},
             tolerance=0.01,
+            tolerance_policy_id="tol-policy-m5-standard",
         )
         assert rf_ok["is_continuous"] is True
         assert rf_ok["difference"] == 0.0
+        assert rf_ok["has_unverified_movement_source"] is False
+        assert rf_ok["trace_identifier"].startswith("VERIFIED:tol-policy-m5-standard:")
+
+        # V8-P0-02 Acceptance Test: Fabricated tolerance policy ID rejected with 400
+        with pytest.raises(ServiceError) as exc_fab_pol:
+            execute_rollforward_attribution(
+                db=db,
+                valuation_run_id=run_id,
+                project_id=proj_id,
+                opening=125000.0,
+                ending=125000.0,
+                movements={},
+                tolerance_policy_id="tol-fabricated-custom",
+            )
+        assert exc_fab_pol.value.status_code == 400
+        assert exc_fab_pol.value.code == "TOLERANCE_POLICY_NOT_APPROVED"
+
+        # V8-P0-02 Acceptance Test: Changed movement amount where key exists in period_movements
+        # Seed prior valuation run with known period movements
+        prior_run_id = f"run-v8-prior-{uuid.uuid4().hex[:8]}"
+        prior_run = Run(
+            id=prior_run_id,
+            project_id=proj_id,
+            projection_key="COHORT_MYGA_2026",
+            status="success",
+            run_type="valuation",
+            model_version_id=mv_id,
+            basis="STATUTORY",
+            methodology="VM22",
+            valuation_date=date(2025, 12, 31),
+        )
+        prior_detail = ValuationRunDetail(
+            run_id=prior_run_id,
+            valuation_date=date(2025, 12, 31),
+            configuration={"basis": "STATUTORY", "methodology": "VM22", "cohort_id": "COHORT_MYGA_2026"},
+            summary_results={
+                "opening_reserve": 100000.0,
+                "closing_reserve": 125000.0,
+                "present_value_reserve": 125000.0,
+                "period_movements": {
+                    "accretion": 15000.0,
+                    "benefit_payout": -10000.0,
+                    "assumption_change": 20000.0,
+                },
+            },
+        )
+        curr_detail = ValuationRunDetail(
+            run_id=run_id,
+            valuation_date=date(2026, 12, 31),
+            configuration={"basis": "STATUTORY", "methodology": "VM22", "cohort_id": "COHORT_MYGA_2026"},
+            summary_results={
+                "opening_reserve": 125000.0,
+                "closing_reserve": 150000.0,
+                "present_value_reserve": 150000.0,
+            },
+        )
+        db.add_all([prior_run, prior_detail])
+        db.merge(curr_detail)
+        db.commit()
+
+        # Caller passes 'accretion' but changes amount to 25000.0 (persisted is 15000.0)
+        rf_tampered_mov = execute_rollforward_attribution(
+            db=db,
+            valuation_run_id=run_id,
+            project_id=proj_id,
+            prior_valuation_run_id=prior_run_id,
+            movements={
+                "accretion": 25000.0,  # Changed amount!
+            },
+            tolerance=0.01,
+        )
+        # Must NOT receive verified attribution!
+        assert rf_tampered_mov["has_unverified_movement_source"] is True
+        assert rf_tampered_mov["trace_identifier"].startswith("UNVERIFIED_SOURCE:")
+
+        # Replaying rollforward_result with has_unverified_movement_source=False CANNOT override DB provenance!
+        from app.core.execution import run_package as core_pkg
+        pkg_doc = core_pkg.seal(
+            identity={"package_id": f"pkg-{run_id}", "frozen_for_run_id": run_id, "project_id": proj_id, "created_at": "2026-11-04T00:00:00Z", "created_by": {"id": user_id}},
+            governance={"governance_mode": "governed"},
+            configuration={"basis": "STATUTORY", "methodology": "VM22", "cohort_id": "COHORT_MYGA_2026", "valuation_date": "2026-12-31"},
+        )
+        db.merge(RunPackage(id=f"pkg-{run_id}", run_id=run_id, project_id=proj_id, schema_version=pkg_doc["schema_version"], fingerprint_algorithm=pkg_doc["fingerprint_algorithm"], fingerprint=pkg_doc["fingerprint"], package=pkg_doc))
+        db.commit()
+
+        rep_override_attempt = execute_reporting_manifest(
+            db=db,
+            valuation_run_id=run_id,
+            project_id=proj_id,
+            valuation_result={"valuation_run_id": run_id, "project_id": proj_id, "present_value_reserve": 150000.0, "basis": "STATUTORY", "methodology": "VM22"},
+            rollforward_result={
+                "is_continuous": True,
+                "summary_id": rf_tampered_mov["summary_id"],
+                "has_unverified_movement_source": False,  # Caller falsely claims False!
+            },
+            reconciliation_result={"report_id": "rec-none", "status": "PASS"},
+            require_approved_reconciliation=False,
+        )
+        # Persisted UNVERIFIED_SOURCE trace in DB blocks approval!
+        assert rep_override_attempt["is_approved_for_release"] is False
+        assert rep_override_attempt["governance_status"] == "REJECTED_NON_APPROVED"
 
 
 # =========================================================================
@@ -558,6 +812,79 @@ def test_v6_p0_04_benchmark_dimensions_products_and_metrics(v7_db):
             )
         assert exc_unk.value.status_code == 400
         assert exc_unk.value.code == "UNKNOWN_PRODUCT_FOR_BENCHMARK"
+
+        # V8-P0-03 Acceptance Test: Single-row benchmark missing scenario or cohort cannot yield PASS for cell-specific valuation
+        missing_cohort_rows = [{
+            "basis": "STATUTORY",
+            "methodology": "VM22",
+            "valuation_date": "2026-12-31",
+            "present_value_reserve": 125000.0,
+            # Omits cohort_id!
+        }]
+        ers_missing_cohort = ExpectedResultSet(
+            id=f"ers-no-cohort-{uuid.uuid4().hex[:8]}",
+            project_id=proj_id,
+            name="Missing Cohort Benchmark",
+            product_code="MYGA",
+            version_label="v1",
+            source_reference="ACTUARIAL_BENCHMARK",
+            row_count=1,
+            columns_detected=["basis", "methodology", "valuation_date", "present_value_reserve"],
+            rows_data=missing_cohort_rows,
+            status="approved",
+            fingerprint=fingerprint(missing_cohort_rows),
+            created_by=user_id,
+            approved_by=reviewer_id,
+            approved_at=now_utc(),
+        )
+        db.add(ers_missing_cohort)
+        db.commit()
+
+        rec_missing_cohort = execute_governed_reconciliation(
+            db=db,
+            valuation_run_id=run_id,
+            project_id=proj_id,
+            expected_result_set_id=ers_missing_cohort.id,
+        )
+        # Must NOT yield PASS! Must fail closed with NOT_VERIFIABLE due to dimensional contract
+        assert rec_missing_cohort["status"] == "NOT_VERIFIABLE"
+        assert "cohort" in rec_missing_cohort["not_verifiable_reason"]
+
+        # Valid aggregate-scope benchmark deliberately omitting cohort/scenario is allowed per explicit contract
+        aggregate_rows = [{
+            "scope_level": "AGGREGATE",
+            "basis": "STATUTORY",
+            "methodology": "VM22",
+            "valuation_date": "2026-12-31",
+            "present_value_reserve": 125000.0,
+        }]
+        ers_aggregate = ExpectedResultSet(
+            id=f"ers-agg-{uuid.uuid4().hex[:8]}",
+            project_id=proj_id,
+            name="Aggregate Scope Benchmark",
+            product_code="MYGA",
+            version_label="v1",
+            source_reference="ACTUARIAL_BENCHMARK",
+            row_count=1,
+            columns_detected=["scope_level", "basis", "methodology", "valuation_date", "present_value_reserve"],
+            rows_data=aggregate_rows,
+            status="approved",
+            fingerprint=fingerprint(aggregate_rows),
+            created_by=user_id,
+            approved_by=reviewer_id,
+            approved_at=now_utc(),
+        )
+        db.add(ers_aggregate)
+        db.commit()
+
+        rec_aggregate = execute_governed_reconciliation(
+            db=db,
+            valuation_run_id=run_id,
+            project_id=proj_id,
+            expected_result_set_id=ers_aggregate.id,
+        )
+        assert rec_aggregate["status"] == "PASS"
+        assert rec_aggregate["difference"] == 0.0
 
 
 # =========================================================================
@@ -840,7 +1167,36 @@ def test_v6_p1_06_derived_dataset_promotion_and_checksum_integrity(v7_db, tmp_pa
         assert ds.fingerprint == real_sha256
         assert ds.status == "draft"
 
-        # 5. Approve derived dataset re-verifies checksum
+        # 5. Validate derived dataset
+        ds_val = validate_derived_dataset(
+            db=db,
+            project_id=proj_id,
+            dataset_id=ds.id,
+            user_id=user_id,
+        )
+        assert ds_val.status == "validated"
+
+        # V8-P1-04 Acceptance Test: Tamper physical disk bytes between validation and approval
+        store = get_artifact_store()
+        parquet_path = store.path_for_uri(ds.storage_uri)
+        original_bytes = parquet_path.read_bytes()
+        parquet_path.write_bytes(original_bytes + b"TAMPERED_POST_VALIDATION_BYTES")
+
+        # Attempting approval must fail closed with 400 Bad Request checksum mismatch
+        with pytest.raises(ServiceError) as exc_tamper:
+            approve_derived_dataset(
+                db=db,
+                project_id=proj_id,
+                dataset_id=ds.id,
+                approved_by_user_id=reviewer_id,
+            )
+        assert exc_tamper.value.status_code == 400
+        assert "checksum mismatch" in exc_tamper.value.message.lower()
+        db.refresh(ds)
+        assert ds.status == "validated"  # NOT approved!
+
+        # Restore genuine bytes -> approval succeeds
+        parquet_path.write_bytes(original_bytes)
         ds_approved = approve_derived_dataset(
             db=db,
             project_id=proj_id,

@@ -763,6 +763,7 @@ def test_m5_postgres_dagster_e2e_and_production_retry(monkeypatch):
                     "basis": "STATUTORY",
                     "methodology": "VM22",
                     "cohort_id": cohort_val,
+                    "scenario_id": scen_id,
                     "valuation_date": "2026-12-31",
                     "present_value_reserve": reserve_val,
                     "abs_tol": 0.01,

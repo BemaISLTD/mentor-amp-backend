@@ -296,6 +296,24 @@ def approve_derived_dataset(
         # Run validation check first
         validate_derived_dataset(db, project_id, dataset_id, approved_by_user_id)
 
+    # V8-P1-04: Unconditionally re-verify physical Parquet bytes and checksum at approval
+    store = get_artifact_store()
+    path = store.path_for_uri(dataset.storage_uri)
+    if not path.exists():
+        raise bad_request(f"Dataset Parquet file is missing from '{dataset.storage_uri}'.")
+    content = path.read_bytes()
+    computed_sha = hashlib.sha256(content).hexdigest()
+    if dataset.fingerprint and computed_sha != dataset.fingerprint:
+        raise bad_request(
+            f"Physical artifact checksum mismatch for dataset '{dataset_id}'. Expected {dataset.fingerprint}, got {computed_sha}."
+        )
+    if dataset.source_artifact_id:
+        src_art = db.get(RunArtifact, dataset.source_artifact_id)
+        if src_art and src_art.checksum_sha256 and computed_sha != src_art.checksum_sha256:
+            raise bad_request(
+                f"Physical artifact checksum '{computed_sha}' mismatches source artifact checksum '{src_art.checksum_sha256}'."
+            )
+
     dataset.status = "approved"
     dataset.approved_by = approved_by_user_id
     dataset.approved_at = _now()

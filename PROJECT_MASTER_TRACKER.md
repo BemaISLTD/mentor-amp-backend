@@ -5,11 +5,11 @@
 > This document is a **Living Requirements Traceability and Execution Ledger** derived from the project's authoritative source documents. It does **NOT** replace, supersede, or alter them.  
 > **If this ledger conflicts with an authoritative source document, the authoritative source wins until the conflict is deliberately resolved, approved, and formally documented.**
 
-**Document Version:** 2.8 (M5 Senior Review V6 Findings Resolved — Bundle v7 Ready)  
+**Document Version:** 2.9 (M5 Senior Review V7 Findings Resolved — Bundle v8 Ready)  
 **Date:** November 4, 2026  
 **Status:** Working Execution Ledger — Independent Senior Review Ready (M5A–M5D Foundation & Dagster Orchestration Verified Locally; M5E Reference Verticals Gated)  
 **Current Git Branch:** `feat/m5-valuation-frameworks-dagster`  
-**Prior Reviewed Baseline SHA:** `bd46bf776a8da8ce36f3782752159cbdffd2c6d7` (`bd46bf7`) — V7 HEAD SHA recorded in `00_REVIEW_OVERVIEW_AND_MANIFEST.md` and `evidence/git_log.log`  
+**Prior Reviewed Baseline SHA:** `5324123e5ec06af01826f08e9c6ec566c4001218` (`5324123`) — V7 HEAD SHA recorded in `00_REVIEW_OVERVIEW_AND_MANIFEST.md` and `patches/git_log_graph.txt`  
 **Alembic Head Revision:** `c9f4e2d8a615` (Single canonical head)  
 **Engine Build Identity:** `m3-cpu-dsl-1`  
 
@@ -131,7 +131,7 @@ The team has accumulated critical architectural lessons through senior review pa
 | **5. Product Verticals** | 15% | **Delivered:** SPIA, MYGA. **Remaining:** FIA, RILA, IDI, VA, PRT, Life-readiness demonstration. | **IN PROGRESS** (0.35) | 5.25% |
 | **6. Valuation Frameworks & Accounting** | 15% | Foundation discounting, trusted RunPackage provenance, valuation-linked 2-period rollforwards, derived datasets (Verified Locally). VM-21, VM-22, LDTI, DAC, MRB, ASC 815 reference verticals gated on ACT-DEC-01..09. | **IN PROGRESS — FOUNDATION VERIFIED / VERTICALS GATED** (0.25) | 3.75% |
 | **7. Execution Scale & Orchestration** | 10% | Local CPU multithreading & PostgreSQL-backed 8-asset Dagster pipeline with partial-write production retry on same run_id (Verified Locally). PySpark cluster executor, GPU CUDA kernels (Pending Week 6). | **IN PROGRESS — DAGSTER VERIFIED / SPARK & GPU PLANNED** (0.45) | 4.50% |
-| **8. Hardening, QA & Release** | 5% | Full repo tests passing (609 M5/regression tests: 365 unit + 219 integration + 25 PostgreSQL). Performance benchmark (target TBD under ACT-DEC-06; 100k candidate only), actuarial sign-off, tagged v1.0.0. | **PLANNED** (0.25) | 1.25% |
+| **8. Hardening, QA & Release** | 5% | Full repo tests passing (616 M5/regression tests: 372 unit + 219 integration + 25 PostgreSQL, 2 skipped, 0 failed; combined suite: 591 passed, 2 skipped). Performance benchmark (target TBD under ACT-DEC-06; 100k candidate only), actuarial sign-off, tagged v1.0.0. | **PLANNED** (0.25) | 1.25% |
 | **TOTALS** | **100%** | **Consolidated Launch Release 1.0 Progress** | — | **≈ 45%** |
 
 ---
@@ -167,7 +167,7 @@ Every major completion claim is audited against concrete evidence files, commit 
 | **Statutory Model #805 Implementation** | `DOWNGRADED: Illustrative Contractual Nonforfeiture Floor Only` | `backend/app/core/products/myga.py` | `f6708d1` | Local Python CPU | Full Model #805 statutory rules pending |
 | **Weeks 0–3 Substantially Done** | `DOWNGRADED: Backend Substantial; Frontend Integration & Actuarial Gates Pending` | `sam_m3_frontend_spec.md`, `PROJECT_MASTER_TRACKER.md` | `f6708d1` | Local codebase | Full-team integration review pending |
 | **MYGA-10001 Benchmark & Inforce Package** | `VERIFIED` | `samples/myga/synthetic_myga_inforce_10001.csv`, `samples/myga/expected_reference_myga_10001.csv`, `generate_myga_samples.py`, `test_seed_demo_multi_product.py` | Working Tree | Python 3.14.2, pytest-8.4.2 | 100% pass across 60 months; max abs diff 0.00e+00; 512 tests passing |
-| **M5 V6 Foundation, Trusted Provenance & PG Dagster E2E (609 Tests)** | `LOCAL AGENT EVIDENCE — VERIFIED ON DISPOSABLE POSTGRESQL; PENDING INDEPENDENT SENIOR REVIEW` | `evidence/unit_tests.log` (365 pass), `evidence/integration_tests.log` (219 pass, 2 skip), `evidence/postgres_tests.log` (25 pass), `evidence/dagster_execution_evidence.log` (8 pass), `evidence/combined_tests.log` (584 pass, 2 skip) | V6 HEAD (`git_log.log`) | Windows 11, Python 3.14.2, PostgreSQL `mentoramp_m5_disposable_test` | Pending Senior Review of `mentoramp_m5_senior_review_bundle_v6.zip` |
+| **M5 V8 Foundation, Governed Reporting Gate & Scoped Reconciliation (616 Tests)** | `LOCAL AGENT EVIDENCE — VERIFIED ON DISPOSABLE POSTGRESQL; PENDING INDEPENDENT SENIOR REVIEW` | `evidence/unit_tests.log` (372 pass), `evidence/integration_tests.log` (219 pass, 2 skip), `evidence/postgres_tests.log` (25 pass), `evidence/governance_hardening_evidence.log` (7 pass), `evidence/combined_tests.log` (591 pass, 2 skip) | V8 HEAD (`patches/git_log_graph.txt`) | Windows 11, Python 3.14.2, PostgreSQL `mentoramp_m5_disposable_test` | Pending Senior Review of `mentoramp_m5_senior_review_bundle_v8.zip` |
 
 ---
 
@@ -330,7 +330,7 @@ This matrix traces every authoritative requirement from `CAS`, `MP`, `W0R`, and 
 | **TRK-MP-14-W2** | TRACKER-DERIVED | `MP` §14.2 | Week 2 Registries & Formula Studio Foundation | `registry.py`, `dsl.py`| `formulas` | `/v1/formulas/*` | DSL tests | YES | YES | Formula Studio | Monaco UI pending | **VERIFIED (0.75)** |
 | **TRK-MP-14-W3** | TRACKER-DERIVED | `MP` §14.3 | Week 3 Projection Spine, Parquet, MYGA & M3 | `myga.py`, `reconciliation_service.py`| PG Triggers | `/v1/reconciliation`| M3 tests | YES | YES | Recon Dashboard | Pending re-review | **IMPLEMENTED — RE-REVIEW (0.65)** |
 | **TRK-MP-14-W4** | TRACKER-DERIVED | `MP` §14.4 | Week 4 FIA & RILA Priority Product Verticals | — | — | — | — | — | — | Models UI | Scheduled next | **PLANNED (0.00)** |
-| **TRK-MP-14-W5** | TRACKER-DERIVED | `MP` §14.5 | Week 5 Valuation Frameworks & Dagster Workflow | `app/orchestration/dagster/assets.py`, `app/core/valuation/`, `app/services/valuation_pipeline_service.py` | Migration `c9f4e2d8a615` | `/v1/runs` | 606 M5/regression tests pass | YES | YES | Results UI | Foundation verified locally; M5E verticals gated on ACT-DEC-01..09 | **IN PROGRESS — FOUNDATION VERIFIED / M5E VERTICALS GATED (0.70)** |
+| **TRK-MP-14-W5** | TRACKER-DERIVED | `MP` §14.5 | Week 5 Valuation Frameworks & Dagster Workflow | `app/orchestration/dagster/assets.py`, `app/core/valuation/`, `app/services/valuation_pipeline_service.py` | Migration `c9f4e2d8a615` | `/v1/runs` | 616 M5/regression tests pass (372 unit, 219 integration, 25 postgres; 591 combined, 2 skipped) | YES | YES | Results UI | Foundation verified locally; M5E verticals gated on ACT-DEC-01..09 | **IN PROGRESS — FOUNDATION VERIFIED / M5E VERTICALS GATED (0.70)** |
 | **TRK-MP-14-W6** | TRACKER-DERIVED | `MP` §14.6 | Week 6 PySpark / GPU Scale Paths & Integration | — | — | — | — | — | — | Run Center | Scheduled Week 6 | **NOT STARTED (0.00)** |
 | **TRK-MP-14-W7** | TRACKER-DERIVED | `MP` §14.7 | Week 7 IDI, VA, PRT, Life Readiness & Reporting| — | — | — | — | — | — | Models UI | Scheduled Week 7 | **NOT STARTED (0.00)** |
 | **TRK-MP-14-W8** | TRACKER-DERIVED | `MP` §14.8 | Week 8 Full UI Integration & Electron Packaging| — | — | — | — | — | — | Electron App | Scheduled Week 8 | **NOT STARTED (0.00)** |
@@ -827,6 +827,13 @@ ightarrow$ reporting.
   - **V6-P1-05 (Model Version Four-Eyes and Approval Integrity):** `freeze_valuation_run_package` and `execute_projection_simulation` strictly enforce that `ModelVersion` status is `"approved"` or `"published"`, `approved_at` is timestamped, and `approved_by` and `created_by` are distinct non-null principals (`400 MODEL_VERSION_NOT_APPROVED` / `400 MODEL_VERSION_APPROVAL_INVALID`).
   - **V6-P1-06 (Derived Dataset Promotion and Checksum Integrity):** `promote_run_to_derived_dataset` requires source run `accepted_attempt_number >= 1`, strictly queries artifact scoped to accepted attempt number (`attempt_number == run.accepted_attempt_number`), and enforces non-empty 64-hex recorded `checksum_sha256` matching physical file bytes. Re-verified on `approve_derived_dataset`.
   - **V6-P1-07 (Evidence Description Accuracy):** Corrected test comments and docstrings in `backend/tests/postgres/test_m5_postgres_governance.py` from "mid-attempt worker crash" to "worker crash after real PostgreSQL commits".
+* **M5 Senior Review V8 Corrections Status (November 4, 2026 — Bundle v8 Ready):**
+  - **V7-P0-01 (Approved Release Gate Fail-Open Elimination):** `execute_reporting_manifest` mandates verified frozen `RunPackage`, four-eyes approved `ExpectedResultSet` with fingerprint verification, checks that no reconciliation report for the run has `status in ("FAIL", "ERROR")`, enforces presence of a passing material reserve metric report (`present_value_reserve`), and authenticates rollforward continuity. Summary package fields are constructed strictly from authoritative DB rows, unconditionally rejecting caller overrides.
+  - **V7-P0-02 (Rollforward Movement Provenance & Verified Status):** `execute_rollforward_attribution` enforces governed tolerance policies (`GOVERNED_APPROVED_TOLERANCE_POLICIES`), authenticates movement keys and amounts against persisted summary, records verified state into `trace_identifier` (`VERIFIED:{policy_id}:{token}` vs `UNVERIFIED_SOURCE:{token}`), and persists a `RunArtifact` with type `rollforward_summary`. `execute_reporting_manifest` re-reads DB `trace_identifier`, rejecting unapproved policies and caller overrides.
+  - **V7-P0-03 (Strict Reconciliation Scoped Dimensions):** Exact match required on `basis`, `methodology`, `valuation_date`, `cohort_id`, and `scenario_id` unless the benchmark row is explicitly marked with `scope_level in ("PORTFOLIO", "AGGREGATE")`. Rejects contradictory or failing reports for the same run.
+  - **V7-P1-04 (Derived Dataset Approval-Time Physical Checksum Verification):** `approve_derived_dataset` unconditionally re-reads physical Parquet file bytes from disk and recalculates SHA-256 against `dataset.fingerprint` and `source_artifact.checksum_sha256`.
+  - **V7-P1-05 (Single-Invocation Combined Test Evidence & Clean Worktree):** Single-invocation `combined_tests.log` capturing 591 passed, 2 skipped across unit and integration suites; `.gitignore` updated with `bundle_v*/` ensuring worktree is completely clean.
+  - **V7-P2-06 (Undefined target_metric Fallback Fix):** Safe variable extraction in `execute_reporting_manifest` when `rec_row.variables_requested` is empty, failing closed cleanly without `NameError`.
 
 ---
 
