@@ -1584,6 +1584,7 @@ def execute_rollforward_attribution(
         row_count=len(records),
         checksum_sha256=hashlib.sha256(rf_bytes).hexdigest(),
         partition={
+            "summary_id": records[0].id if records else "",
             "has_unverified_movement_source": has_unverified_movement_source,
             "tolerance_policy_id": effective_policy_id,
             "trace_identifier": trace_id,
@@ -1594,6 +1595,7 @@ def execute_rollforward_attribution(
 
     completed_at = datetime.now(timezone.utc).isoformat()
     return {
+        "artifact_id": rf_art.id,
         "summary_id": records[0].id if records else "",
         "component_ids": [r.id for r in records],
         "component_count": len(records),
@@ -1621,6 +1623,229 @@ def execute_rollforward_attribution(
     }
 
 
+def evaluate_benchmark_matching(
+    val_run: Run,
+    val_detail: ValuationRunDetail,
+    val_pkg: RunPackage | None,
+    ers: ExpectedResultSet,
+    target_metric: str = "present_value_reserve",
+    tolerance: float | None = None,
+    rel_tol: float | None = None,
+    db: Session | None = None,
+) -> dict[str, Any]:
+    """Pure evaluation of valuation run results against an approved ExpectedResultSet (V8-P0-01).
+
+    Revalidates:
+    1. Active independent approval & Four-Eyes governance on ExpectedResultSet.
+    2. ExpectedResultSet rows fingerprint integrity.
+    3. Product family agreement between run and benchmark.
+    4. Dimensional scoping: basis, methodology, valuation_date, cohort_id, scenario_id.
+    5. Exact metric matching without arbitrary fallback.
+    6. Governed tolerances and tolerance override boundaries.
+    """
+    persisted_summary = (val_detail.summary_results if val_detail and isinstance(val_detail.summary_results, dict) else {}) or {}
+    if not target_metric or target_metric not in persisted_summary or persisted_summary[target_metric] is None:
+        raise ServiceError(
+            400, "INVALID_TARGET_METRIC",
+            f"Persisted ValuationRunDetail for run '{val_run.id}' does not contain target_metric '{target_metric}'.",
+        )
+    persisted_actual = float(persisted_summary[target_metric])
+
+    if ers.status != "approved" or not ers.approved_by or not ers.approved_at or ers.superseded_by_id is not None:
+        raise ServiceError(
+            400, "BENCHMARK_NOT_APPROVED",
+            f"ExpectedResultSet '{ers.id}' must be in active 'approved' status with independent approver (status: {ers.status}).",
+        )
+    if not ers.created_by or ers.approved_by == ers.created_by:
+        raise ServiceError(
+            400, "SELF_APPROVED_BENCHMARK_FORBIDDEN",
+            f"ExpectedResultSet '{ers.id}' violates four-eyes governance: created_by ('{ers.created_by}') must differ from approved_by ('{ers.approved_by}').",
+        )
+
+    computed_ers_fp = compute_fp(ers.rows_data)
+    if ers.fingerprint != computed_ers_fp:
+        raise ServiceError(
+            400, "BENCHMARK_FINGERPRINT_MISMATCH",
+            f"ExpectedResultSet '{ers.id}' rows do not match recorded fingerprint.",
+        )
+
+    pkg_cfg = (val_pkg.package.get("configuration", {}) if val_pkg and isinstance(val_pkg.package, dict) else {}) or {}
+    db_model_prod = None
+    if val_run.model_version_id and db is not None:
+        val_mv = db.get(ModelVersion, val_run.model_version_id)
+        if val_mv is not None:
+            val_mod = db.get(Model, val_mv.model_id)
+            if val_mod is not None:
+                db_model_prod = val_mod.product_code
+
+    run_product = _normalize_product_family(
+        pkg_cfg.get("model", {}).get("product_code")
+        or db_model_prod
+        or persisted_summary.get("product_code")
+    )
+    ers_product = _normalize_product_family(ers.product_code)
+    if ers_product == "UNKNOWN" or run_product == "UNKNOWN":
+        raise ServiceError(
+            400, "UNKNOWN_PRODUCT_FOR_BENCHMARK",
+            f"Governed reconciliation requires recognized product codes (benchmark: '{ers.product_code}', run: '{run_product}').",
+        )
+    if ers_product != run_product:
+        raise ServiceError(
+            400, "BENCHMARK_PRODUCT_MISMATCH",
+            f"ExpectedResultSet product '{ers.product_code}' ({ers_product}) mismatches valuation run product '{run_product}'.",
+        )
+
+    run_basis = str(val_run.basis or persisted_summary.get("basis") or "").strip().upper()
+    run_method = str(val_run.methodology or persisted_summary.get("methodology") or "").strip().upper()
+    run_cohort = str(persisted_summary.get("cohort_id") or val_run.projection_key or "").strip()
+    run_val_date = str(val_detail.valuation_date) if val_detail.valuation_date else str(val_run.valuation_date or "")
+    run_scenario_id = str(pkg_cfg.get("scenario", {}).get("id") or val_run.scenario_id or "").strip()
+
+    if not run_basis or not run_method or not run_val_date:
+        raise ServiceError(
+            400, "REQUIRED_DIMENSION_MISSING",
+            "Valuation run is missing required reconciliation dimension (basis, methodology, or valuation_date).",
+        )
+
+    if tolerance is not None and float(tolerance) < 0:
+        raise ServiceError(400, "UNGOVERNED_TOLERANCE_OVERRIDE_FORBIDDEN", "Negative tolerance is invalid.")
+    if rel_tol is not None and float(rel_tol) < 0:
+        raise ServiceError(400, "UNGOVERNED_TOLERANCE_OVERRIDE_FORBIDDEN", "Negative relative tolerance is invalid.")
+
+    rows = list(ers.rows_data or [])
+    matching_rows: list[dict[str, Any]] = []
+    scope_keys = ("basis", "methodology", "cohort_id", "valuation_date", "scenario_id")
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if len(rows) > 1 and not any(k in row and row[k] is not None for k in scope_keys):
+            raise ServiceError(
+                400, "AMBIGUOUS_BENCHMARK_ROWS",
+                f"Multi-row ExpectedResultSet '{ers.id}' contains unscoped rows without basis/methodology/cohort_id/valuation_date/scenario_id.",
+            )
+        row_basis = row.get("basis")
+        row_method = row.get("methodology")
+        row_val_date = row.get("valuation_date")
+        if not row_basis or not row_method or not row_val_date:
+            continue
+
+        if str(row_basis).strip().upper() != run_basis:
+            continue
+        if str(row_method).strip().upper() != run_method:
+            continue
+        if str(row_val_date).strip() != run_val_date:
+            continue
+
+        is_aggregate_contract = (
+            str(row.get("scope_level", "")).upper() in ("PORTFOLIO", "AGGREGATE")
+            or str(row.get("benchmark_scope", "")).upper() in ("PORTFOLIO", "AGGREGATE")
+            or str(getattr(ers, "scope_level", "")).upper() in ("PORTFOLIO", "AGGREGATE")
+        )
+        if not is_aggregate_contract:
+            if run_cohort:
+                row_cohort = row.get("cohort_id")
+                if not row_cohort or str(row_cohort).strip() != run_cohort:
+                    continue
+            elif row.get("cohort_id") is not None and str(row.get("cohort_id")).strip() != "":
+                continue
+
+            if run_scenario_id:
+                row_scen = row.get("scenario_id")
+                if not row_scen or str(row_scen).strip() != run_scenario_id:
+                    continue
+            elif row.get("scenario_id") is not None and str(row.get("scenario_id")).strip() != "":
+                continue
+
+        # Exact metric matching
+        if "metric_name" in row:
+            if str(row.get("metric_name")) != target_metric or row.get("expected_value") is None:
+                continue
+        else:
+            if target_metric not in row or row[target_metric] is None:
+                continue
+
+        matching_rows.append(row)
+
+    if len(matching_rows) > 1:
+        raise ServiceError(
+            400, "AMBIGUOUS_BENCHMARK_ROWS",
+            f"ExpectedResultSet '{ers.id}' matched {len(matching_rows)} ambiguous rows for metric '{target_metric}'.",
+        )
+
+    if len(matching_rows) == 0:
+        return {
+            "status": "NOT_VERIFIABLE",
+            "persisted_actual": persisted_actual,
+            "expected_benchmark": None,
+            "difference": 0.0,
+            "allowed_tolerance": 0.0,
+            "effective_abs_tol": GOVERNED_DEFAULT_ABS_TOL,
+            "effective_rel_tol": GOVERNED_DEFAULT_REL_TOL,
+            "reason": (
+                f"Approved ExpectedResultSet '{ers.id}' contains no scoped row matching "
+                f"(metric={target_metric}, basis={run_basis}, methodology={run_method}, cohort={run_cohort}, valuation_date={run_val_date})."
+            ),
+            "failures": [],
+            "ers_fingerprint": ers.fingerprint,
+            "ers_version": ers.version_label,
+        }
+
+    matched_row = matching_rows[0]
+    raw_expected = matched_row["expected_value"] if "metric_name" in matched_row else matched_row[target_metric]
+    benchmark_val = float(raw_expected)
+
+    row_abs_tol = matched_row.get("tolerance_abs", matched_row.get("abs_tol"))
+    row_rel_tol = matched_row.get("tolerance_rel", matched_row.get("rel_tol"))
+    governed_abs_tol = float(row_abs_tol) if row_abs_tol is not None else GOVERNED_DEFAULT_ABS_TOL
+    governed_rel_tol = float(row_rel_tol) if row_rel_tol is not None else GOVERNED_DEFAULT_REL_TOL
+
+    if tolerance is not None and float(tolerance) > governed_abs_tol + 1e-12:
+        raise ServiceError(
+            400, "UNGOVERNED_TOLERANCE_OVERRIDE_FORBIDDEN",
+            f"Caller absolute tolerance ({tolerance}) exceeds governed benchmark tolerance ({governed_abs_tol}).",
+        )
+    if rel_tol is not None and float(rel_tol) > governed_rel_tol + 1e-12:
+        raise ServiceError(
+            400, "UNGOVERNED_TOLERANCE_OVERRIDE_FORBIDDEN",
+            f"Caller relative tolerance ({rel_tol}) exceeds governed benchmark relative tolerance ({governed_rel_tol}).",
+        )
+
+    effective_abs_tol = float(tolerance) if tolerance is not None else governed_abs_tol
+    effective_rel_tol = float(rel_tol) if rel_tol is not None else governed_rel_tol
+
+    diff = abs(persisted_actual - benchmark_val)
+    allowed = effective_abs_tol + effective_rel_tol * abs(benchmark_val)
+    failures = []
+    if diff <= allowed:
+        status = "PASS"
+        reason = None
+    else:
+        status = "FAIL"
+        reason = f"Actual ({persisted_actual}) differs from expected ({benchmark_val}) by {diff:.6f} exceeding allowed tolerance {allowed:.6f}."
+        failures.append({
+            "metric": target_metric,
+            "actual": persisted_actual,
+            "expected": benchmark_val,
+            "difference": diff,
+            "allowed_tolerance": allowed,
+        })
+
+    return {
+        "status": status,
+        "persisted_actual": persisted_actual,
+        "expected_benchmark": benchmark_val,
+        "difference": diff,
+        "allowed_tolerance": allowed,
+        "effective_abs_tol": effective_abs_tol,
+        "effective_rel_tol": effective_rel_tol,
+        "reason": reason,
+        "failures": failures,
+        "ers_fingerprint": ers.fingerprint,
+        "ers_version": ers.version_label,
+    }
+
+
 def execute_governed_reconciliation(
     db: Session,
     valuation_run_id: str,
@@ -1632,7 +1857,7 @@ def execute_governed_reconciliation(
     rel_tol: float | None = None,
     target_metric: str = "present_value_reserve",
 ) -> dict[str, Any]:
-    """Execute three-state reconciliation strictly against an independently approved ExpectedResultSet (V5-P0-F).
+    """Execute three-state reconciliation strictly against an independently approved ExpectedResultSet (V5-P0-F, V8-P0-01).
 
     Enforces:
     1. Raw `expected_benchmark` is unconditionally forbidden (even if `expected_result_set_id` is passed).
@@ -1681,44 +1906,18 @@ def execute_governed_reconciliation(
             f"Caller-supplied actual_reserve ({actual_reserve}) disagrees with persisted ValuationRunDetail.{target_metric} ({persisted_actual}).",
         )
 
-    # Extract valuation run's authoritative dimensions for scoped benchmark matching
     val_pkg = db.query(RunPackage).filter(RunPackage.run_id == val_run.id).first()
-    pkg_cfg = (val_pkg.package.get("configuration", {}) if val_pkg and isinstance(val_pkg.package, dict) else {}) or {}
-    db_model_prod = None
-    if val_run.model_version_id:
-        val_mv = db.get(ModelVersion, val_run.model_version_id)
-        if val_mv is not None:
-            val_mod = db.get(Model, val_mv.model_id)
-            if val_mod is not None:
-                db_model_prod = val_mod.product_code
-    run_product = _normalize_product_family(
-        pkg_cfg.get("model", {}).get("product_code")
-        or db_model_prod
-        or persisted_summary.get("product_code")
-    )
-    run_basis = str(val_run.basis or persisted_summary.get("basis") or "").strip().upper()
-    run_method = str(val_run.methodology or persisted_summary.get("methodology") or "").strip().upper()
-    run_cohort = str(persisted_summary.get("cohort_id") or val_run.projection_key or "").strip()
-    run_val_date = str(val_detail.valuation_date) if val_detail.valuation_date else str(val_run.valuation_date or "")
-    run_scenario_id = str(pkg_cfg.get("scenario", {}).get("id") or val_run.scenario_id or "").strip()
-
-    benchmark_val: float | None = None
-    effective_abs_tol = GOVERNED_DEFAULT_ABS_TOL
-    effective_rel_tol = GOVERNED_DEFAULT_REL_TOL
-    ers_fp = ""
-    ers_version = "v1"
-    reason: str | None = None
-    failures: list[dict[str, Any]] = []
-
-    if tolerance is not None and float(tolerance) < 0:
-        raise ServiceError(400, "UNGOVERNED_TOLERANCE_OVERRIDE_FORBIDDEN", "Negative tolerance is invalid.")
-    if rel_tol is not None and float(rel_tol) < 0:
-        raise ServiceError(400, "UNGOVERNED_TOLERANCE_OVERRIDE_FORBIDDEN", "Negative relative tolerance is invalid.")
 
     if not expected_result_set_id:
         status = "NOT_VERIFIABLE"
         diff = 0.0
         reason = "No approved ExpectedResultSet supplied for governed reconciliation."
+        benchmark_val = None
+        effective_abs_tol = GOVERNED_DEFAULT_ABS_TOL
+        effective_rel_tol = GOVERNED_DEFAULT_REL_TOL
+        ers_fp = ""
+        ers_version = "v1"
+        failures = []
     else:
         ers = db.get(ExpectedResultSet, expected_result_set_id)
         if not ers or ers.project_id != project_id:
@@ -1726,154 +1925,26 @@ def execute_governed_reconciliation(
                 404, "BENCHMARK_NOT_FOUND",
                 f"ExpectedResultSet '{expected_result_set_id}' not found in project '{project_id}'.",
             )
-        if ers.status != "approved" or not ers.approved_by or not ers.approved_at or ers.superseded_by_id is not None:
-            raise ServiceError(
-                400, "BENCHMARK_NOT_APPROVED",
-                f"ExpectedResultSet '{expected_result_set_id}' must be in active 'approved' status with independent approver (status: {ers.status}).",
-            )
-        # 3. Enforce Four-Eyes independent approval on ExpectedResultSet
-        if not ers.created_by or ers.approved_by == ers.created_by:
-            raise ServiceError(
-                400, "SELF_APPROVED_BENCHMARK_FORBIDDEN",
-                f"ExpectedResultSet '{expected_result_set_id}' violates four-eyes governance: created_by ('{ers.created_by}') must differ from approved_by ('{ers.approved_by}').",
-            )
 
-        computed_ers_fp = compute_fp(ers.rows_data)
-        if ers.fingerprint != computed_ers_fp:
-            raise ServiceError(
-                400, "BENCHMARK_FINGERPRINT_MISMATCH",
-                f"ExpectedResultSet '{expected_result_set_id}' rows do not match recorded fingerprint.",
-            )
-
-        # Verify product family agreement (V6-P0-04: require recognized matching product)
-        ers_product = _normalize_product_family(ers.product_code)
-        if ers_product == "UNKNOWN" or run_product == "UNKNOWN":
-            raise ServiceError(
-                400, "UNKNOWN_PRODUCT_FOR_BENCHMARK",
-                f"Governed reconciliation requires recognized product codes (benchmark: '{ers.product_code}', run: '{run_product}').",
-            )
-        if ers_product != run_product:
-            raise ServiceError(
-                400, "BENCHMARK_PRODUCT_MISMATCH",
-                f"ExpectedResultSet product '{ers.product_code}' ({ers_product}) mismatches valuation run product '{run_product}'.",
-            )
-
-        if not run_basis or not run_method or not run_val_date:
-            raise ServiceError(
-                400, "REQUIRED_DIMENSION_MISSING",
-                "Valuation run is missing required reconciliation dimension (basis, methodology, or valuation_date).",
-            )
-
-        ers_fp = ers.fingerprint
-        ers_version = ers.version_label
-
-        rows = list(ers.rows_data or [])
-        matching_rows: list[dict[str, Any]] = []
-        scope_keys = ("basis", "methodology", "cohort_id", "valuation_date", "scenario_id")
-
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            # If multi-row benchmark, each row must carry at least one explicit scoping key so we never blindly pick last row
-            if len(rows) > 1 and not any(k in row and row[k] is not None for k in scope_keys):
-                raise ServiceError(
-                    400, "AMBIGUOUS_BENCHMARK_ROWS",
-                    f"Multi-row ExpectedResultSet '{ers.id}' contains unscoped rows without basis/methodology/cohort_id/valuation_date/scenario_id.",
-                )
-            # V6-P0-04: Strict dimensional contract: benchmark row must carry basis, methodology, and valuation_date
-            row_basis = row.get("basis")
-            row_method = row.get("methodology")
-            row_val_date = row.get("valuation_date")
-            if not row_basis or not row_method or not row_val_date:
-                continue
-
-            if str(row_basis).strip().upper() != run_basis:
-                continue
-            if str(row_method).strip().upper() != run_method:
-                continue
-            if str(row_val_date).strip() != run_val_date:
-                continue
-            # V8-P0-03: Strict dimensional contract: exact cohort and scenario matching unless benchmark explicitly declares aggregate scope
-            is_aggregate_contract = (
-                str(row.get("scope_level", "")).upper() in ("PORTFOLIO", "AGGREGATE")
-                or str(row.get("benchmark_scope", "")).upper() in ("PORTFOLIO", "AGGREGATE")
-                or str(getattr(ers, "scope_level", "")).upper() in ("PORTFOLIO", "AGGREGATE")
-            )
-            if not is_aggregate_contract:
-                if run_cohort:
-                    row_cohort = row.get("cohort_id")
-                    if not row_cohort or str(row_cohort).strip() != run_cohort:
-                        continue
-                elif row.get("cohort_id") is not None and str(row.get("cohort_id")).strip() != "":
-                    continue
-
-                if run_scenario_id:
-                    row_scen = row.get("scenario_id")
-                    if not row_scen or str(row_scen).strip() != run_scenario_id:
-                        continue
-                elif row.get("scenario_id") is not None and str(row.get("scenario_id")).strip() != "":
-                    continue
-
-            # Exact metric matching only (NO fallback to unrelated keys like account_value_close or reserve)
-            if "metric_name" in row:
-                if str(row.get("metric_name")) != target_metric or row.get("expected_value") is None:
-                    continue
-            else:
-                if target_metric not in row or row[target_metric] is None:
-                    continue
-
-            matching_rows.append(row)
-
-        if len(matching_rows) > 1:
-            raise ServiceError(
-                400, "AMBIGUOUS_BENCHMARK_ROWS",
-                f"ExpectedResultSet '{ers.id}' matched {len(matching_rows)} ambiguous rows for metric '{target_metric}'.",
-            )
-
-        if len(matching_rows) == 0:
-            status = "NOT_VERIFIABLE"
-            diff = 0.0
-            reason = (
-                f"Approved ExpectedResultSet '{ers.id}' contains no scoped row matching "
-                f"(metric={target_metric}, basis={run_basis}, methodology={run_method}, cohort={run_cohort}, valuation_date={run_val_date})."
-            )
-        else:
-            matched_row = matching_rows[0]
-            raw_expected = matched_row["expected_value"] if "metric_name" in matched_row else matched_row[target_metric]
-            benchmark_val = float(raw_expected)
-
-            row_abs_tol = matched_row.get("tolerance_abs", matched_row.get("abs_tol"))
-            row_rel_tol = matched_row.get("tolerance_rel", matched_row.get("rel_tol"))
-            governed_abs_tol = float(row_abs_tol) if row_abs_tol is not None else GOVERNED_DEFAULT_ABS_TOL
-            governed_rel_tol = float(row_rel_tol) if row_rel_tol is not None else GOVERNED_DEFAULT_REL_TOL
-
-            if tolerance is not None and float(tolerance) > governed_abs_tol + 1e-12:
-                raise ServiceError(
-                    400, "UNGOVERNED_TOLERANCE_OVERRIDE_FORBIDDEN",
-                    f"Caller absolute tolerance ({tolerance}) exceeds governed benchmark tolerance ({governed_abs_tol}).",
-                )
-            if rel_tol is not None and float(rel_tol) > governed_rel_tol + 1e-12:
-                raise ServiceError(
-                    400, "UNGOVERNED_TOLERANCE_OVERRIDE_FORBIDDEN",
-                    f"Caller relative tolerance ({rel_tol}) exceeds governed benchmark relative tolerance ({governed_rel_tol}).",
-                )
-
-            effective_abs_tol = float(tolerance) if tolerance is not None else governed_abs_tol
-            effective_rel_tol = float(rel_tol) if rel_tol is not None else governed_rel_tol
-
-            diff = abs(persisted_actual - benchmark_val)
-            allowed = effective_abs_tol + effective_rel_tol * abs(benchmark_val)
-            if diff <= allowed:
-                status = "PASS"
-            else:
-                status = "FAIL"
-                failures.append({
-                    "metric": target_metric,
-                    "actual": persisted_actual,
-                    "expected": benchmark_val,
-                    "difference": diff,
-                    "allowed_tolerance": allowed,
-                })
+        eval_res = evaluate_benchmark_matching(
+            val_run=val_run,
+            val_detail=val_detail,
+            val_pkg=val_pkg,
+            ers=ers,
+            target_metric=target_metric,
+            tolerance=tolerance,
+            rel_tol=rel_tol,
+            db=db,
+        )
+        status = eval_res["status"]
+        diff = eval_res["difference"]
+        reason = eval_res["reason"]
+        benchmark_val = eval_res["expected_benchmark"]
+        effective_abs_tol = eval_res["effective_abs_tol"]
+        effective_rel_tol = eval_res["effective_rel_tol"]
+        ers_fp = eval_res["ers_fingerprint"]
+        ers_version = eval_res["ers_version"]
+        failures = eval_res["failures"]
 
     rec_report = ReconciliationReport(
         id=f"rec-{uuid.uuid4().hex[:12]}",
@@ -1927,7 +1998,7 @@ def execute_reporting_manifest(
     reconciliation_result: dict[str, Any],
     require_approved_reconciliation: bool = False,
 ) -> dict[str, Any]:
-    """Assemble reporting manifest, explicitly distinguishing technical materialization from governance acceptance (V5-P1-I)."""
+    """Assemble reporting manifest, strictly deriving release approval from verified persisted evidence (V8-P0-01, V8-P0-02, V8-P1-03)."""
     started_at = datetime.now(timezone.utc).isoformat()
     if db is None:
         raise ServiceError(500, "DATABASE_REQUIRED", "Governed reporting export requires an active database session.")
@@ -1936,7 +2007,7 @@ def execute_reporting_manifest(
     if val_run is None or val_run.project_id != project_id:
         raise ServiceError(404, "RUN_NOT_FOUND", f"Valuation run '{valuation_run_id}' not found in project '{project_id}'.")
 
-    # V6-P0-02, V7-P0-01, V8-P0-01: Derive release/approval status ONLY from verified persisted database rows!
+    # 1. Valuation RunDetail integrity
     val_detail = db.get(ValuationRunDetail, valuation_run_id)
     val_pkg = db.query(RunPackage).filter(RunPackage.run_id == valuation_run_id).first()
 
@@ -1955,22 +2026,72 @@ def execute_reporting_manifest(
             except (ValueError, TypeError):
                 val_detail_consistent = False
 
-    # V8-P0-01: RunPackage is mandatory for release approval; cannot approve without frozen verified RunPackage!
+    # 2. V8-P1-03: Frozen RunPackage binding to canonical valuation run and project
     pkg_consistent = True
     if val_pkg is None:
         pkg_consistent = False
     else:
-        if val_pkg.project_id != project_id:
+        if val_pkg.project_id != project_id or val_pkg.run_id != valuation_run_id:
             pkg_consistent = False
+        if val_run.run_package_fingerprint and val_pkg.fingerprint != val_run.run_package_fingerprint:
+            pkg_consistent = False
+
+        doc = val_pkg.package if isinstance(val_pkg.package, dict) else {}
+        identity = doc.get("identity") if isinstance(doc.get("identity"), dict) else {}
+        config = doc.get("configuration") if isinstance(doc.get("configuration"), dict) else {}
+
+        if identity.get("package_id") and identity["package_id"] != val_pkg.id:
+            pkg_consistent = False
+        if identity.get("frozen_for_run_id") and identity["frozen_for_run_id"] != valuation_run_id:
+            pkg_consistent = False
+        if identity.get("project_id") and identity["project_id"] != project_id:
+            pkg_consistent = False
+        if doc.get("fingerprint") and doc["fingerprint"] != val_pkg.fingerprint:
+            pkg_consistent = False
+
+        val_block = config.get("valuation") or {}
+        if val_block:
+            if val_run.basis and val_block.get("basis") and str(val_block.get("basis")).strip().upper() != str(val_run.basis).strip().upper():
+                pkg_consistent = False
+            if val_run.methodology and val_block.get("methodology") and str(val_block.get("methodology")).strip().upper() != str(val_run.methodology).strip().upper():
+                pkg_consistent = False
+
+        # Strict valuation envelope identity binding (V8-P1-03)
+        if identity.get("package_id") != val_pkg.id:
+            pkg_consistent = False
+        if identity.get("frozen_for_run_id") != valuation_run_id or val_pkg.run_id != valuation_run_id or val_run.id != valuation_run_id:
+            pkg_consistent = False
+        if identity.get("project_id") != project_id or val_pkg.project_id != project_id or val_run.project_id != project_id:
+            pkg_consistent = False
+        if (config.get("project") or {}).get("id") and (config.get("project") or {}).get("id") != project_id:
+            pkg_consistent = False
+        if not val_run.run_package_fingerprint or val_run.run_package_fingerprint != val_pkg.fingerprint or doc.get("fingerprint") != val_pkg.fingerprint:
+            pkg_consistent = False
+
+        pkg_basis = (config.get("valuation") or {}).get("basis") or config.get("basis")
+        if val_run.basis and pkg_basis and str(pkg_basis).strip().upper() != str(val_run.basis).strip().upper():
+            pkg_consistent = False
+        pkg_method = (config.get("valuation") or {}).get("methodology") or config.get("methodology")
+        if val_run.methodology and pkg_method and str(pkg_method).strip().upper() != str(val_run.methodology).strip().upper():
+            pkg_consistent = False
+        pkg_vdate = (config.get("valuation") or {}).get("valuation_date") or config.get("valuation_date")
+        if val_run.valuation_date and pkg_vdate and str(pkg_vdate).strip() != str(val_run.valuation_date).strip():
+            pkg_consistent = False
+        pkg_mv = (config.get("model_version") or {}).get("id")
+        if val_run.model_version_id and pkg_mv and pkg_mv != val_run.model_version_id:
+            pkg_consistent = False
+
         try:
-            core_run_pkg.verify(val_pkg.package, val_pkg.fingerprint)
+            core_run_pkg.verify(doc, val_pkg.fingerprint)
         except Exception:
             pkg_consistent = False
+
         if valuation_result.get("run_package_id") and valuation_result["run_package_id"] != val_pkg.id:
             pkg_consistent = False
         if valuation_result.get("run_package_fingerprint") and valuation_result["run_package_fingerprint"] != val_pkg.fingerprint:
             pkg_consistent = False
 
+    # 3. V8-P0-01: Reconciliation approval integrity
     rec_report_id = reconciliation_result.get("report_id")
     rec_row = db.get(ReconciliationReport, rec_report_id) if rec_report_id else None
     if rec_row is None or rec_row.project_id != project_id or rec_row.run_id != valuation_run_id:
@@ -1983,13 +2104,16 @@ def execute_reporting_manifest(
         actual_rec_diff = float((rec_row.summary or {}).get("difference") or 0.0)
         actual_rec_reason = (rec_row.summary or {}).get("reason") or rec_row.disposition_notes or ""
 
-        # V8-P2-06: Fix undefined target_metric variable safely; absent/empty metric fails closed
-        target_var = rec_row.variables_requested[0] if (rec_row.variables_requested and len(rec_row.variables_requested) > 0) else None
-        is_material_metric = target_var in ("present_value_reserve", "closing_reserve")
+        # Prescribed required metric for foundation package: present_value_reserve MUST be requested
+        req_metric = "present_value_reserve"
+        has_required_metric = (
+            rec_row.variables_requested is not None
+            and req_metric in rec_row.variables_requested
+        )
 
-        # V8-P0-01: Mandate independently approved, four-eyes verified, fingerprint-checked ExpectedResultSet
-        ers_verified = False
-        if rec_row.expected_result_set_id:
+        ers_match_ok = False
+        eval_status_ok = False
+        if rec_row.expected_result_set_id and has_required_metric:
             ers = db.get(ExpectedResultSet, rec_row.expected_result_set_id)
             if (
                 ers is not None
@@ -1998,61 +2122,160 @@ def execute_reporting_manifest(
                 and ers.approved_by is not None
                 and ers.created_by is not None
                 and ers.approved_by != ers.created_by
+                and ers.fingerprint == rec_row.expected_result_fingerprint
+                and ers.version_label == rec_row.expected_result_version
             ):
-                computed_ers_fp = compute_fp(ers.rows_data)
-                if ers.fingerprint == computed_ers_fp:
-                    ers_verified = True
+                try:
+                    eval_res = evaluate_benchmark_matching(
+                        val_run=val_run,
+                        val_detail=val_detail,
+                        val_pkg=val_pkg,
+                        ers=ers,
+                        target_metric=req_metric,
+                        tolerance=rec_row.abs_tol,
+                        rel_tol=rec_row.rel_tol,
+                        db=db,
+                    )
+                    rec_actual = (rec_row.summary or {}).get("actual")
+                    rec_expected = (rec_row.summary or {}).get("expected")
 
-        # V8-P0-01 & V8-P0-03: Contradictory report rejection: Any non-PASS report for the run disqualifies release
+                    actual_matches = (
+                        rec_actual is not None
+                        and abs(float(rec_actual) - eval_res["persisted_actual"]) < 1e-6
+                    )
+                    expected_matches = (
+                        rec_expected is not None
+                        and eval_res["expected_benchmark"] is not None
+                        and abs(float(rec_expected) - eval_res["expected_benchmark"]) < 1e-6
+                    )
+
+                    if eval_res["status"] == "PASS" and actual_matches and expected_matches:
+                        eval_status_ok = True
+                        ers_match_ok = True
+                except Exception:
+                    eval_status_ok = False
+                    ers_match_ok = False
+
         all_rec_reports = db.query(ReconciliationReport).filter(
             ReconciliationReport.run_id == valuation_run_id,
             ReconciliationReport.project_id == project_id,
         ).all()
-        has_failing_rec = any(r.status in ("FAIL", "ERROR") for r in all_rec_reports)
 
-        # Require that the prescribed material reserve metric has a passing report
-        has_passing_reserve_report = any(
-            r.status == "PASS" and any(v in ("present_value_reserve", "closing_reserve") for v in (r.variables_requested or []))
+        has_failing_rec = any(r.status in ("FAIL", "ERROR") for r in all_rec_reports)
+        has_contradictory_for_ers = any(
+            r.expected_result_set_id == rec_row.expected_result_set_id
+            and r.status in ("FAIL", "ERROR", "NOT_VERIFIABLE")
+            and r.id != rec_row.id
             for r in all_rec_reports
         )
+        pv_reports = [r for r in all_rec_reports if r.variables_requested and req_metric in r.variables_requested]
+        has_passing_required_report = any(r.status == "PASS" for r in pv_reports)
 
         rec_verified = (
             rec_row.status == "PASS"
-            and is_material_metric
-            and ers_verified
+            and has_required_metric
+            and ers_match_ok
+            and eval_status_ok
             and not has_failing_rec
-            and has_passing_reserve_report
+            and not has_contradictory_for_ers
+            and has_passing_required_report
             and reconciliation_result.get("status") == rec_row.status
         )
 
-    # V8-P0-02: Read rollforward verification and movement provenance strictly from persisted database rows
-    rf_rows = db.query(RollforwardSummary).filter(
-        RollforwardSummary.run_id == valuation_run_id,
-        RollforwardSummary.project_id == project_id,
+    # 4. V8-P0-02: Authenticate persisted rollforward RunArtifact, physical file, checksum, and DB rows
+    rf_arts = db.query(RunArtifact).filter(
+        RunArtifact.run_id == valuation_run_id,
+        RunArtifact.artifact_type == "rollforward_summary",
     ).all()
 
-    if not rf_rows:
-        persisted_rf_ok = False
-        rf_verified = False
-    else:
-        all_continuous = all(bool(r.is_continuity_verified) for r in rf_rows)
-        has_unverified_provenance = any(
-            r.trace_identifier.startswith("UNVERIFIED_SOURCE")
-            or not r.trace_identifier.startswith("VERIFIED:")
-            for r in rf_rows
-        )
-        for r in rf_rows:
-            if r.trace_identifier.startswith("VERIFIED:"):
-                parts = r.trace_identifier.split(":")
-                if len(parts) >= 2:
-                    pol_id = parts[1]
-                    if pol_id not in GOVERNED_APPROVED_TOLERANCE_POLICIES:
-                        has_unverified_provenance = True
+    selected_rf_art = None
+    explicit_rf_art_id = rollforward_result.get("artifact_id")
+    explicit_rf_trace = rollforward_result.get("trace_identifier")
+    explicit_rf_sum_id = rollforward_result.get("summary_id")
 
-        persisted_rf_ok = all_continuous
-        rf_verified = all_continuous and not has_unverified_provenance
-        if bool(rollforward_result.get("is_continuous")) != all_continuous:
+    if explicit_rf_art_id:
+        for art in rf_arts:
+            if art.id == explicit_rf_art_id:
+                selected_rf_art = art
+                break
+    elif explicit_rf_trace:
+        for art in rf_arts:
+            part = art.partition if isinstance(art.partition, dict) else {}
+            if part.get("trace_identifier") == explicit_rf_trace:
+                selected_rf_art = art
+                break
+    elif explicit_rf_sum_id:
+        for art in rf_arts:
+            part = art.partition if isinstance(art.partition, dict) else {}
+            if part.get("summary_id") == explicit_rf_sum_id:
+                selected_rf_art = art
+                break
+    elif len(rf_arts) == 1:
+        selected_rf_art = rf_arts[0]
+
+    persisted_rf_ok = False
+    rf_verified = False
+    canonical_rf_rows: list[RollforwardSummary] = []
+    rf_persisted_movements: dict[str, float] = {}
+    rf_primary: RollforwardSummary | None = None
+
+    if selected_rf_art is not None:
+        try:
+            store = get_artifact_store()
+            rf_path = store.path_for_uri(selected_rf_art.storage_uri)
+            if rf_path.exists():
+                raw_rf_bytes = rf_path.read_bytes()
+                actual_rf_sha = hashlib.sha256(raw_rf_bytes).hexdigest()
+                if actual_rf_sha == selected_rf_art.checksum_sha256:
+                    rf_doc = json.loads(raw_rf_bytes.decode("utf-8"))
+                    if (
+                        rf_doc.get("valuation_run_id") == valuation_run_id
+                        and rf_doc.get("project_id") == project_id
+                        and rf_doc.get("is_continuous") is True
+                        and not rf_doc.get("has_unverified_movement_source")
+                        and rf_doc.get("tolerance_policy_id") in GOVERNED_APPROVED_TOLERANCE_POLICIES
+                    ):
+                        trace_id = rf_doc.get("trace_identifier", "")
+                        pol_id = rf_doc.get("tolerance_policy_id")
+                        if trace_id.startswith(f"VERIFIED:{pol_id}:"):
+                            canonical_rf_rows = db.query(RollforwardSummary).filter(
+                                RollforwardSummary.run_id == valuation_run_id,
+                                RollforwardSummary.project_id == project_id,
+                                RollforwardSummary.trace_identifier == trace_id,
+                            ).all()
+                            if canonical_rf_rows:
+                                all_continuous = all(bool(r.is_continuity_verified) for r in canonical_rf_rows)
+                                primary_candidates = [r for r in canonical_rf_rows if not r.is_movement]
+                                rf_primary = primary_candidates[0] if primary_candidates else canonical_rf_rows[0]
+
+                                db_movements = {
+                                    r.component_name: float(r.movement_amount)
+                                    for r in canonical_rf_rows if r.is_movement
+                                }
+                                art_movements = {
+                                    str(k): float(v)
+                                    for k, v in (rf_doc.get("movements") or {}).items()
+                                }
+
+                                movements_match = (
+                                    set(db_movements.keys()) == set(art_movements.keys())
+                                    and all(abs(db_movements[k] - art_movements[k]) < 1e-4 for k in db_movements)
+                                )
+
+                                balance_match = (
+                                    abs(float(rf_primary.opening_balance) - float(rf_doc.get("opening_balance", 0.0))) < 1e-4
+                                    and abs(float(rf_primary.closing_balance) - float(rf_doc.get("ending_balance", 0.0))) < 1e-4
+                                )
+
+                                if all_continuous and movements_match and balance_match:
+                                    persisted_rf_ok = True
+                                    rf_verified = True
+                                    rf_persisted_movements = db_movements
+                                    if bool(rollforward_result.get("is_continuous")) != all_continuous:
+                                        rf_verified = False
+        except Exception:
             rf_verified = False
+            persisted_rf_ok = False
 
     if not val_detail_consistent or not pkg_consistent:
         governance_status = "REJECTED_NON_APPROVED"
@@ -2093,19 +2316,14 @@ def execute_reporting_manifest(
         else valuation_result.get("valuation_date")
     )
 
-    rf_primary = rf_rows[0] if rf_rows else None
-    rf_persisted_movements = {
-        r.component_name: float(r.movement_amount)
-        for r in rf_rows if r.is_movement
-    }
-
+    rf_primary_item = rf_primary
     summary_package = {
         "valuation_run_id": valuation_run_id,
         "upstream_projection_run_id": val_run.source_projection_run_id if val_run else valuation_result.get("upstream_run_id"),
         "project_id": project_id,
         "basis": val_run.basis if val_run and val_run.basis else valuation_result.get("basis"),
         "methodology": val_run.methodology if val_run and val_run.methodology else valuation_result.get("methodology"),
-        "cohort_id": (rf_primary.cohort_id if rf_primary else val_run.projection_key if val_run else valuation_result.get("cohort_id")),
+        "cohort_id": (rf_primary_item.cohort_id if rf_primary_item else val_run.projection_key if val_run else valuation_result.get("cohort_id")),
         "valuation_date": val_date_str,
         "run_package_id": val_pkg.id if val_pkg else None,
         "run_package_fingerprint": val_pkg.fingerprint if val_pkg else None,
@@ -2114,17 +2332,18 @@ def execute_reporting_manifest(
         "is_approved_for_release": is_approved_for_release,
         "regulatory_compliance_claimed": False,
         "rollforward": {
-            "summary_id": rf_primary.id if rf_primary else None,
+            "summary_id": rf_primary_item.id if rf_primary_item else None,
+            "artifact_id": selected_rf_art.id if selected_rf_art else None,
             "is_continuous": persisted_rf_ok,
             "attribution_mode": (
                 "MULTI_PERIOD_PERSISTED_VALUATION_COMPARISON"
                 if val_run and getattr(val_run, "prior_valuation_run_id", None)
                 else "ILLUSTRATIVE_GENERIC_PV_NON_REGULATORY"
             ),
-            "opening": float(rf_primary.opening_balance) if rf_primary else None,
+            "opening": float(rf_primary_item.opening_balance) if rf_primary_item else None,
             "movements": rf_persisted_movements if rf_persisted_movements else rollforward_result.get("movements", {}),
-            "ending": float(rf_primary.closing_balance) if rf_primary else None,
-            "difference": float(rf_primary.continuity_difference) if rf_primary else 0.0,
+            "ending": float(rf_primary_item.closing_balance) if rf_primary_item else None,
+            "difference": float(rf_primary_item.continuity_difference) if rf_primary_item else 0.0,
         },
         "reconciliation": {
             "report_id": rec_row.id if rec_row else None,

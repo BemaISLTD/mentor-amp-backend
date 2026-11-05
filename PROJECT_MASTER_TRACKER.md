@@ -5,11 +5,11 @@
 > This document is a **Living Requirements Traceability and Execution Ledger** derived from the project's authoritative source documents. It does **NOT** replace, supersede, or alter them.  
 > **If this ledger conflicts with an authoritative source document, the authoritative source wins until the conflict is deliberately resolved, approved, and formally documented.**
 
-**Document Version:** 2.9 (M5 Senior Review V7 Findings Resolved — Bundle v8 Ready)  
+**Document Version:** 3.2 (M5 Senior Review V8 Findings Resolved — Bundle v9 Ready)  
 **Date:** November 4, 2026  
 **Status:** Working Execution Ledger — Independent Senior Review Ready (M5A–M5D Foundation & Dagster Orchestration Verified Locally; M5E Reference Verticals Gated)  
 **Current Git Branch:** `feat/m5-valuation-frameworks-dagster`  
-**Prior Reviewed Baseline SHA:** `5324123e5ec06af01826f08e9c6ec566c4001218` (`5324123`) — V7 HEAD SHA recorded in `00_REVIEW_OVERVIEW_AND_MANIFEST.md` and `patches/git_log_graph.txt`  
+**Prior Reviewed Baseline SHA:** `513eeb20b5a55fc53af16610c99f365b858c1913` (`513eeb2`) — V8 HEAD SHA recorded in `00_REVIEW_OVERVIEW_AND_MANIFEST.md` and `patches/git_log_graph.txt`  
 **Alembic Head Revision:** `c9f4e2d8a615` (Single canonical head)  
 **Engine Build Identity:** `m3-cpu-dsl-1`  
 

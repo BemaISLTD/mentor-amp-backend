@@ -1102,7 +1102,51 @@ def test_p0_06_and_v5_p0_f_governed_benchmark_reconciliation_and_v5_p1_i_reporti
             continuity_difference=0.0,
             trace_identifier="VERIFIED:tol-policy-m5-standard:trace-01",
         )
-        db.add_all([r, detail, val_pkg, rf_summary])
+        import json
+        import hashlib
+        from app.core.artifacts import get_artifact_store
+        rf_doc = {
+            "summary_id": rf_summary.id,
+            "valuation_run_id": val_run_id,
+            "project_id": proj_id,
+            "cohort_id": "COHORT_MYGA_2026",
+            "is_continuous": True,
+            "has_unverified_movement_source": False,
+            "tolerance_policy_id": "tol-policy-m5-standard",
+            "trace_identifier": "VERIFIED:tol-policy-m5-standard:trace-01",
+            "opening_balance": 100000.0,
+            "ending_balance": actual_reserve,
+            "movements": {},
+            "difference": 0.0,
+            "tolerance": 0.05,
+        }
+        rf_bytes = json.dumps(rf_doc, sort_keys=True).encode("utf-8")
+        store = get_artifact_store()
+        stored_rf = store.write_bytes(
+            namespace=val_run_id,
+            artifact_type="rollforward_summary",
+            filename="rollforward_summary.json",
+            content=rf_bytes,
+        )
+        rf_art = RunArtifact(
+            id=f"art-rf-{uuid.uuid4().hex[:8]}",
+            run_id=val_run_id,
+            attempt_number=1,
+            artifact_type="rollforward_summary",
+            storage_uri=stored_rf.uri,
+            storage_backend="local",
+            file_format="json",
+            schema_version="m2-v1",
+            row_count=1,
+            checksum_sha256=hashlib.sha256(rf_bytes).hexdigest(),
+            partition={
+                "summary_id": rf_summary.id,
+                "has_unverified_movement_source": False,
+                "tolerance_policy_id": "tol-policy-m5-standard",
+                "trace_identifier": "VERIFIED:tol-policy-m5-standard:trace-01",
+            },
+        )
+        db.add_all([r, detail, val_pkg, rf_summary, rf_art])
 
         # 1. Seed four-eyes approved multi-row scoped ExpectedResultSet (matching row + other cohort row)
         ers_scoped_rows = [
