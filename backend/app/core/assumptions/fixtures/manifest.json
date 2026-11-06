@@ -1,0 +1,36 @@
+{
+  "classification": "SYNTHETIC_NON_PRODUCTION",
+  "unresolved_dependency": "ACT-DEP-TABLE-01",
+  "fixtures": [
+    {
+      "filename": "illustrative_us_treasury_spot_curve.json",
+      "sha256": "378e2a16ed255e660fce9cbd503d2b7ffd462405b3e854643df7d429a354bcf4",
+      "source": "MentorAmp illustrative development fixture",
+      "license_status": "Internal synthetic data; not published US Treasury data"
+    },
+    {
+      "filename": "standard_surrender_tiers.csv",
+      "sha256": "e158d000329fa23b50f7c4600ea5f11f61afead2e5e6873898da286c53b64fb2",
+      "source": "MentorAmp illustrative development fixture",
+      "license_status": "Internal synthetic data"
+    },
+    {
+      "filename": "synthetic_mortality_sample.csv",
+      "sha256": "ee4ae9925c0a6ced5cc040044f544b7ad81572a1976db2b9f45f2fbedc636ca6",
+      "source": "MentorAmp synthetic mortality equation sample",
+      "license_status": "Internal synthetic data; not SOA or NAIC data"
+    },
+    {
+      "filename": "synthetic_mp_sample_matrix.csv",
+      "sha256": "6831c4e3262a9a135643873f18ef43f03b9dd6faed06eec36af87c0cd2561684",
+      "source": "MentorAmp synthetic MP-structure sample",
+      "license_status": "Internal synthetic data; not RPEC MP-series published values"
+    },
+    {
+      "filename": "synthetic_scale_g2_sample.csv",
+      "sha256": "a7b83f34640842e4a67e0ca59db54b642ac849c9dd08b65795e8f6f5eddc73f8",
+      "source": "MentorAmp synthetic G2-structure sample",
+      "license_status": "Internal synthetic data; not published Scale G2 values"
+    }
+  ]
+}

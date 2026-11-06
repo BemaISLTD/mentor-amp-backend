@@ -10,6 +10,7 @@ psycopg2-binary>=2.9,<3.0
 alembic>=1.13,<2.0
 
 # Data processing
+numpy>=1.26,<3.0
 polars>=1.8,<2.0
 openpyxl>=3.1,<4.0
 
