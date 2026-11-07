@@ -356,17 +356,7 @@ def _period(value: Any) -> int | None | bool:
 
 
 def override_problems(label: str, overrides: list, variables: dict[str, VariableSpec]) -> list[Problem]:
-    """Deterministic override contract (the engine applies an override for months
-    ``applies_from_period <= month <= applies_to_period``, both inclusive, either open):
-
-    - the target is a variable of this model version, numeric, not calculated (formula /
-      valuation), and its definition explicitly allows scenario overrides;
-    - the operation is one of set / add / subtract / multiply / percent_change, with a numeric
-      (non-boolean) value;
-    - periods are whole months in 0..1200 and ``from <= to``;
-    - two overrides of the same variable may not overlap in time (stacking is not defined, so
-      ambiguity is rejected rather than resolved by list order).
-    """
+    """Deterministic override contract."""
     problems: list[Problem] = []
     ranges: dict[str, list[tuple[int, float, int]]] = {}
     for index, override in enumerate(overrides):
@@ -534,7 +524,6 @@ def collect(
     all_formulas_approved = all(row.status in (lifecycle.VALIDATED, lifecycle.APPROVED) for row in model.formulas)
 
     requested_mode = (projection_set.parameters or {}).get("governance_mode")
-    # Governed execution is required if explicitly requested, or if model version is approved/published and sandbox is not intentionally requested
     is_governed_candidate = bool(
         requested_mode == "governed" or (
             version.status in (lifecycle.APPROVED, lifecycle.PUBLISHED)
@@ -549,7 +538,6 @@ def collect(
                 f"Governed run requires an approved or published model version, but '{version.version_label}' is '{version.status}'.",
             ))
 
-        # Tightened fingerprint requirements: non-null matching approved_fingerprint and validation_fingerprint
         if not version.approved_fingerprint:
             problems.append(Problem(
                 "GOVERNED_RUN_APPROVED_FINGERPRINT_MISSING",
@@ -616,12 +604,10 @@ def collect(
             "version_label": version.version_label,
             "basis": version.basis,
             "methodology": version.methodology,
-            "methodology_version": None,  # not modelled yet (recorded explicitly as unknown)
+            "methodology_version": None,
             "block_name": version.block_name,
             "profile_name": version.profile_name,
             "illustrative": bool(version.illustrative),
-            # Immutable model-specific provenance and calculation settings. This is part
-            # of the executable configuration fingerprint, not mutable governance state.
             "configuration": dict(version.configuration or {}),
             "model_definition_fingerprint": model_def_fp,
             "validation_fingerprint": version.validation_fingerprint,
@@ -674,7 +660,6 @@ def collect(
             "output_variables": list(projection_set.output_variables or []),
             "trace_scope": normalise_trace_scope(projection_set.trace_scope),
             "max_traced_policies": settings.max_traced_policies,
-            # How each output is labelled and aggregated (sum of flows vs end-of-period balance).
             "published": {
                 name: {
                     "display_name": model.published[name].display_name,
@@ -745,5 +730,628 @@ def freeze(
         "created_by": {"id": user.id, "full_name": getattr(user, "full_name", None)},
     }
     governance = {**governance, "frozen_at": iso(now)}
+    document = run_package.seal(identity, governance, configuration)
+    return FrozenPackage(document=document, fingerprint=document["fingerprint"], configuration=configuration)
+
+
+def freeze_valuation_run_package(
+    db: Session | None = None,
+    project: Any = None,
+    run: Any = None,
+    user: Any = None,
+    *,
+    basis: str,
+    methodology: str,
+    methodology_version: str,
+    source_projection_run_id: str | None = None,
+    source_artifact_id: str | None = None,
+    derived_dataset_id: str | None = None,
+    derived_dataset_fingerprint: str | None = None,
+    source_artifact_fingerprint: str | None = None,
+    discount_curve_fingerprint: str | None = None,
+    valuation_date: str | Any = None,
+    valuation_parameters: dict | None = None,
+    model_id: str | None = None,
+    model_version_id: str | None = None,
+) -> FrozenPackage:
+    """Freeze a canonical RunPackage for an M5 valuation run (Directives 2, 3 and 16, V5-P0-C, V5-P0-D)."""
+    import copy
+    import hashlib
+    import polars as pl
+    from app.core.execution.fingerprints import fingerprint as compute_fp
+    from app.db.models.run import Run
+    from app.db.models.run_package import RunPackage
+    from app.db.models.run_artifact import RunArtifact
+    from app.core.valuation.taxonomy import (
+        ValuationTaxonomyError,
+        validate_basis,
+        validate_methodology,
+        validate_basis_methodology_pair,
+    )
+
+    try:
+        validate_basis(basis)
+        validate_methodology(methodology)
+        validate_basis_methodology_pair(basis, methodology)
+    except ValuationTaxonomyError as exc:
+        raise ServiceError(400, "INVALID_VALUATION_TAXONOMY", str(exc)) from exc
+
+    if basis == "TAX":
+        raise ServiceError(400, "UNSUPPORTED_VALUATION_BASIS", "TAX basis is explicitly not supported at launch.")
+
+    if db is None:
+        raise ServiceError(
+            500, "DATABASE_REQUIRED",
+            "Governed valuation RunPackage freezing requires an active database session.",
+        )
+
+    if not source_projection_run_id and not derived_dataset_id:
+        raise ServiceError(
+            400, "VALUATION_SOURCE_REQUIRED",
+            "Valuation runs require an authoritative upstream source (source_projection_run_id or derived_dataset_id).",
+        )
+
+    proj_id = getattr(project, "id", str(project)) if project else None
+    run_proj_id = getattr(run, "project_id", None)
+    if proj_id and run_proj_id and run_proj_id != proj_id:
+        raise ServiceError(404, "RUN_NOT_FOUND", f"Run not found in project '{proj_id}'.")
+
+    if model_id == "model-default" or model_version_id == "mv-default":
+        raise ServiceError(
+            400, "MODEL_IDENTITY_REQUIRED",
+            "Fake default model identities ('model-default' / 'mv-default') are forbidden.",
+        )
+
+    model_dict: dict[str, Any] | None = None
+    model_version_dict: dict[str, Any] | None = None
+    formulas: list[dict[str, Any]] = []
+    variables: list[dict[str, Any]] = []
+    datasets: dict[str, Any] = {"inforce": [], "assumption_tables": [], "factor_tables": []}
+    parameters: dict[str, Any] = {}
+    scenario: dict[str, Any] = {}
+    source_run_package_fingerprint: str | None = None
+    inherited_val_date: str | None = None
+
+    canonical_art_types = ("cash_flows", "outputs", "valuation_results", "projection_outputs")
+
+    # 1. Provenance from source projection run
+    if source_projection_run_id:
+        source_run = db.get(Run, source_projection_run_id)
+        if source_run is None or (proj_id and source_run.project_id != proj_id):
+            raise ServiceError(404, "RUN_NOT_FOUND", f"Source projection run '{source_projection_run_id}' not found in project '{proj_id}'.")
+
+        if source_run.status not in ("completed", "success"):
+            raise ServiceError(
+                400, "INVALID_SOURCE_RUN_STATUS",
+                f"Source projection run '{source_projection_run_id}' must be in 'completed' or 'success' status (current status: {source_run.status}).",
+            )
+
+        if source_run.accepted_attempt_number is None or source_run.accepted_attempt_number < 1:
+            raise ServiceError(
+                400, "ACCEPTED_ATTEMPT_MISSING",
+                f"Source projection run '{source_projection_run_id}' does not have a verified accepted_attempt_number.",
+            )
+        expected_attempt = source_run.accepted_attempt_number
+
+        source_pkg_record = db.query(RunPackage).filter(RunPackage.run_id == source_run.id).first()
+        if source_pkg_record is None:
+            raise ServiceError(
+                400, "SOURCE_RUN_PACKAGE_NOT_FOUND",
+                f"Source projection run '{source_projection_run_id}' does not have an immutable persisted RunPackage.",
+            )
+
+        pkg_row_dict = {
+            "id": source_pkg_record.id,
+            "run_id": source_pkg_record.run_id,
+            "project_id": source_pkg_record.project_id,
+            "fingerprint": source_pkg_record.fingerprint,
+            "schema_version": source_pkg_record.schema_version,
+            "fingerprint_algorithm": source_pkg_record.fingerprint_algorithm,
+        }
+        run_row_dict = {
+            "id": source_run.id,
+            "project_id": source_run.project_id,
+            "run_set_id": source_run.run_set_id,
+            "run_package_fingerprint": source_run.run_package_fingerprint,
+            "scenario_id": source_run.scenario_id,
+            "model_version_id": source_run.model_version_id,
+            "projection_set_id": source_run.projection_set_id,
+            "horizon_months": source_run.horizon_months,
+            "valuation_date": str(source_run.valuation_date) if source_run.valuation_date else None,
+        }
+        try:
+            run_package.verify_envelope(source_pkg_record.package, pkg_row_dict, run_row_dict)
+        except Exception as env_err:
+            raise ServiceError(
+                400, "SOURCE_PACKAGE_ENVELOPE_INVALID",
+                f"Source RunPackage envelope check failed: {env_err}",
+            )
+        try:
+            src_conf = run_package.verify(source_pkg_record.package, source_pkg_record.fingerprint)
+        except Exception as tamper_err:
+            raise ServiceError(
+                400, "SOURCE_PACKAGE_TAMPERED",
+                f"Source RunPackage integrity verification failed: {tamper_err}",
+            )
+        source_run_package_fingerprint = source_pkg_record.fingerprint
+        if "model" in src_conf:
+            model_dict = copy.deepcopy(src_conf["model"])
+        if "model_version" in src_conf:
+            model_version_dict = copy.deepcopy(src_conf["model_version"])
+        formulas = copy.deepcopy(src_conf.get("formulas", []))
+        variables = copy.deepcopy(src_conf.get("variables", []))
+        datasets = copy.deepcopy(src_conf.get("datasets", {"inforce": [], "assumption_tables": [], "factor_tables": []}))
+        parameters = copy.deepcopy(src_conf.get("parameters", {}))
+        scenario = copy.deepcopy(src_conf.get("scenario", {}))
+        if src_conf.get("valuation_date"):
+            inherited_val_date = str(src_conf["valuation_date"])
+        elif source_run.valuation_date:
+            inherited_val_date = str(source_run.valuation_date)
+
+        # Explicit source artifact resolution, accepted-attempt check, and physical file verification
+        art_query = db.query(RunArtifact).filter(RunArtifact.run_id == source_run.id)
+        if source_artifact_id:
+            art = art_query.filter(RunArtifact.id == source_artifact_id).first()
+            if art is None:
+                raise ServiceError(
+                    404, "ARTIFACT_NOT_FOUND",
+                    f"Source artifact '{source_artifact_id}' does not belong to source run '{source_projection_run_id}'.",
+                )
+            if art.attempt_number != expected_attempt:
+                raise ServiceError(
+                    400, "ARTIFACT_ATTEMPT_MISMATCH",
+                    f"Source artifact '{source_artifact_id}' belongs to attempt {art.attempt_number}, not accepted attempt {expected_attempt}.",
+                )
+            if art.artifact_type not in canonical_art_types:
+                raise ServiceError(
+                    400, "INVALID_ARTIFACT_TYPE",
+                    f"Source artifact '{source_artifact_id}' has non-canonical type '{art.artifact_type}'.",
+                )
+        else:
+            art = (
+                art_query.filter(
+                    RunArtifact.attempt_number == expected_attempt,
+                    RunArtifact.artifact_type.in_(canonical_art_types),
+                )
+                .first()
+            )
+
+        if art is None:
+            raise ServiceError(
+                400, "SOURCE_ARTIFACT_NOT_FOUND",
+                f"No canonical RunArtifact found for source run '{source_projection_run_id}' accepted attempt {expected_attempt}.",
+            )
+
+        source_artifact_id = art.id
+        if source_artifact_fingerprint and source_artifact_fingerprint != art.checksum_sha256:
+            raise ServiceError(
+                400, "FINGERPRINT_MISMATCH",
+                f"Source artifact fingerprint mismatch: expected '{art.checksum_sha256}', got '{source_artifact_fingerprint}'.",
+            )
+        source_artifact_fingerprint = art.checksum_sha256
+
+        from app.core.artifacts import get_artifact_store
+        store = get_artifact_store()
+        try:
+            path = store.path_for_uri(art.storage_uri)
+        except Exception as exc:
+            raise ServiceError(400, "PHYSICAL_ARTIFACT_MISSING", f"Failed to resolve artifact path: {exc}") from exc
+
+        if not path.exists():
+            raise ServiceError(
+                400, "PHYSICAL_ARTIFACT_MISSING",
+                f"Physical artifact file does not exist at storage URI: {art.storage_uri}",
+            )
+
+        actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual_sha != art.checksum_sha256:
+            raise ServiceError(
+                400, "FINGERPRINT_MISMATCH",
+                f"Physical artifact content SHA-256 ({actual_sha}) does not match recorded checksum ({art.checksum_sha256}).",
+            )
+
+    # 2. Provenance from derived dataset (V5-P0-C: strict source run, physical artifact, and DB model identity)
+    if derived_dataset_id:
+        from app.db.models.governance import DerivedDataset
+        dataset = db.get(DerivedDataset, derived_dataset_id)
+        if dataset is None or (proj_id and dataset.project_id != proj_id):
+            raise ServiceError(404, "DATASET_NOT_FOUND", f"Derived dataset '{derived_dataset_id}' not found in project '{proj_id}'.")
+
+        if dataset.status != "approved" or not getattr(dataset, "approved_by", None) or not getattr(dataset, "approved_at", None):
+            raise ServiceError(
+                400, "DATASET_NOT_APPROVED",
+                f"Derived dataset '{derived_dataset_id}' must be approved with recorded approval metadata (current status: {dataset.status}).",
+            )
+        if getattr(dataset, "created_by", None) and dataset.approved_by == dataset.created_by:
+            raise ServiceError(
+                400, "SELF_APPROVED_DATASET_FORBIDDEN",
+                f"Derived dataset '{derived_dataset_id}' violates four-eyes governance (created_by == approved_by).",
+            )
+        if getattr(dataset, "is_superseded", False) or getattr(dataset, "is_deleted", False):
+            raise ServiceError(
+                400, "DATASET_INACTIVE",
+                f"Derived dataset '{derived_dataset_id}' is inactive or deleted.",
+            )
+
+        if not dataset.fingerprint:
+            raise ServiceError(400, "FINGERPRINT_MISMATCH", f"Derived dataset '{derived_dataset_id}' has no fingerprint.")
+        if derived_dataset_fingerprint and derived_dataset_fingerprint != dataset.fingerprint:
+            raise ServiceError(
+                400, "FINGERPRINT_MISMATCH",
+                f"Derived dataset fingerprint mismatch: expected '{dataset.fingerprint}', got '{derived_dataset_fingerprint}'.",
+            )
+        derived_dataset_fingerprint = dataset.fingerprint
+
+        # Verify authoritative completed source Run in the same project
+        if not getattr(dataset, "source_run_id", None):
+            raise ServiceError(
+                400, "DATASET_SOURCE_RUN_REQUIRED",
+                f"Derived dataset '{derived_dataset_id}' has no source_run_id.",
+            )
+        ds_src_run = db.get(Run, dataset.source_run_id)
+        if ds_src_run is None or (proj_id and ds_src_run.project_id != proj_id):
+            raise ServiceError(
+                404, "SOURCE_RUN_NOT_FOUND",
+                f"Derived dataset source run '{dataset.source_run_id}' not found in project '{proj_id}'.",
+            )
+        if ds_src_run.status not in ("completed", "success"):
+            raise ServiceError(
+                400, "INVALID_SOURCE_RUN_STATUS",
+                f"Derived dataset source run '{ds_src_run.id}' must be in completed/success status (got '{ds_src_run.status}').",
+            )
+        if not inherited_val_date and ds_src_run.valuation_date:
+            inherited_val_date = str(ds_src_run.valuation_date)
+
+        # Require authoritative Model and ModelVersion rows in database (no synthetic 'M5' or 'v1.0' fallbacks)
+        if not model_dict:
+            if not getattr(dataset, "source_model_id", None):
+                raise ServiceError(
+                    400, "MODEL_IDENTITY_REQUIRED",
+                    f"Derived dataset '{derived_dataset_id}' is missing authoritative source_model_id.",
+                )
+            db_src_model = db.get(Model, dataset.source_model_id)
+            if db_src_model is None:
+                raise ServiceError(
+                    400, "MODEL_NOT_FOUND",
+                    f"Derived dataset source_model_id '{dataset.source_model_id}' does not exist in database.",
+                )
+            if proj_id and db_src_model.project_id != proj_id:
+                raise ServiceError(
+                    404, "MODEL_NOT_FOUND",
+                    f"Derived dataset model '{db_src_model.id}' does not belong to project '{proj_id}'.",
+                )
+            if db_src_model.deleted_at is not None or db_src_model.status not in ("active", "validated", "approved", "published"):
+                raise ServiceError(
+                    400, "MODEL_NOT_APPROVED",
+                    f"Derived dataset model '{db_src_model.id}' is not in an approved/runnable state (status: {db_src_model.status}).",
+                )
+            if getattr(dataset, "product_code", None):
+                ds_prod = str(dataset.product_code).strip().upper()
+                mod_prod = str(db_src_model.product_code or "").strip().upper()
+                if ds_prod and mod_prod and ds_prod != mod_prod and ds_prod not in mod_prod and mod_prod not in ds_prod:
+                    raise ServiceError(
+                        400, "PRODUCT_MODEL_MISMATCH",
+                        f"Derived dataset product_code '{dataset.product_code}' mismatches Model product_code '{db_src_model.product_code}'.",
+                    )
+            model_dict = {
+                "id": db_src_model.id,
+                "name": db_src_model.name,
+                "product_code": db_src_model.product_code,
+            }
+
+        if not model_version_dict:
+            if not getattr(dataset, "source_model_version_id", None):
+                raise ServiceError(
+                    400, "MODEL_IDENTITY_REQUIRED",
+                    f"Derived dataset '{derived_dataset_id}' is missing authoritative source_model_version_id.",
+                )
+            db_src_mv = db.get(ModelVersion, dataset.source_model_version_id)
+            if db_src_mv is None:
+                raise ServiceError(
+                    400, "MODEL_VERSION_NOT_FOUND",
+                    f"Derived dataset source_model_version_id '{dataset.source_model_version_id}' does not exist in database.",
+                )
+            if model_dict and db_src_mv.model_id != model_dict["id"]:
+                raise ServiceError(
+                    400, "MODEL_LINEAGE_MISMATCH",
+                    f"Derived dataset ModelVersion '{db_src_mv.id}' does not belong to Model '{model_dict['id']}'.",
+                )
+            if db_src_mv.deleted_at is not None or db_src_mv.status not in ("validated", "approved", "published"):
+                raise ServiceError(
+                    400, "MODEL_VERSION_NOT_APPROVED",
+                    f"Derived dataset ModelVersion '{db_src_mv.id}' is not in an approved/runnable state (status: {db_src_mv.status}).",
+                )
+            model_version_dict = {
+                "id": db_src_mv.id,
+                "version_label": db_src_mv.version_label,
+                "basis": basis,
+                "methodology": methodology,
+                "methodology_version": methodology_version,
+            }
+
+        # Require verified physical materialization (RunArtifact and/or immutable storage_uri Parquet file)
+        ds_art: RunArtifact | None = None
+        if getattr(dataset, "source_artifact_id", None):
+            ds_art = db.get(RunArtifact, dataset.source_artifact_id)
+            if ds_art is None:
+                raise ServiceError(
+                    404, "ARTIFACT_NOT_FOUND",
+                    f"Derived dataset source artifact '{dataset.source_artifact_id}' not found.",
+                )
+            if ds_art.run_id != ds_src_run.id:
+                raise ServiceError(
+                    400, "ARTIFACT_RUN_MISMATCH",
+                    f"Derived dataset artifact '{ds_art.id}' belongs to run '{ds_art.run_id}', not source run '{ds_src_run.id}'.",
+                )
+            if ds_src_run.accepted_attempt_number is None or ds_src_run.accepted_attempt_number < 1:
+                raise ServiceError(
+                    400, "ACCEPTED_ATTEMPT_MISSING",
+                    f"Derived dataset source run '{ds_src_run.id}' has no accepted_attempt_number.",
+                )
+            if ds_art.attempt_number != ds_src_run.accepted_attempt_number:
+                raise ServiceError(
+                    400, "ARTIFACT_ATTEMPT_MISMATCH",
+                    f"Derived dataset artifact '{ds_art.id}' belongs to attempt {ds_art.attempt_number}, not accepted attempt {ds_src_run.accepted_attempt_number}.",
+                )
+            if ds_art.artifact_type not in canonical_art_types:
+                raise ServiceError(
+                    400, "INVALID_ARTIFACT_TYPE",
+                    f"Derived dataset artifact '{ds_art.id}' has non-canonical type '{ds_art.artifact_type}'.",
+                )
+            if ds_art.checksum_sha256 != dataset.fingerprint:
+                raise ServiceError(
+                    400, "FINGERPRINT_MISMATCH",
+                    f"Derived dataset fingerprint ({dataset.fingerprint}) disagrees with source RunArtifact checksum ({ds_art.checksum_sha256}).",
+                )
+            source_artifact_id = ds_art.id
+            if source_artifact_fingerprint and source_artifact_fingerprint != ds_art.checksum_sha256:
+                raise ServiceError(
+                    400, "FINGERPRINT_MISMATCH",
+                    f"Source artifact fingerprint mismatch: expected '{ds_art.checksum_sha256}', got '{source_artifact_fingerprint}'.",
+                )
+            source_artifact_fingerprint = ds_art.checksum_sha256
+
+        target_uri = (ds_art.storage_uri if ds_art is not None else None) or getattr(dataset, "storage_uri", None)
+        if not target_uri:
+            raise ServiceError(
+                400, "PHYSICAL_ARTIFACT_MISSING",
+                f"Derived dataset '{derived_dataset_id}' has no physical source_artifact_id or storage_uri.",
+            )
+        if ds_art is not None and getattr(dataset, "storage_uri", None) and dataset.storage_uri != ds_art.storage_uri:
+            raise ServiceError(
+                400, "ARTIFACT_URI_MISMATCH",
+                f"Derived dataset storage_uri '{dataset.storage_uri}' disagrees with source artifact URI '{ds_art.storage_uri}'.",
+            )
+
+        from app.core.artifacts import get_artifact_store
+        store = get_artifact_store()
+        try:
+            ds_path = store.path_for_uri(target_uri)
+        except Exception as exc:
+            raise ServiceError(400, "PHYSICAL_ARTIFACT_MISSING", f"Failed to resolve derived dataset path: {exc}") from exc
+
+        if not ds_path.exists():
+            raise ServiceError(
+                400, "PHYSICAL_ARTIFACT_MISSING",
+                f"Physical derived dataset file does not exist at storage URI: {target_uri}",
+            )
+        actual_ds_sha = hashlib.sha256(ds_path.read_bytes()).hexdigest()
+        if actual_ds_sha != dataset.fingerprint:
+            raise ServiceError(
+                400, "FINGERPRINT_MISMATCH",
+                f"Physical derived dataset SHA-256 ({actual_ds_sha}) does not match recorded fingerprint ({dataset.fingerprint}).",
+            )
+        if not source_artifact_fingerprint:
+            source_artifact_fingerprint = actual_ds_sha
+
+        try:
+            ds_df = pl.read_parquet(ds_path)
+        except Exception as exc:
+            raise ServiceError(422, "INVALID_ARTIFACT_SCHEMA", f"Corrupt derived dataset Parquet at '{target_uri}': {exc}") from exc
+
+        if ds_df.height == 0 or (getattr(dataset, "row_count", None) and ds_df.height != dataset.row_count):
+            raise ServiceError(
+                422, "ARTIFACT_ROW_COUNT_MISMATCH",
+                f"Derived dataset Parquet row count ({ds_df.height}) disagrees with metadata ({dataset.row_count}).",
+            )
+        if isinstance(getattr(dataset, "schema", None), dict) and dataset.schema:
+            missing_cols = set(dataset.schema.keys()) - set(ds_df.columns)
+            if missing_cols:
+                raise ServiceError(
+                    422, "INVALID_ARTIFACT_SCHEMA",
+                    f"Derived dataset Parquet is missing schema columns: {sorted(missing_cols)}.",
+                )
+
+    # 3. Validate any caller-supplied model_id / model_version_id selectors against DB and authoritative lineage
+    if model_id:
+        db_model = db.get(Model, model_id)
+        if db_model is None:
+            raise ServiceError(
+                400, "MODEL_NOT_FOUND",
+                f"Caller-supplied model_id '{model_id}' does not exist in database.",
+            )
+        if proj_id and db_model.project_id != proj_id:
+            raise ServiceError(
+                404, "MODEL_NOT_FOUND",
+                f"Model '{model_id}' not found in project '{proj_id}'.",
+            )
+        if db_model.deleted_at is not None or db_model.status not in ("active", "validated", "approved", "published"):
+            raise ServiceError(
+                400, "MODEL_NOT_APPROVED",
+                f"Model '{model_id}' is not in a runnable/approved governance state (status: {db_model.status}).",
+            )
+        if model_dict and model_dict.get("id") and model_dict["id"] != model_id:
+            raise ServiceError(
+                400, "MODEL_LINEAGE_MISMATCH",
+                f"Caller-supplied model_id '{model_id}' conflicts with authoritative source model '{model_dict['id']}'.",
+            )
+
+    if model_version_id:
+        db_mv = db.get(ModelVersion, model_version_id)
+        if db_mv is None:
+            raise ServiceError(
+                400, "MODEL_VERSION_NOT_FOUND",
+                f"Caller-supplied model_version_id '{model_version_id}' does not exist in database.",
+            )
+        parent_model = db.get(Model, db_mv.model_id)
+        if parent_model is None or (proj_id and parent_model.project_id != proj_id):
+            raise ServiceError(
+                404, "MODEL_VERSION_NOT_FOUND",
+                f"Model version '{model_version_id}' not found in project '{proj_id}'.",
+            )
+        if db_mv.deleted_at is not None or db_mv.status not in ("validated", "approved", "published"):
+            raise ServiceError(
+                400, "MODEL_VERSION_NOT_APPROVED",
+                f"Model version '{model_version_id}' is not in a runnable/approved governance state (status: {db_mv.status}).",
+            )
+        if model_version_dict and model_version_dict.get("id") and model_version_dict["id"] != model_version_id:
+            raise ServiceError(
+                400, "MODEL_VERSION_LINEAGE_MISMATCH",
+                f"Caller-supplied model_version_id '{model_version_id}' conflicts with authoritative source model version '{model_version_dict['id']}'.",
+            )
+
+    # 4. Zero fake identity defaults: fail if model identity cannot be established from authoritative source
+    if not model_dict or not model_dict.get("id") or model_dict["id"] == "model-default":
+        raise ServiceError(
+            400, "MODEL_IDENTITY_REQUIRED",
+            "Valuation runs require verified model identity derived from trusted source run or approved dataset.",
+        )
+    if not model_version_dict or not model_version_dict.get("id") or model_version_dict["id"] == "mv-default":
+        raise ServiceError(
+            400, "MODEL_IDENTITY_REQUIRED",
+            "Valuation runs require verified model version identity derived from trusted source run or approved dataset.",
+        )
+
+    # Mandatory verification of authoritative model & model_version rows in database (V5-P0-C: refuse absent records)
+    auth_model = db.get(Model, model_dict["id"])
+    if auth_model is None:
+        raise ServiceError(
+            400, "MODEL_NOT_FOUND",
+            f"Authoritative model '{model_dict['id']}' does not exist in database.",
+        )
+    if proj_id and auth_model.project_id != proj_id:
+        raise ServiceError(404, "MODEL_NOT_FOUND", f"Model '{auth_model.id}' not found in project '{proj_id}'.")
+    if auth_model.deleted_at is not None or auth_model.status not in ("active", "validated", "approved", "published"):
+        raise ServiceError(
+            400, "MODEL_NOT_APPROVED",
+            f"Authoritative model '{auth_model.id}' is not in an approved/validated state (status: {auth_model.status}).",
+        )
+
+    auth_mv = db.get(ModelVersion, model_version_dict["id"])
+    if auth_mv is None:
+        raise ServiceError(
+            400, "MODEL_VERSION_NOT_FOUND",
+            f"Authoritative model version '{model_version_dict['id']}' does not exist in database.",
+        )
+    if auth_mv.model_id != auth_model.id:
+        raise ServiceError(400, "MODEL_LINEAGE_MISMATCH", "ModelVersion does not belong to Model.")
+    if (
+        auth_mv.deleted_at is not None
+        or auth_mv.status not in ("approved", "published")
+        or auth_mv.approved_at is None
+        or not auth_mv.approved_by
+        or not auth_mv.created_by
+    ):
+        raise ServiceError(
+            400, "MODEL_VERSION_NOT_APPROVED",
+            f"Authoritative model version '{auth_mv.id}' must be in an approved or published state with recorded approver and creator (status: {auth_mv.status}).",
+        )
+    if auth_mv.approved_by == auth_mv.created_by:
+        raise ServiceError(
+            400, "SELF_APPROVED_MODEL_FORBIDDEN",
+            f"Authoritative model version '{auth_mv.id}' violates four-eyes governance: created_by ('{auth_mv.created_by}') cannot match approved_by ('{auth_mv.approved_by}').",
+        )
+
+    model_version_dict["basis"] = basis
+    model_version_dict["methodology"] = methodology
+    model_version_dict["methodology_version"] = methodology_version
+
+    # 5. Immutable build identity obtained strictly from build_identity() for this run
+    try:
+        build = build_identity()
+    except BuildIdentityUnavailable as exc:
+        raise ServiceError(
+            503, "BUILD_IDENTITY_UNAVAILABLE",
+            "Governed valuation runs require verified immutable build identity.",
+        ) from exc
+
+    exec_fp = build.get("build_fingerprint") or ""
+    src_commit = build.get("source_commit") or ""
+    id_source = build.get("identity_source") or ""
+
+    if id_source == "fallback" or exec_fp == "0" * 64 or not re.fullmatch(r"[0-9a-fA-F]{64}", exec_fp):
+        raise ServiceError(
+            503, "BUILD_IDENTITY_UNAVAILABLE",
+            "Governed valuation runs require verified immutable build identity.",
+        )
+    if src_commit and not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", src_commit):
+        raise ServiceError(503, "BUILD_IDENTITY_INVALID", "SOURCE_COMMIT must be a Git commit SHA.")
+
+    raw_val_date = valuation_date or getattr(run, "valuation_date", None) or inherited_val_date
+    if not raw_val_date:
+        raise ServiceError(
+            400, "VALUATION_DATE_REQUIRED",
+            "Valuation RunPackage requires an explicit valuation_date.",
+        )
+    val_date_str = str(raw_val_date)
+
+    configuration = {
+        "project": {"id": proj_id, "name": getattr(project, "name", "") if project else ""},
+        "run_type": "valuation",
+        "model": model_dict,
+        "model_version": model_version_dict,
+        "valuation_date": val_date_str,
+        "horizon_months": getattr(run, "horizon_months", 120),
+        "execution_backend": "cpu",
+        "parameters": parameters,
+        "formulas": formulas,
+        "variables": variables,
+        "datasets": datasets,
+        "scenario": scenario,
+        "build": build,
+    }
+
+    val_params = dict(valuation_parameters or {})
+    val_config_fp = compute_fp(val_params)
+
+    valuation_block = {
+        "basis": basis,
+        "methodology": methodology,
+        "methodology_version": methodology_version,
+        "source_projection_run_id": source_projection_run_id,
+        "source_run_package_fingerprint": source_run_package_fingerprint,
+        "source_artifact_id": source_artifact_id,
+        "source_artifact_fingerprint": source_artifact_fingerprint,
+        "derived_dataset_id": derived_dataset_id,
+        "derived_dataset_fingerprint": derived_dataset_fingerprint,
+        "discount_curve_fingerprint": discount_curve_fingerprint,
+        "valuation_date": val_date_str,
+        "valuation_parameters": val_params,
+        "valuation_config_fingerprint": val_config_fp,
+    }
+    configuration["valuation"] = valuation_block
+    configuration["valuation_date"] = val_date_str
+
+    now = now_utc()
+    run_id = getattr(run, "id", str(run))
+    run_set_id = getattr(run, "run_set_id", None)
+    user_id = getattr(user, "id", str(user)) if user else "user-system"
+    user_name = getattr(user, "full_name", None) if user else None
+
+    identity = {
+        "package_id": str(uuid.uuid4()),
+        "frozen_for_run_id": run_id,
+        "run_set_id": run_set_id,
+        "project_id": proj_id,
+        "created_at": iso(now),
+        "created_by": {"id": user_id, "full_name": user_name},
+    }
+    governance = {
+        "governance_mode": "governed",
+        "is_governed": True,
+        "frozen_at": iso(now),
+        "valuation_basis": basis,
+        "valuation_methodology": methodology,
+    }
     document = run_package.seal(identity, governance, configuration)
     return FrozenPackage(document=document, fingerprint=document["fingerprint"], configuration=configuration)

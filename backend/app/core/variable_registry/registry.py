@@ -42,7 +42,16 @@ def _model_to_definition(model: VariableModel) -> VariableDefinition:
     if model.source_type == "manual":
         source = {"type": "manual", "value": default_val}
     elif model.source_type and model.source_table:
-        source = {"type": model.source_type, "table_id": model.source_table}
+        if model.source_type == "prior_output" and ":" in model.source_table:
+            ds_id, col_name = model.source_table.split(":", 1)
+        else:
+            ds_id, col_name = model.source_table, None
+        source = {
+            "type": model.source_type,
+            "table_id": ds_id,
+            "dataset_id": ds_id if model.source_type == "prior_output" else None,
+            "column_name": col_name,
+        }
         if model.lookup_keys:
             source["lookup_keys"] = model.lookup_keys
     elif model.source_type == "input":
@@ -77,7 +86,15 @@ def register(db: Session, variable: VariableDefinition, actor_user_id: str) -> V
         description=variable.description,
         data_type=variable.data_type,
         source_type=source_type,
-        source_table=source.get("table_id") if isinstance(source, dict) else getattr(source, "table_id", None),
+        source_table=(
+            (
+                f"{source.get('dataset_id')}:{source.get('column_name')}"
+                if source_type == "prior_output" and source.get("dataset_id") and source.get("column_name")
+                else (source.get("table_id") or source.get("dataset_id"))
+            )
+            if isinstance(source, dict)
+            else getattr(source, "table_id", getattr(source, "dataset_id", None))
+        ),
         lookup_keys=source.get("lookup_keys", []) if isinstance(source, dict) else [],
         required=variable.required,
         default_value=default_value,

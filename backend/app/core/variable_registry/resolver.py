@@ -12,6 +12,11 @@ from app.db.models.factor import FactorTable
 from app.db.models.inforce import InforceRecord
 from app.db.models.scenario import ScenarioTable
 from app.models.schemas import ProjectionContext, VariableResolutionResult
+from app.services.common import ServiceError
+from app.services.derived_dataset_service import (
+    AmbiguousDerivedOutputError,
+    DerivedDatasetGovernanceError,
+)
 
 
 def build_lookup_keys(definition, context: ProjectionContext) -> dict:
@@ -30,6 +35,16 @@ def build_lookup_keys(definition, context: ProjectionContext) -> dict:
         keys["scenario_id"] = context.scenario_id
     if context.product:
         keys["product_type"] = context.product
+    if getattr(context, "coverage_id", None):
+        keys["coverage_id"] = context.coverage_id
+    if getattr(context, "rider_id", None):
+        keys["rider_id"] = context.rider_id
+    if getattr(context, "account_id", None):
+        keys["account_id"] = context.account_id
+    if getattr(context, "segment_id", None):
+        keys["segment_id"] = context.segment_id
+    if getattr(context, "cohort_id", None):
+        keys["cohort_id"] = context.cohort_id
     return keys
 
 
@@ -184,11 +199,32 @@ def resolve(
             source_table = context.scenario_id
 
         elif source_type == "prior_output":
-            offset = _get_source_attr(source, "offset_periods", 1)
-            value = _prior_period_lookup(
-                db, variable_name, context, offset, output_buffer=output_buffer
-            )
-            source_table = "run_artifacts"
+            dataset_id = _get_source_attr(source, "dataset_id") or getattr(context, "derived_dataset_id", None)
+            if dataset_id:
+                target_col = _get_source_attr(source, "column_name") or _get_source_attr(source, "variable_name", variable_name)
+                from app.services.derived_dataset_service import lookup_derived_output_value
+                value = lookup_derived_output_value(
+                    db,
+                    dataset_id=dataset_id,
+                    variable_name=target_col,
+                    project_id=getattr(context, "project_id", None),
+                    governed_execution=True,
+                    policy_id=lookup_keys.get("policy_id"),
+                    coverage_id=lookup_keys.get("coverage_id"),
+                    rider_id=lookup_keys.get("rider_id"),
+                    account_id=lookup_keys.get("account_id"),
+                    segment_id=lookup_keys.get("segment_id"),
+                    cohort_id=lookup_keys.get("cohort_id"),
+                    projection_month=lookup_keys.get("projection_month"),
+                    scenario_id=lookup_keys.get("scenario_id"),
+                )
+                source_table = f"derived_datasets:{dataset_id}"
+            else:
+                offset = _get_source_attr(source, "offset_periods", 1)
+                value = _prior_period_lookup(
+                    db, variable_name, context, offset, output_buffer=output_buffer
+                )
+                source_table = "run_artifacts"
 
         elif source_type == "manual":
             value = _get_source_attr(source, "value")
@@ -204,11 +240,15 @@ def resolve(
             value = definition.default_value
             source_table = "default"
 
+    except (DerivedDatasetGovernanceError, AmbiguousDerivedOutputError, ServiceError):
+        # Directive 3: Governance, security, and ambiguity errors must NEVER be masked by default fallback
+        raise
     except Exception as e:
         error = f"Error resolving '{variable_name}': {str(e)}"
 
     was_defaulted = False
-    if value is None and definition.default_value is not None:
+    # Only fall back to default when valid source returned no value AND no error occurred
+    if value is None and error is None and definition.default_value is not None:
         value = definition.default_value
         was_defaulted = True
 

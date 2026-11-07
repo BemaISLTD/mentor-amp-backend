@@ -36,7 +36,11 @@ from app.core.artifacts import IDENTITY_NEUTRAL_SCHEMA, get_artifact_store
 from app.config import settings
 from app.core.execution.run_package import RunPackageError
 from app.core.projection_engine.engine import EngineError, run_policy
+import app.db.database as _db_mod
 from app.db.database import SessionLocal
+_ORIG_SESSION_LOCAL = SessionLocal
+def _get_session_local():
+    return SessionLocal if SessionLocal is not _ORIG_SESSION_LOCAL else _db_mod.SessionLocal
 from app.db.models.projection import RunSet
 from app.db.models.run import Run
 from app.db.models.run_artifact import RunArtifact
@@ -169,7 +173,7 @@ def execute_run_set(run_set_id: str, worker_id: str | None = None) -> None:
     """Execute every pending run of a Run Set in its own database session (background task)."""
     register_all_products()
     worker_id = worker_id or default_worker_id()
-    db = SessionLocal()
+    db = _get_session_local()()
     try:
         run_set = db.get(RunSet, run_set_id)
         if run_set is None:
@@ -198,7 +202,7 @@ def execute_run_set(run_set_id: str, worker_id: str | None = None) -> None:
 
 def execute_run_by_id(run_id: str, worker_id: str | None = None) -> None:
     """Execute one queued run in a background-safe session and refresh its Run Set."""
-    db = SessionLocal()
+    db = _get_session_local()()
     try:
         execute_run(db, run_id, worker_id)
         run = db.get(Run, run_id)
@@ -248,7 +252,7 @@ def _finish(db: Session, outcome: TerminalOutcome) -> str | None:
     """Promote the outcome; an unrecoverable finalization leaves the run for recovery."""
     began = perf_counter()
     try:
-        result = run_finalization.commit_terminal_outcome(db, outcome, SessionLocal)
+        result = run_finalization.commit_terminal_outcome(db, outcome, _get_session_local())
     except FinalizationError as error:
         logger.error("Finalization of run %s failed (%s): %s", outcome.run_id, error.code, error.details)
         return None

@@ -188,6 +188,24 @@ class DerivedDataset(Base):
     )
     status: Mapped[str] = mapped_column(String(30), default="draft", nullable=False)
     source_run_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    source_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("runs.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    source_artifact_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("run_artifacts.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    source_model_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("models.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    source_model_version_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("model_versions.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    product_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    dimensions_available: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    approved_by: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     schema: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     storage_uri: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     storage_backend: Mapped[str | None] = mapped_column(String(50), nullable=True)
