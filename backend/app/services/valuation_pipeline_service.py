@@ -92,6 +92,11 @@ FORBIDDEN_RESIDUAL_MOVEMENT_NAMES = frozenset({
     "balancing_plug",
     "plug",
     "residual",
+    "balancing_adjustment",
+    "reconciliation_discrepancy",
+    "plug_balance",
+    "residual_plug",
+    "plug_residual",
 })
 GOVERNED_DEFAULT_ABS_TOL = 0.01
 
@@ -1172,6 +1177,20 @@ def execute_foundation_valuation(
         attempt_count=1,
     )
     db.add(val_run)
+
+    # Consistently create and persist canonical RunAttempt record for attempt 1
+    val_attempt = RunAttempt(
+        id=f"att-{uuid.uuid4().hex[:12]}",
+        run_id=val_run.id,
+        attempt_number=1,
+        status=run_state.SUCCESS,
+        worker_id="valuation_pipeline_worker",
+        started_at=datetime.fromisoformat(started_at) if isinstance(started_at, str) else started_at,
+        completed_at=datetime.now(timezone.utc),
+        output_row_count=1,
+        trace_row_count=0,
+    )
+    db.add(val_attempt)
     db.flush()
 
     pkg = freeze_valuation_run_package(
@@ -1989,6 +2008,1055 @@ def execute_governed_reconciliation(
     }
 
 
+def evaluate_rollforward_evidence(
+    db: Session,
+    val_run: Run,
+    val_detail: ValuationRunDetail,
+    val_pkg: RunPackage | None,
+    rollforward_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Pure evaluation of rollforward evidence for release approval (V9-P0-01).
+
+    Revalidates:
+    1. Accepted execution attempt lineage on canonical valuation run (rejects failed/superseded attempts).
+    2. Physical artifact presence and recorded SHA-256 integrity.
+    3. JSON schema, valuation run identity, and project binding.
+    4. Governed tolerance policy approval, parameters, and bounded threshold.
+    5. Independent arithmetic continuity recomputation:
+       ExpectedClosing = OpeningBalance + Sum(VerifiedSignedMovements)
+       Difference = ActualClosing - ExpectedClosing
+       abs(Difference) <= effective_approved_tolerance.
+       Never accepts stored continuity boolean without arithmetic verification.
+    6. Rejection of forbidden residual/balancing movements and nonfinite values.
+    7. Reconciliation of rollforward closing balance to persisted valuation reserve.
+    8. Exact agreement between physical artifact, RollforwardSummary database rows,
+       and partition summary IDs.
+    """
+    VALID_SUCCESS_STATUSES = (run_state.SUCCESS, run_state.PARTIAL_SUCCESS, "completed", "success")
+    if val_run.status not in VALID_SUCCESS_STATUSES:
+        return {
+            "is_verified": False,
+            "recomputed_difference": None,
+            "expected_closing": None,
+            "actual_closing": None,
+            "effective_tolerance": None,
+            "tolerance_policy_id": None,
+            "trace_identifier": None,
+            "selected_artifact": None,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {},
+            "reason": f"Valuation run '{val_run.id}' has non-successful execution status '{val_run.status}' (pending, running, failed, or cancelled executions cannot authorize release).",
+        }
+
+    # 1. Lineage: Check execution attempts in DB
+    attempts = (
+        db.query(RunAttempt)
+        .filter(RunAttempt.run_id == val_run.id)
+        .order_by(RunAttempt.attempt_number)
+        .all()
+    )
+
+    if attempts:
+        if val_run.accepted_attempt_number is None:
+            return {
+                "is_verified": False,
+                "recomputed_difference": None,
+                "expected_closing": None,
+                "actual_closing": None,
+                "effective_tolerance": None,
+                "tolerance_policy_id": None,
+                "trace_identifier": None,
+                "selected_artifact": None,
+                "primary_summary": None,
+                "canonical_rf_rows": [],
+                "movements": {},
+                "reason": f"Valuation run '{val_run.id}' has recorded execution attempts but no accepted execution attempt (accepted_attempt_number is None).",
+            }
+        accepted_att = next(
+            (a for a in attempts if a.attempt_number == val_run.accepted_attempt_number),
+            None,
+        )
+        if not accepted_att:
+            return {
+                "is_verified": False,
+                "recomputed_difference": None,
+                "expected_closing": None,
+                "actual_closing": None,
+                "effective_tolerance": None,
+                "tolerance_policy_id": None,
+                "trace_identifier": None,
+                "selected_artifact": None,
+                "primary_summary": None,
+                "canonical_rf_rows": [],
+                "movements": {},
+                "reason": f"Claimed accepted attempt {val_run.accepted_attempt_number} record does not exist in database for run '{val_run.id}'.",
+            }
+        if accepted_att.status not in (run_state.SUCCESS, run_state.PARTIAL_SUCCESS, "completed", "success"):
+            return {
+                "is_verified": False,
+                "recomputed_difference": None,
+                "expected_closing": None,
+                "actual_closing": None,
+                "effective_tolerance": None,
+                "tolerance_policy_id": None,
+                "trace_identifier": None,
+                "selected_artifact": None,
+                "primary_summary": None,
+                "canonical_rf_rows": [],
+                "movements": {},
+                "reason": f"Accepted attempt {val_run.accepted_attempt_number} has non-successful status '{accepted_att.status}'.",
+            }
+        canonical_attempt_num = val_run.accepted_attempt_number
+    else:
+        # Path 2: Direct valuation execution contract (zero RunAttempt records in DB)
+        # Direct valuation runs executed synchronously in a single transaction without a multi-attempt worker queue
+        # establish trusted lineage via the canonical Run record under strict invariants:
+        # 1. Run type must be 'valuation' (projection runs strictly require RunAttempt records).
+        # 2. Run status is already verified above as terminal success (never pending, running, failed, cancelled).
+        # 3. attempt_count cannot indicate multi-attempt execution (attempt_count > 1 without RunAttempt records is invalid).
+        # 4. Canonical attempt number resolves strictly to accepted_attempt_number if specified (>= 1),
+        #    or 1 ONLY if attempt_count <= 1 and status is terminal success. If accepted_attempt_number is explicitly
+        #    set to an invalid value (< 1), or if attempt_count > 1 without attempt records, reject.
+        if val_run.run_type != "valuation":
+            return {
+                "is_verified": False,
+                "recomputed_difference": None,
+                "expected_closing": None,
+                "actual_closing": None,
+                "effective_tolerance": None,
+                "tolerance_policy_id": None,
+                "trace_identifier": None,
+                "selected_artifact": None,
+                "primary_summary": None,
+                "canonical_rf_rows": [],
+                "movements": {},
+                "reason": f"Run '{val_run.id}' has run_type '{val_run.run_type}' without RunAttempt records; attempt records are mandatory for non-valuation runs.",
+            }
+        if val_run.attempt_count is not None and val_run.attempt_count > 1:
+            return {
+                "is_verified": False,
+                "recomputed_difference": None,
+                "expected_closing": None,
+                "actual_closing": None,
+                "effective_tolerance": None,
+                "tolerance_policy_id": None,
+                "trace_identifier": None,
+                "selected_artifact": None,
+                "primary_summary": None,
+                "canonical_rf_rows": [],
+                "movements": {},
+                "reason": f"Valuation run '{val_run.id}' indicates multiple execution attempts (attempt_count={val_run.attempt_count}) but has no RunAttempt audit records.",
+            }
+        if val_run.accepted_attempt_number is not None:
+            if val_run.accepted_attempt_number < 1:
+                return {
+                    "is_verified": False,
+                    "recomputed_difference": None,
+                    "expected_closing": None,
+                    "actual_closing": None,
+                    "effective_tolerance": None,
+                    "tolerance_policy_id": None,
+                    "trace_identifier": None,
+                    "selected_artifact": None,
+                    "primary_summary": None,
+                    "canonical_rf_rows": [],
+                    "movements": {},
+                    "reason": f"Valuation run '{val_run.id}' has invalid accepted_attempt_number={val_run.accepted_attempt_number} (< 1).",
+                }
+            canonical_attempt_num = val_run.accepted_attempt_number
+        else:
+            canonical_attempt_num = 1
+
+    # 2. Query candidate artifacts and filter strictly by accepted attempt
+    rf_arts = (
+        db.query(RunArtifact)
+        .filter(
+            RunArtifact.run_id == val_run.id,
+            RunArtifact.artifact_type == "rollforward_summary",
+        )
+        .all()
+    )
+    if not rf_arts:
+        return {
+            "is_verified": False,
+            "recomputed_difference": None,
+            "expected_closing": None,
+            "actual_closing": None,
+            "effective_tolerance": None,
+            "tolerance_policy_id": None,
+            "trace_identifier": None,
+            "selected_artifact": None,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {},
+            "reason": f"No rollforward_summary artifact found for run '{val_run.id}'.",
+        }
+
+    accepted_rf_arts = [
+        a for a in rf_arts
+        if (a.attempt_number == canonical_attempt_num or (a.attempt_number is None and canonical_attempt_num == 1))
+    ]
+
+    explicit_art_id = rollforward_result.get("artifact_id")
+    explicit_trace = rollforward_result.get("trace_identifier")
+    explicit_sum_id = rollforward_result.get("summary_id")
+
+    selected_rf_art = None
+    if explicit_art_id:
+        matched_any = next((a for a in rf_arts if a.id == explicit_art_id), None)
+        if not matched_any:
+            return {
+                "is_verified": False,
+                "recomputed_difference": None,
+                "expected_closing": None,
+                "actual_closing": None,
+                "effective_tolerance": None,
+                "tolerance_policy_id": None,
+                "trace_identifier": None,
+                "selected_artifact": None,
+                "primary_summary": None,
+                "canonical_rf_rows": [],
+                "movements": {},
+                "reason": f"Specified rollforward artifact '{explicit_art_id}' not found for run '{val_run.id}'.",
+            }
+        if matched_any.attempt_number != canonical_attempt_num and not (matched_any.attempt_number is None and canonical_attempt_num == 1):
+            return {
+                "is_verified": False,
+                "recomputed_difference": None,
+                "expected_closing": None,
+                "actual_closing": None,
+                "effective_tolerance": None,
+                "tolerance_policy_id": None,
+                "trace_identifier": None,
+                "selected_artifact": matched_any,
+                "primary_summary": None,
+                "canonical_rf_rows": [],
+                "movements": {},
+                "reason": f"Specified rollforward artifact '{explicit_art_id}' belongs to superseded attempt {matched_any.attempt_number}, not accepted attempt {canonical_attempt_num}.",
+            }
+        selected_rf_art = matched_any
+    elif explicit_trace:
+        matched_trace = [
+            a for a in accepted_rf_arts
+            if (a.partition if isinstance(a.partition, dict) else {}).get("trace_identifier") == explicit_trace
+        ]
+        if not matched_trace:
+            other_trace = [
+                a for a in rf_arts
+                if (a.partition if isinstance(a.partition, dict) else {}).get("trace_identifier") == explicit_trace
+            ]
+            if other_trace:
+                return {
+                    "is_verified": False,
+                    "recomputed_difference": None,
+                    "expected_closing": None,
+                    "actual_closing": None,
+                    "effective_tolerance": None,
+                    "tolerance_policy_id": None,
+                    "trace_identifier": None,
+                    "selected_artifact": other_trace[0],
+                    "primary_summary": None,
+                    "canonical_rf_rows": [],
+                    "movements": {},
+                    "reason": f"Rollforward artifact with trace '{explicit_trace}' belongs to superseded attempt {other_trace[0].attempt_number}, not accepted attempt {canonical_attempt_num}.",
+                }
+            return {
+                "is_verified": False,
+                "recomputed_difference": None,
+                "expected_closing": None,
+                "actual_closing": None,
+                "effective_tolerance": None,
+                "tolerance_policy_id": None,
+                "trace_identifier": None,
+                "selected_artifact": None,
+                "primary_summary": None,
+                "canonical_rf_rows": [],
+                "movements": {},
+                "reason": f"No rollforward artifact matching trace '{explicit_trace}' found in accepted attempt {canonical_attempt_num}.",
+            }
+        selected_rf_art = matched_trace[0]
+    elif explicit_sum_id:
+        matched_sum = [
+            a for a in accepted_rf_arts
+            if (a.partition if isinstance(a.partition, dict) else {}).get("summary_id") == explicit_sum_id
+        ]
+        if not matched_sum:
+            other_sum = [
+                a for a in rf_arts
+                if (a.partition if isinstance(a.partition, dict) else {}).get("summary_id") == explicit_sum_id
+            ]
+            if other_sum:
+                return {
+                    "is_verified": False,
+                    "recomputed_difference": None,
+                    "expected_closing": None,
+                    "actual_closing": None,
+                    "effective_tolerance": None,
+                    "tolerance_policy_id": None,
+                    "trace_identifier": None,
+                    "selected_artifact": other_sum[0],
+                    "primary_summary": None,
+                    "canonical_rf_rows": [],
+                    "movements": {},
+                    "reason": f"Rollforward artifact with summary '{explicit_sum_id}' belongs to superseded attempt {other_sum[0].attempt_number}, not accepted attempt {canonical_attempt_num}.",
+                }
+            return {
+                "is_verified": False,
+                "recomputed_difference": None,
+                "expected_closing": None,
+                "actual_closing": None,
+                "effective_tolerance": None,
+                "tolerance_policy_id": None,
+                "trace_identifier": None,
+                "selected_artifact": None,
+                "primary_summary": None,
+                "canonical_rf_rows": [],
+                "movements": {},
+                "reason": f"No rollforward artifact matching summary '{explicit_sum_id}' found in accepted attempt {canonical_attempt_num}.",
+            }
+        selected_rf_art = matched_sum[0]
+    elif len(accepted_rf_arts) == 1:
+        selected_rf_art = accepted_rf_arts[0]
+    elif len(accepted_rf_arts) == 0:
+        return {
+            "is_verified": False,
+            "recomputed_difference": None,
+            "expected_closing": None,
+            "actual_closing": None,
+            "effective_tolerance": None,
+            "tolerance_policy_id": None,
+            "trace_identifier": None,
+            "selected_artifact": None,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {},
+            "reason": f"No rollforward_summary artifact found for accepted attempt {canonical_attempt_num} (artifacts exist for other attempts: {[a.attempt_number for a in rf_arts]}).",
+        }
+    else:
+        return {
+            "is_verified": False,
+            "recomputed_difference": None,
+            "expected_closing": None,
+            "actual_closing": None,
+            "effective_tolerance": None,
+            "tolerance_policy_id": None,
+            "trace_identifier": None,
+            "selected_artifact": None,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {},
+            "reason": f"Multiple rollforward_summary artifacts ({len(accepted_rf_arts)}) in accepted attempt {canonical_attempt_num} without explicit disambiguation.",
+        }
+
+    # 3. Physical storage file existence & SHA-256 verification
+    store = get_artifact_store()
+    try:
+        rf_path = store.path_for_uri(selected_rf_art.storage_uri)
+    except Exception as exc:
+        return {
+            "is_verified": False,
+            "recomputed_difference": None,
+            "expected_closing": None,
+            "actual_closing": None,
+            "effective_tolerance": None,
+            "tolerance_policy_id": None,
+            "trace_identifier": None,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {},
+            "reason": f"Invalid artifact storage URI '{selected_rf_art.storage_uri}': {exc}",
+        }
+
+    if not rf_path.exists():
+        return {
+            "is_verified": False,
+            "recomputed_difference": None,
+            "expected_closing": None,
+            "actual_closing": None,
+            "effective_tolerance": None,
+            "tolerance_policy_id": None,
+            "trace_identifier": None,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {},
+            "reason": f"Physical rollforward artifact file does not exist at '{selected_rf_art.storage_uri}'.",
+        }
+
+    try:
+        raw_rf_bytes = rf_path.read_bytes()
+    except Exception as exc:
+        return {
+            "is_verified": False,
+            "recomputed_difference": None,
+            "expected_closing": None,
+            "actual_closing": None,
+            "effective_tolerance": None,
+            "tolerance_policy_id": None,
+            "trace_identifier": None,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {},
+            "reason": f"Failed reading physical rollforward artifact: {exc}",
+        }
+
+    actual_sha = hashlib.sha256(raw_rf_bytes).hexdigest()
+    if actual_sha != selected_rf_art.checksum_sha256:
+        return {
+            "is_verified": False,
+            "recomputed_difference": None,
+            "expected_closing": None,
+            "actual_closing": None,
+            "effective_tolerance": None,
+            "tolerance_policy_id": None,
+            "trace_identifier": None,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {},
+            "reason": f"Rollforward artifact SHA-256 mismatch: recorded '{selected_rf_art.checksum_sha256}', actual '{actual_sha}'.",
+        }
+
+    # 4. JSON parsing & identity binding
+    try:
+        rf_doc = json.loads(raw_rf_bytes.decode("utf-8"))
+    except Exception as exc:
+        return {
+            "is_verified": False,
+            "recomputed_difference": None,
+            "expected_closing": None,
+            "actual_closing": None,
+            "effective_tolerance": None,
+            "tolerance_policy_id": None,
+            "trace_identifier": None,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {},
+            "reason": f"Rollforward artifact payload is not valid JSON: {exc}",
+        }
+
+    if rf_doc.get("valuation_run_id") != val_run.id:
+        return {
+            "is_verified": False,
+            "recomputed_difference": None,
+            "expected_closing": None,
+            "actual_closing": None,
+            "effective_tolerance": None,
+            "tolerance_policy_id": None,
+            "trace_identifier": None,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {},
+            "reason": f"Artifact valuation_run_id '{rf_doc.get('valuation_run_id')}' mismatches valuation run '{val_run.id}'.",
+        }
+    if rf_doc.get("project_id") != val_run.project_id:
+        return {
+            "is_verified": False,
+            "recomputed_difference": None,
+            "expected_closing": None,
+            "actual_closing": None,
+            "effective_tolerance": None,
+            "tolerance_policy_id": None,
+            "trace_identifier": None,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {},
+            "reason": f"Artifact project_id '{rf_doc.get('project_id')}' mismatches valuation run project '{val_run.project_id}'.",
+        }
+
+    # 5. Governed tolerance policy verification
+    pol_id = rf_doc.get("tolerance_policy_id")
+    if not pol_id or pol_id not in GOVERNED_APPROVED_TOLERANCE_POLICIES:
+        return {
+            "is_verified": False,
+            "recomputed_difference": None,
+            "expected_closing": None,
+            "actual_closing": None,
+            "effective_tolerance": None,
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": None,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {},
+            "reason": f"Tolerance policy '{pol_id}' is not an approved governed tolerance policy.",
+        }
+    governed_policy = GOVERNED_APPROVED_TOLERANCE_POLICIES[pol_id]
+    max_policy_tol = governed_policy["max_tolerance"]
+
+    raw_doc_tol = rf_doc.get("tolerance")
+    if raw_doc_tol is not None:
+        try:
+            f_tol = float(raw_doc_tol)
+            if not math.isfinite(f_tol) or f_tol < 0.0:
+                return {
+                    "is_verified": False,
+                    "recomputed_difference": None,
+                    "expected_closing": None,
+                    "actual_closing": None,
+                    "effective_tolerance": None,
+                    "tolerance_policy_id": pol_id,
+                    "trace_identifier": None,
+                    "selected_artifact": selected_rf_art,
+                    "primary_summary": None,
+                    "canonical_rf_rows": [],
+                    "movements": {},
+                    "reason": f"Artifact tolerance '{raw_doc_tol}' must be finite and non-negative.",
+                }
+            dec_doc_tol = Decimal(str(raw_doc_tol))
+            if not dec_doc_tol.is_finite() or dec_doc_tol < Decimal("0"):
+                return {
+                    "is_verified": False,
+                    "recomputed_difference": None,
+                    "expected_closing": None,
+                    "actual_closing": None,
+                    "effective_tolerance": None,
+                    "tolerance_policy_id": pol_id,
+                    "trace_identifier": None,
+                    "selected_artifact": selected_rf_art,
+                    "primary_summary": None,
+                    "canonical_rf_rows": [],
+                    "movements": {},
+                    "reason": f"Artifact tolerance '{raw_doc_tol}' must be finite and non-negative.",
+                }
+            if dec_doc_tol > max_policy_tol:
+                return {
+                    "is_verified": False,
+                    "recomputed_difference": None,
+                    "expected_closing": None,
+                    "actual_closing": None,
+                    "effective_tolerance": None,
+                    "tolerance_policy_id": pol_id,
+                    "trace_identifier": None,
+                    "selected_artifact": selected_rf_art,
+                    "primary_summary": None,
+                    "canonical_rf_rows": [],
+                    "movements": {},
+                    "reason": f"Artifact tolerance {dec_doc_tol} exceeds maximum approved policy threshold {max_policy_tol} for '{pol_id}'.",
+                }
+            effective_tolerance = min(dec_doc_tol, max_policy_tol)
+        except Exception:
+            return {
+                "is_verified": False,
+                "recomputed_difference": None,
+                "expected_closing": None,
+                "actual_closing": None,
+                "effective_tolerance": None,
+                "tolerance_policy_id": pol_id,
+                "trace_identifier": None,
+                "selected_artifact": selected_rf_art,
+                "primary_summary": None,
+                "canonical_rf_rows": [],
+                "movements": {},
+                "reason": f"Invalid tolerance '{raw_doc_tol}' in artifact.",
+            }
+    else:
+        effective_tolerance = max_policy_tol
+
+    # 6. Balances & Movements validation & independent arithmetic recomputation
+    raw_open = rf_doc.get("opening_balance")
+    raw_close = rf_doc.get("ending_balance", rf_doc.get("closing_balance"))
+    if raw_open is None or raw_close is None:
+        return {
+            "is_verified": False,
+            "recomputed_difference": None,
+            "expected_closing": None,
+            "actual_closing": None,
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": None,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {},
+            "reason": "Artifact missing opening_balance or ending_balance.",
+        }
+    try:
+        f_open = float(raw_open)
+        f_close = float(raw_close)
+        if not math.isfinite(f_open) or not math.isfinite(f_close):
+            return {
+                "is_verified": False,
+                "recomputed_difference": None,
+                "expected_closing": None,
+                "actual_closing": None,
+                "effective_tolerance": float(effective_tolerance),
+                "tolerance_policy_id": pol_id,
+                "trace_identifier": None,
+                "selected_artifact": selected_rf_art,
+                "primary_summary": None,
+                "canonical_rf_rows": [],
+                "movements": {},
+                "reason": f"Non-finite balances in artifact: opening={raw_open}, closing={raw_close}.",
+            }
+        opening_dec = Decimal(str(raw_open))
+        closing_dec = Decimal(str(raw_close))
+    except Exception:
+        return {
+            "is_verified": False,
+            "recomputed_difference": None,
+            "expected_closing": None,
+            "actual_closing": None,
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": None,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {},
+            "reason": f"Invalid numeric balances: opening='{raw_open}', closing='{raw_close}'.",
+        }
+
+    raw_movements = rf_doc.get("movements")
+    if not isinstance(raw_movements, dict):
+        return {
+            "is_verified": False,
+            "recomputed_difference": None,
+            "expected_closing": None,
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": None,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {},
+            "reason": "Artifact movements must be a dictionary.",
+        }
+
+    movements_dec: dict[str, Decimal] = {}
+    for k, v in raw_movements.items():
+        k_str = str(k).strip()
+        if not k_str:
+            return {
+                "is_verified": False,
+                "recomputed_difference": None,
+                "expected_closing": None,
+                "actual_closing": float(closing_dec),
+                "effective_tolerance": float(effective_tolerance),
+                "tolerance_policy_id": pol_id,
+                "trace_identifier": None,
+                "selected_artifact": selected_rf_art,
+                "primary_summary": None,
+                "canonical_rf_rows": [],
+                "movements": {},
+                "reason": "Empty movement component name in artifact.",
+            }
+        if k_str.lower() in FORBIDDEN_RESIDUAL_MOVEMENT_NAMES:
+            return {
+                "is_verified": False,
+                "recomputed_difference": None,
+                "expected_closing": None,
+                "actual_closing": float(closing_dec),
+                "effective_tolerance": float(effective_tolerance),
+                "tolerance_policy_id": pol_id,
+                "trace_identifier": None,
+                "selected_artifact": selected_rf_art,
+                "primary_summary": None,
+                "canonical_rf_rows": [],
+                "movements": {},
+                "reason": f"Movement component '{k}' is a forbidden balancing/residual plug; unexplained movements cannot masquerade as attributed movements.",
+            }
+        try:
+            f_v = float(v)
+            if not math.isfinite(f_v):
+                return {
+                    "is_verified": False,
+                    "recomputed_difference": None,
+                    "expected_closing": None,
+                    "actual_closing": float(closing_dec),
+                    "effective_tolerance": float(effective_tolerance),
+                    "tolerance_policy_id": pol_id,
+                    "trace_identifier": None,
+                    "selected_artifact": selected_rf_art,
+                    "primary_summary": None,
+                    "canonical_rf_rows": [],
+                    "movements": {},
+                    "reason": f"Movement component '{k}' has non-finite value '{v}'.",
+                }
+            dec_v = Decimal(str(v))
+            if not dec_v.is_finite():
+                return {
+                    "is_verified": False,
+                    "recomputed_difference": None,
+                    "expected_closing": None,
+                    "actual_closing": float(closing_dec),
+                    "effective_tolerance": float(effective_tolerance),
+                    "tolerance_policy_id": pol_id,
+                    "trace_identifier": None,
+                    "selected_artifact": selected_rf_art,
+                    "primary_summary": None,
+                    "canonical_rf_rows": [],
+                    "movements": {},
+                    "reason": f"Movement component '{k}' has non-finite value '{v}'.",
+                }
+            movements_dec[k_str] = dec_v
+        except Exception:
+            return {
+                "is_verified": False,
+                "recomputed_difference": None,
+                "expected_closing": None,
+                "actual_closing": float(closing_dec),
+                "effective_tolerance": float(effective_tolerance),
+                "tolerance_policy_id": pol_id,
+                "trace_identifier": None,
+                "selected_artifact": selected_rf_art,
+                "primary_summary": None,
+                "canonical_rf_rows": [],
+                "movements": {},
+                "reason": f"Movement component '{k}' has invalid numeric value '{v}'.",
+            }
+
+    # Mandatory independent continuity calculation (Requirement A):
+    expected_closing = opening_dec + sum(movements_dec.values(), Decimal("0"))
+    difference = closing_dec - expected_closing
+    abs_diff = abs(difference)
+
+    if abs_diff > effective_tolerance:
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": None,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": f"Arithmetic continuity breach: ActualClosing ({closing_dec}) differs from ExpectedClosing ({expected_closing}) by {abs_diff} exceeding tolerance {effective_tolerance}.",
+        }
+
+    if rf_doc.get("has_unverified_movement_source") is True:
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": None,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": "Rollforward artifact contains unverified movement sources.",
+        }
+
+    trace_id = str(rf_doc.get("trace_identifier") or "")
+    if not trace_id.startswith(f"VERIFIED:{pol_id}:"):
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": trace_id,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": f"Rollforward artifact trace_identifier '{trace_id}' is not in approved 'VERIFIED:{pol_id}:*' format.",
+        }
+
+    # 7. Reserve agreement (Requirement E): closing balance must match persisted reserve in ValuationRunDetail
+    persisted_summary = (val_detail.summary_results or {}) if val_detail else {}
+    persisted_reserve = persisted_summary.get("present_value_reserve")
+    if persisted_reserve is None:
+        persisted_reserve = persisted_summary.get("closing_reserve")
+    if persisted_reserve is None:
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": trace_id,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": f"Persisted ValuationRunDetail for run '{val_run.id}' missing present_value_reserve.",
+        }
+    try:
+        persisted_res_dec = Decimal(str(persisted_reserve))
+        if abs(closing_dec - persisted_res_dec) > effective_tolerance:
+            return {
+                "is_verified": False,
+                "recomputed_difference": float(abs_diff),
+                "expected_closing": float(expected_closing),
+                "actual_closing": float(closing_dec),
+                "effective_tolerance": float(effective_tolerance),
+                "tolerance_policy_id": pol_id,
+                "trace_identifier": trace_id,
+                "selected_artifact": selected_rf_art,
+                "primary_summary": None,
+                "canonical_rf_rows": [],
+                "movements": {k: float(v) for k, v in movements_dec.items()},
+                "reason": f"Rollforward closing balance ({closing_dec}) differs from persisted valuation reserve ({persisted_res_dec}) beyond tolerance {effective_tolerance}.",
+            }
+    except Exception:
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": trace_id,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": f"Invalid persisted reserve value '{persisted_reserve}' in ValuationRunDetail.",
+        }
+
+    # 8. Database RollforwardSummary row agreement (Requirement D)
+    canonical_rf_rows = (
+        db.query(RollforwardSummary)
+        .filter(
+            RollforwardSummary.run_id == val_run.id,
+            RollforwardSummary.project_id == val_run.project_id,
+            RollforwardSummary.trace_identifier == trace_id,
+        )
+        .all()
+    )
+    if not canonical_rf_rows:
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": trace_id,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": None,
+            "canonical_rf_rows": [],
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": f"No persisted RollforwardSummary database rows found matching trace_identifier '{trace_id}'.",
+        }
+
+    primary_candidates = [r for r in canonical_rf_rows if not r.is_movement]
+    rf_primary = primary_candidates[0] if primary_candidates else canonical_rf_rows[0]
+
+    part = selected_rf_art.partition if isinstance(selected_rf_art.partition, dict) else {}
+    if part.get("summary_id") and part["summary_id"] != rf_primary.id:
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": trace_id,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": rf_primary,
+            "canonical_rf_rows": canonical_rf_rows,
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": f"Artifact partition summary_id '{part.get('summary_id')}' disagrees with primary RollforwardSummary '{rf_primary.id}'.",
+        }
+    if part.get("trace_identifier") and part["trace_identifier"] != trace_id:
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": trace_id,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": rf_primary,
+            "canonical_rf_rows": canonical_rf_rows,
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": f"Artifact partition trace_identifier '{part.get('trace_identifier')}' disagrees with artifact trace_identifier '{trace_id}'.",
+        }
+    if part.get("has_unverified_movement_source"):
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": trace_id,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": rf_primary,
+            "canonical_rf_rows": canonical_rf_rows,
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": "Artifact partition indicates unverified movement sources.",
+        }
+
+    if val_run.basis and rf_primary.basis and str(rf_primary.basis).strip().upper() != str(val_run.basis).strip().upper():
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": trace_id,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": rf_primary,
+            "canonical_rf_rows": canonical_rf_rows,
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": f"Rollforward basis '{rf_primary.basis}' mismatches valuation run basis '{val_run.basis}'.",
+        }
+    if val_run.methodology and rf_primary.methodology and str(rf_primary.methodology).strip().upper() != str(val_run.methodology).strip().upper():
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": trace_id,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": rf_primary,
+            "canonical_rf_rows": canonical_rf_rows,
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": f"Rollforward methodology '{rf_primary.methodology}' mismatches valuation run methodology '{val_run.methodology}'.",
+        }
+
+    rf_doc_cohort = str(rf_doc.get("cohort_id") or "").strip()
+    if rf_doc_cohort and rf_primary.cohort_id and rf_doc_cohort != str(rf_primary.cohort_id).strip():
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": trace_id,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": rf_primary,
+            "canonical_rf_rows": canonical_rf_rows,
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": f"Artifact cohort '{rf_doc_cohort}' disagrees with DB rollforward cohort '{rf_primary.cohort_id}'.",
+        }
+
+    if abs(Decimal(str(rf_primary.opening_balance)) - opening_dec) > Decimal("1e-4"):
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": trace_id,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": rf_primary,
+            "canonical_rf_rows": canonical_rf_rows,
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": f"DB opening balance ({rf_primary.opening_balance}) disagrees with artifact ({opening_dec}).",
+        }
+    if abs(Decimal(str(rf_primary.closing_balance)) - closing_dec) > Decimal("1e-4"):
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": trace_id,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": rf_primary,
+            "canonical_rf_rows": canonical_rf_rows,
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": f"DB closing balance ({rf_primary.closing_balance}) disagrees with artifact ({closing_dec}).",
+        }
+    if not rf_primary.is_continuity_verified:
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": trace_id,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": rf_primary,
+            "canonical_rf_rows": canonical_rf_rows,
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": "DB RollforwardSummary is_continuity_verified is False.",
+        }
+    if abs(Decimal(str(rf_primary.continuity_difference)) - abs_diff) > Decimal("1e-4"):
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": trace_id,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": rf_primary,
+            "canonical_rf_rows": canonical_rf_rows,
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": f"DB continuity difference ({rf_primary.continuity_difference}) disagrees with recomputed difference ({abs_diff}).",
+        }
+
+    db_movements = {
+        r.component_name: Decimal(str(r.movement_amount))
+        for r in canonical_rf_rows if r.is_movement
+    }
+    if set(db_movements.keys()) != set(movements_dec.keys()):
+        return {
+            "is_verified": False,
+            "recomputed_difference": float(abs_diff),
+            "expected_closing": float(expected_closing),
+            "actual_closing": float(closing_dec),
+            "effective_tolerance": float(effective_tolerance),
+            "tolerance_policy_id": pol_id,
+            "trace_identifier": trace_id,
+            "selected_artifact": selected_rf_art,
+            "primary_summary": rf_primary,
+            "canonical_rf_rows": canonical_rf_rows,
+            "movements": {k: float(v) for k, v in movements_dec.items()},
+            "reason": f"DB movement components {sorted(db_movements.keys())} disagree with artifact {sorted(movements_dec.keys())}.",
+        }
+    for k in db_movements:
+        if abs(db_movements[k] - movements_dec[k]) > Decimal("1e-4"):
+            return {
+                "is_verified": False,
+                "recomputed_difference": float(abs_diff),
+                "expected_closing": float(expected_closing),
+                "actual_closing": float(closing_dec),
+                "effective_tolerance": float(effective_tolerance),
+                "tolerance_policy_id": pol_id,
+                "trace_identifier": trace_id,
+                "selected_artifact": selected_rf_art,
+                "primary_summary": rf_primary,
+                "canonical_rf_rows": canonical_rf_rows,
+                "movements": {k: float(v) for k, v in movements_dec.items()},
+                "reason": f"DB movement '{k}' amount ({db_movements[k]}) disagrees with artifact ({movements_dec[k]}).",
+            }
+
+    return {
+        "is_verified": True,
+        "recomputed_difference": float(abs_diff),
+        "expected_closing": float(expected_closing),
+        "actual_closing": float(closing_dec),
+        "effective_tolerance": float(effective_tolerance),
+        "tolerance_policy_id": pol_id,
+        "trace_identifier": trace_id,
+        "selected_artifact": selected_rf_art,
+        "primary_summary": rf_primary,
+        "canonical_rf_rows": canonical_rf_rows,
+        "movements": {k: float(v) for k, v in movements_dec.items()},
+        "reason": None,
+    }
+
+
 def execute_reporting_manifest(
     db: Session,
     valuation_run_id: str,
@@ -2182,100 +3250,24 @@ def execute_reporting_manifest(
             and reconciliation_result.get("status") == rec_row.status
         )
 
-    # 4. V8-P0-02: Authenticate persisted rollforward RunArtifact, physical file, checksum, and DB rows
-    rf_arts = db.query(RunArtifact).filter(
-        RunArtifact.run_id == valuation_run_id,
-        RunArtifact.artifact_type == "rollforward_summary",
-    ).all()
+    # 4. V9-P0-01: Independent rollforward continuity, attempt lineage, and evidence authentication
+    rf_eval = evaluate_rollforward_evidence(
+        db=db,
+        val_run=val_run,
+        val_detail=val_detail,
+        val_pkg=val_pkg,
+        rollforward_result=rollforward_result,
+    )
 
-    selected_rf_art = None
-    explicit_rf_art_id = rollforward_result.get("artifact_id")
-    explicit_rf_trace = rollforward_result.get("trace_identifier")
-    explicit_rf_sum_id = rollforward_result.get("summary_id")
+    persisted_rf_ok = rf_eval["is_verified"]
+    rf_verified = rf_eval["is_verified"]
+    if rollforward_result.get("is_continuous") is False:
+        rf_verified = False
 
-    if explicit_rf_art_id:
-        for art in rf_arts:
-            if art.id == explicit_rf_art_id:
-                selected_rf_art = art
-                break
-    elif explicit_rf_trace:
-        for art in rf_arts:
-            part = art.partition if isinstance(art.partition, dict) else {}
-            if part.get("trace_identifier") == explicit_rf_trace:
-                selected_rf_art = art
-                break
-    elif explicit_rf_sum_id:
-        for art in rf_arts:
-            part = art.partition if isinstance(art.partition, dict) else {}
-            if part.get("summary_id") == explicit_rf_sum_id:
-                selected_rf_art = art
-                break
-    elif len(rf_arts) == 1:
-        selected_rf_art = rf_arts[0]
-
-    persisted_rf_ok = False
-    rf_verified = False
-    canonical_rf_rows: list[RollforwardSummary] = []
-    rf_persisted_movements: dict[str, float] = {}
-    rf_primary: RollforwardSummary | None = None
-
-    if selected_rf_art is not None:
-        try:
-            store = get_artifact_store()
-            rf_path = store.path_for_uri(selected_rf_art.storage_uri)
-            if rf_path.exists():
-                raw_rf_bytes = rf_path.read_bytes()
-                actual_rf_sha = hashlib.sha256(raw_rf_bytes).hexdigest()
-                if actual_rf_sha == selected_rf_art.checksum_sha256:
-                    rf_doc = json.loads(raw_rf_bytes.decode("utf-8"))
-                    if (
-                        rf_doc.get("valuation_run_id") == valuation_run_id
-                        and rf_doc.get("project_id") == project_id
-                        and rf_doc.get("is_continuous") is True
-                        and not rf_doc.get("has_unverified_movement_source")
-                        and rf_doc.get("tolerance_policy_id") in GOVERNED_APPROVED_TOLERANCE_POLICIES
-                    ):
-                        trace_id = rf_doc.get("trace_identifier", "")
-                        pol_id = rf_doc.get("tolerance_policy_id")
-                        if trace_id.startswith(f"VERIFIED:{pol_id}:"):
-                            canonical_rf_rows = db.query(RollforwardSummary).filter(
-                                RollforwardSummary.run_id == valuation_run_id,
-                                RollforwardSummary.project_id == project_id,
-                                RollforwardSummary.trace_identifier == trace_id,
-                            ).all()
-                            if canonical_rf_rows:
-                                all_continuous = all(bool(r.is_continuity_verified) for r in canonical_rf_rows)
-                                primary_candidates = [r for r in canonical_rf_rows if not r.is_movement]
-                                rf_primary = primary_candidates[0] if primary_candidates else canonical_rf_rows[0]
-
-                                db_movements = {
-                                    r.component_name: float(r.movement_amount)
-                                    for r in canonical_rf_rows if r.is_movement
-                                }
-                                art_movements = {
-                                    str(k): float(v)
-                                    for k, v in (rf_doc.get("movements") or {}).items()
-                                }
-
-                                movements_match = (
-                                    set(db_movements.keys()) == set(art_movements.keys())
-                                    and all(abs(db_movements[k] - art_movements[k]) < 1e-4 for k in db_movements)
-                                )
-
-                                balance_match = (
-                                    abs(float(rf_primary.opening_balance) - float(rf_doc.get("opening_balance", 0.0))) < 1e-4
-                                    and abs(float(rf_primary.closing_balance) - float(rf_doc.get("ending_balance", 0.0))) < 1e-4
-                                )
-
-                                if all_continuous and movements_match and balance_match:
-                                    persisted_rf_ok = True
-                                    rf_verified = True
-                                    rf_persisted_movements = db_movements
-                                    if bool(rollforward_result.get("is_continuous")) != all_continuous:
-                                        rf_verified = False
-        except Exception:
-            rf_verified = False
-            persisted_rf_ok = False
+    rf_primary = rf_eval.get("primary_summary")
+    selected_rf_art = rf_eval.get("selected_artifact")
+    rf_persisted_movements = rf_eval.get("movements") or {}
+    canonical_rf_rows = rf_eval.get("canonical_rf_rows") or []
 
     if not val_detail_consistent or not pkg_consistent:
         governance_status = "REJECTED_NON_APPROVED"
@@ -2334,7 +3326,7 @@ def execute_reporting_manifest(
         "rollforward": {
             "summary_id": rf_primary_item.id if rf_primary_item else None,
             "artifact_id": selected_rf_art.id if selected_rf_art else None,
-            "is_continuous": persisted_rf_ok,
+            "is_continuous": persisted_rf_ok and rf_verified,
             "attribution_mode": (
                 "MULTI_PERIOD_PERSISTED_VALUATION_COMPARISON"
                 if val_run and getattr(val_run, "prior_valuation_run_id", None)
@@ -2343,7 +3335,12 @@ def execute_reporting_manifest(
             "opening": float(rf_primary_item.opening_balance) if rf_primary_item else None,
             "movements": rf_persisted_movements if rf_persisted_movements else rollforward_result.get("movements", {}),
             "ending": float(rf_primary_item.closing_balance) if rf_primary_item else None,
-            "difference": float(rf_primary_item.continuity_difference) if rf_primary_item else 0.0,
+            "difference": float(
+                rf_eval.get("recomputed_difference")
+                if rf_eval.get("recomputed_difference") is not None
+                else (rf_primary_item.continuity_difference if rf_primary_item else 0.0)
+            ),
+            "reason": rf_eval.get("reason"),
         },
         "reconciliation": {
             "report_id": rec_row.id if rec_row else None,

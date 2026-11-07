@@ -1045,6 +1045,7 @@ def test_p0_06_and_v5_p0_f_governed_benchmark_reconciliation_and_v5_p1_i_reporti
             methodology="VM22",
             methodology_version="v1",
             valuation_date=date(2026, 12, 31),
+            accepted_attempt_number=1,
         )
         detail = ValuationRunDetail(
             run_id=val_run_id,
@@ -1102,6 +1103,23 @@ def test_p0_06_and_v5_p0_f_governed_benchmark_reconciliation_and_v5_p1_i_reporti
             continuity_difference=0.0,
             trace_identifier="VERIFIED:tol-policy-m5-standard:trace-01",
         )
+        rf_movement = RollforwardSummary(
+            id=f"rf-mov-{uuid.uuid4().hex[:8]}",
+            run_id=val_run_id,
+            project_id=proj_id,
+            cohort_id="COHORT_MYGA_2026",
+            methodology="VM22",
+            basis="STATUTORY",
+            component_name="discount_unwind",
+            component_order=1,
+            is_movement=True,
+            opening_balance=100000.0,
+            movement_amount=25000.0,
+            closing_balance=actual_reserve,
+            is_continuity_verified=True,
+            continuity_difference=0.0,
+            trace_identifier="VERIFIED:tol-policy-m5-standard:trace-01",
+        )
         import json
         import hashlib
         from app.core.artifacts import get_artifact_store
@@ -1116,7 +1134,7 @@ def test_p0_06_and_v5_p0_f_governed_benchmark_reconciliation_and_v5_p1_i_reporti
             "trace_identifier": "VERIFIED:tol-policy-m5-standard:trace-01",
             "opening_balance": 100000.0,
             "ending_balance": actual_reserve,
-            "movements": {},
+            "movements": {"discount_unwind": 25000.0},
             "difference": 0.0,
             "tolerance": 0.05,
         }
@@ -1137,7 +1155,7 @@ def test_p0_06_and_v5_p0_f_governed_benchmark_reconciliation_and_v5_p1_i_reporti
             storage_backend="local",
             file_format="json",
             schema_version="m2-v1",
-            row_count=1,
+            row_count=2,
             checksum_sha256=hashlib.sha256(rf_bytes).hexdigest(),
             partition={
                 "summary_id": rf_summary.id,
@@ -1146,7 +1164,15 @@ def test_p0_06_and_v5_p0_f_governed_benchmark_reconciliation_and_v5_p1_i_reporti
                 "trace_identifier": "VERIFIED:tol-policy-m5-standard:trace-01",
             },
         )
-        db.add_all([r, detail, val_pkg, rf_summary, rf_art])
+        r_att = RunAttempt(
+            id=f"att-{val_run_id}",
+            run_id=val_run_id,
+            attempt_number=1,
+            status="success",
+            output_row_count=1,
+            trace_row_count=0,
+        )
+        db.add_all([r, r_att, detail, val_pkg, rf_summary, rf_movement, rf_art])
 
         # 1. Seed four-eyes approved multi-row scoped ExpectedResultSet (matching row + other cohort row)
         ers_scoped_rows = [

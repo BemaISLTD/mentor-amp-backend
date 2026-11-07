@@ -5,11 +5,11 @@
 > This document is a **Living Requirements Traceability and Execution Ledger** derived from the project's authoritative source documents. It does **NOT** replace, supersede, or alter them.  
 > **If this ledger conflicts with an authoritative source document, the authoritative source wins until the conflict is deliberately resolved, approved, and formally documented.**
 
-**Document Version:** 3.2 (M5 Senior Review V8 Findings Resolved — Bundle v9 Ready)  
-**Date:** November 4, 2026  
-**Status:** Working Execution Ledger — Independent Senior Review Ready (M5A–M5D Foundation & Dagster Orchestration Verified Locally; M5E Reference Verticals Gated)  
+**Document Version:** 3.3 (M5 Comprehensive Final Engineering Closure & Release Readiness — Final Foundation Bundle Ready)  
+**Date:** November 6, 2026  
+**Status:** Working Execution Ledger — Milestone 5 Comprehensive Final Foundation Closure Complete (M5A–M5D Foundation, Independent Rollforward Verification, Dagster Orchestration Verified Locally; M5E Reference Verticals Gated under ACT-DEC-01..09)  
 **Current Git Branch:** `feat/m5-valuation-frameworks-dagster`  
-**Prior Reviewed Baseline SHA:** `513eeb20b5a55fc53af16610c99f365b858c1913` (`513eeb2`) — V8 HEAD SHA recorded in `00_REVIEW_OVERVIEW_AND_MANIFEST.md` and `patches/git_log_graph.txt`  
+**Prior Reviewed Baseline SHA:** `1ce25f1fd5f594a7ce21c0dd2cae64868e8b74eb` (`1ce25f1`) — V9 HEAD SHA recorded in `00_FINAL_FOUNDATION_CLOSURE_MANIFEST.md` and `patches/git_log.txt`  
 **Alembic Head Revision:** `c9f4e2d8a615` (Single canonical head)  
 **Engine Build Identity:** `m3-cpu-dsl-1`  
 
@@ -167,7 +167,7 @@ Every major completion claim is audited against concrete evidence files, commit 
 | **Statutory Model #805 Implementation** | `DOWNGRADED: Illustrative Contractual Nonforfeiture Floor Only` | `backend/app/core/products/myga.py` | `f6708d1` | Local Python CPU | Full Model #805 statutory rules pending |
 | **Weeks 0–3 Substantially Done** | `DOWNGRADED: Backend Substantial; Frontend Integration & Actuarial Gates Pending` | `sam_m3_frontend_spec.md`, `PROJECT_MASTER_TRACKER.md` | `f6708d1` | Local codebase | Full-team integration review pending |
 | **MYGA-10001 Benchmark & Inforce Package** | `VERIFIED` | `samples/myga/synthetic_myga_inforce_10001.csv`, `samples/myga/expected_reference_myga_10001.csv`, `generate_myga_samples.py`, `test_seed_demo_multi_product.py` | Working Tree | Python 3.14.2, pytest-8.4.2 | 100% pass across 60 months; max abs diff 0.00e+00; 512 tests passing |
-| **M5 V8 Foundation, Governed Reporting Gate & Scoped Reconciliation (616 Tests)** | `LOCAL AGENT EVIDENCE — VERIFIED ON DISPOSABLE POSTGRESQL; PENDING INDEPENDENT SENIOR REVIEW` | `evidence/unit_tests.log` (372 pass), `evidence/integration_tests.log` (219 pass, 2 skip), `evidence/postgres_tests.log` (25 pass), `evidence/governance_hardening_evidence.log` (7 pass), `evidence/combined_tests.log` (591 pass, 2 skip) | V8 HEAD (`patches/git_log_graph.txt`) | Windows 11, Python 3.14.2, PostgreSQL `mentoramp_m5_disposable_test` | Pending Senior Review of `mentoramp_m5_senior_review_bundle_v8.zip` |
+| **M5 Final Foundation Closure, Independent Rollforward Verification & Governed Reporting Gate (637 Tests / 635 Passed, 2 Skipped)** | `LOCAL AGENT EVIDENCE — VERIFIED ON DISPOSABLE POSTGRESQL; PENDING INDEPENDENT SENIOR REVIEW` | `evidence/unit_tests.log` (391 pass, 286.88s), `evidence/integration_tests.log` (219 pass, 2 skip, 432.60s), `evidence/postgres_tests.log` (25 pass, 141.91s), `evidence/governance_hardening_evidence.log` (7 pass, 58.68s), `evidence/rollforward_closure_evidence.log` (19 pass, 66.79s), `evidence/combined_tests.log` (610 pass, 2 skip) | Final Foundation HEAD (`patches/git_log.txt`) | Windows 11, Python 3.14.2, PostgreSQL `mentoramp_m5_disposable_test` | Complete Final Engineering Closure for Milestone 5 (`mentoramp_m5_final_foundation_closure_bundle.zip`) |
 
 ---
 
@@ -834,6 +834,21 @@ ightarrow$ reporting.
   - **V7-P1-04 (Derived Dataset Approval-Time Physical Checksum Verification):** `approve_derived_dataset` unconditionally re-reads physical Parquet file bytes from disk and recalculates SHA-256 against `dataset.fingerprint` and `source_artifact.checksum_sha256`.
   - **V7-P1-05 (Single-Invocation Combined Test Evidence & Clean Worktree):** Single-invocation `combined_tests.log` capturing 591 passed, 2 skipped across unit and integration suites; `.gitignore` updated with `bundle_v*/` ensuring worktree is completely clean.
   - **V7-P2-06 (Undefined target_metric Fallback Fix):** Safe variable extraction in `execute_reporting_manifest` when `rec_row.variables_requested` is empty, failing closed cleanly without `NameError`.
+* **M5 Final Engineering Closure & V9 Findings Resolution (November 7, 2026 — Final Acceptance Handoff Ready):**
+  - **V9-P0-01 (Incomplete Independent Rollforward Verification & Attempt Lineage):**
+    - Independently recomputes arithmetic continuity from authenticated artifact evidence: ExpectedClosing = OpeningBalance + Sum(VerifiedSignedMovements), Difference = ActualClosing - ExpectedClosing, strictly requiring abs(Difference) <= effective_tolerance. Unconditionally rejects stored is_continuous: True status as proof of mathematical correctness.
+    - Governed tolerance policy verification: resolves approved policy identifier against GOVERNED_APPROVED_TOLERANCE_POLICIES, enforces authorized parameters (max_tolerance, target_metric), and rejects unapproved, negative, nonfinite, or excessive tolerances (> 0.05). Rejects arbitrary caller tolerance overrides on failed comparisons.
+    - Authoritative execution-attempt contract & lineage consistency:
+      - Canonical valuation execution in `execute_foundation_valuation` now consistently creates and persists a canonical `RunAttempt` row (`attempt_number=1`, `status="success"`).
+      - In `evaluate_rollforward_evidence`, eliminated silent fallback `accepted_attempt_number or 1`.
+      - Requires strictly terminal success status (`val_run.status in VALID_SUCCESS_STATUSES`), unconditionally rejecting pending, running, failed, cancelled, or unknown statuses.
+      - When `RunAttempt` records exist: enforces non-null `accepted_attempt_number` matching an attempt record with `status in ("SUCCESS", "PARTIAL_SUCCESS")`. Artifact must match `art.attempt_number == accepted_attempt_number`. Superseded, failed, or stale attempts are rejected.
+      - Direct valuation execution contract (zero attempt records): strictly requires `val_run.run_type == "valuation"`, `val_run.attempt_count <= 1`, terminal success, and valid `accepted_attempt_number >= 1` (or 1 if omitted for single attempt). If `attempt_count > 1` without attempt records, release is rejected.
+      - Non-valuation runs (e.g. projection runs) strictly require `RunAttempt` records and fail closed if absent.
+    - Persisted evidence agreement: verifies exact agreement between physical artifact, recomputed SHA-256 byte checksum, PostgreSQL RollforwardSummary, persisted RollforwardMovement components, ValuationRunDetail, and canonical Run. Cross-checks all summary IDs, trace identities, dimensions (basis, methodology, cohort, valuation date), and component keys/amounts.
+    - Reserve reconciliation: reconciles authenticated closing balance against persisted valuation reserve (ValuationRunDetail.summary_results["present_value_reserve"]), rejecting scope or basis mismatches.
+    - Fabricated continuity elimination: rejects nonfinite float values (NaN, Inf), forbids residual balancing aliases (balancing_residual, balancing_adjustment, reconciliation_discrepancy, plug_balance, residual_plug, plug_residual), and treats unverified movement sources as release blockers.
+    - Dedicated test suite `test_m5_final_rollforward_closure.py` (19 tests: 15 negative, 3 positive, 1 adversarial) covers all 10 V9 mandated negative tests, 5 attempt-lineage negative tests, canonical RunAttempt creation, direct valuation single-attempt contract, and authentic positive governed release.
 
 ---
 
