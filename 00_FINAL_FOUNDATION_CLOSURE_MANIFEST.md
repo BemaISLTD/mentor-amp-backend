@@ -78,3 +78,14 @@ In strict adherence to the Controlling Engineering Specification:
 - No premature claim of full actuarial completion is made for these verticals.
 - No synthetic regulatory accounting formulas or fabricated statutory reserves have been asserted.
 - The repository branch remains `feat/m5-valuation-frameworks-dagster`. No merge to `main` has occurred.
+
+---
+
+## 5. Documented Nonblocking Limitations & Production-Policy Review
+
+1. **Legacy Direct-Valuation Execution Path Limitation:**  
+   The execution lineage validator in `evaluate_rollforward_evidence` includes a backward-compatibility path allowing direct valuation runs without `RunAttempt` records to verify lineage if and only if `run_type == "valuation"`, `status in VALID_SUCCESS_STATUSES`, and `attempt_count <= 1`. Standard valuation execution (`execute_foundation_valuation`) now consistently creates and commits canonical `RunAttempt` rows. This legacy single-attempt direct valuation path is treated strictly as a **documented nonblocking limitation requiring production-policy review**, not proof of recorded attempt success. Multi-attempt runs without attempt records fail closed unconditionally.
+2. **Proprietary LifeLib Parity Skipping in Local CI:**  
+   Two integration tests (`test_spia_product_golden` and `test_external_lifelib_parity`) are skipped in local CI because they require external proprietary LifeLib binaries per `CAS` §17. Internal golden tests pass with 100% precision.
+3. **Excluded Documentation Scope:**  
+   Unrelated Noah actuarial assumption-engine task documentation (`NOAH_ACTUARIAL_ASSUMPTION_AND_FACTOR_TABLE_ENGINE_README.md`) has been excluded from the M5 merge payload and preserved separately on branch `feat/noah-assumption-engine-spec`.
