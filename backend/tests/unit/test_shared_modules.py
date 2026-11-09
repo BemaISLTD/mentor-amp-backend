@@ -6,7 +6,7 @@ from app.products.shared_modules.buffer_floor import buffer_payoff, floor_payoff
 from app.products.shared_modules.indexed_crediting import ptp_cap_pr_crediting, ptp_spread_crediting, monthly_average_return
 from app.products.shared_modules.segment import SegmentState, rollforward_segment_term
 from app.products.shared_modules.withdrawal import apply_partial_withdrawal
-from app.products.shared_modules.fixed_crediting import fixed_crediting
+from app.products.shared_modules.fixed_crediting import fixed_account_rollforward, fixed_crediting
 from app.products.shared_modules.account_value import rollforward_account_value
 from app.products.shared_modules.option_budget import lookup_factor, derive_option_budget
 from app.products.shared_modules.surrender_charge import schedule_rate
@@ -30,6 +30,77 @@ def test_crediting_vectors():
     assert monthly_average_return([100, 110, 120], 100) == .1
     assert fixed_crediting(100, .21, 6) == pytest.approx(10)
     assert rollforward_account_value(100, interest=-10, withdrawal=5) == 85
+
+
+@pytest.mark.parametrize(
+    ("annual_rate", "months", "withdrawal", "expected"),
+    [
+        (0.21, 6, 30.0, 80.0),
+        (0.0, 12, 25.0, 75.0),
+        (-0.36, 12, 14.0, 50.0),
+    ],
+)
+def test_fixed_account_rollforward_applies_eom_withdrawal_after_crediting(
+    annual_rate, months, withdrawal, expected
+):
+    closing = fixed_account_rollforward(
+        100.0,
+        withdrawal=withdrawal,
+        annual_rate=annual_rate,
+        months=months,
+    )
+    assert closing == pytest.approx(expected)
+
+
+def test_fixed_account_rollforward_conserves_value_with_premium_and_withdrawal():
+    opening = 100.0
+    premium = 20.0
+    annual_rate = 0.1025
+    months = 6
+    withdrawal = 15.0
+    interest = fixed_crediting(opening + premium, annual_rate, months)
+    closing = fixed_account_rollforward(
+        opening,
+        premium=premium,
+        withdrawal=withdrawal,
+        annual_rate=annual_rate,
+        months=months,
+    )
+    assert closing + withdrawal == pytest.approx(opening + premium + interest)
+
+
+def test_fixed_account_rollforward_rejects_withdrawal_above_post_crediting_value():
+    with pytest.raises(ValueError, match="Withdrawal exceeds"):
+        fixed_account_rollforward(
+            100.0,
+            withdrawal=100.0,
+            annual_rate=-0.50,
+            months=12,
+        )
+    assert fixed_account_rollforward(
+        100.0,
+        withdrawal=50.0,
+        annual_rate=-0.50,
+        months=12,
+    ) == pytest.approx(0.0)
+    with pytest.raises(ValueError, match="Withdrawal exceeds"):
+        fixed_account_rollforward(100.0, withdrawal=-1.0)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"account_value": float("nan")},
+        {"account_value": float("inf")},
+        {"account_value": 100.0, "premium": float("nan")},
+        {"account_value": 100.0, "withdrawal": float("inf")},
+        {"account_value": 100.0, "annual_rate": float("nan")},
+        {"account_value": 100.0, "months": float("inf")},
+    ],
+)
+def test_fixed_account_rollforward_rejects_nonfinite_inputs(kwargs):
+    with pytest.raises(ValueError):
+        fixed_account_rollforward(**kwargs)
 
 
 @pytest.mark.parametrize("mode,base", [("pro_rata", 80), ("dollar_for_dollar", 78)])

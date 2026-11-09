@@ -15,6 +15,7 @@ def fixed_account_rollforward(account_value: float, premium: float = 0.0,
     balance = account_value + premium
     if not all(math.isfinite(v) for v in (account_value, premium, withdrawal)) or min(account_value, premium) < 0:
         raise ValueError("Invalid fixed-account balances")
-    if withdrawal < 0 or withdrawal > balance:
+    available = balance + fixed_crediting(balance, annual_rate, months)
+    if withdrawal < 0 or withdrawal > available:
         raise ValueError("Withdrawal exceeds fixed account balance")
-    return max(0.0, balance - withdrawal + fixed_crediting(balance, annual_rate, months))
+    return available - withdrawal
