@@ -59,6 +59,19 @@ class YieldCurve:
     methodology: str | None = None
 
     def __post_init__(self) -> None:
+        if isinstance(self.tenor_years, (str, bytes)) or isinstance(
+            self.rates, (str, bytes)
+        ):
+            raise CurveMethodologyError("Curve tenors and rates must be numerical sequences.")
+        try:
+            frozen_tenors = tuple(float(value) for value in self.tenor_years)
+            frozen_rates = tuple(float(value) for value in self.rates)
+        except (TypeError, ValueError) as exc:
+            raise CurveMethodologyError(
+                "Curve tenors and rates must be numerical sequences."
+            ) from exc
+        object.__setattr__(self, "tenor_years", frozen_tenors)
+        object.__setattr__(self, "rates", frozen_rates)
         try:
             object.__setattr__(self, "curve_type", YieldCurveType(self.curve_type))
         except (TypeError, ValueError) as exc:

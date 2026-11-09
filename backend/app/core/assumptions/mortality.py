@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 from numbers import Integral
 
-from .table_engine import ActuarialTable, DimensionType, TableSchemaError
+from .table_engine import ActuarialTable, DimensionType, TableDimension, TableSchemaError
 
 
 class MortalityMethodError(ValueError):
@@ -23,6 +23,43 @@ class MortalityMethodError(ValueError):
 class ImprovementProjectionMode(str, Enum):
     FIXED_ATTAINED_AGE = "FIXED_ATTAINED_AGE"
     GENERATIONAL = "GENERATIONAL"
+
+
+def _required_dimension(
+    table: ActuarialTable,
+    name: str,
+    dimension_type: DimensionType,
+) -> TableDimension:
+    try:
+        dimension = table.dimension(name)
+    except KeyError as exc:
+        raise TableSchemaError(f"Mortality table lacks {name!r} dimension.") from exc
+    if dimension.dimension_type != dimension_type:
+        raise TableSchemaError(
+            f"Mortality table dimension '{name}' must be {dimension_type.value}."
+        )
+    return dimension
+
+
+def _validate_categorical_token(table: ActuarialTable, name: str, value: str) -> None:
+    dimension = _required_dimension(table, name, DimensionType.CATEGORICAL)
+    if value not in dimension.values:
+        raise ValueError(f"Invalid categorical value for '{name}': {value!r}.")
+
+
+def _validate_projection_contract(
+    table: ActuarialTable,
+    *,
+    sex: str,
+    terminal_age: int | None,
+) -> None:
+    age_dimension = _required_dimension(table, "attained_age", DimensionType.INTEGER)
+    _validate_categorical_token(table, "sex", sex)
+    if terminal_age is not None and terminal_age not in age_dimension.values:
+        raise MortalityMethodError(
+            f"Terminal age {terminal_age} is not present in the selected table grid "
+            f"[{age_dimension.values[0]}, {age_dimension.values[-1]}]."
+        )
 
 
 def _strict_integer(value: object, label: str) -> int:
@@ -109,6 +146,7 @@ class MortalityTable:
 
     def qx(self, attained_age: int, sex: str, **additional_coordinates: object) -> float:
         attained_age = _strict_integer(attained_age, "attained_age")
+        _validate_categorical_token(self.table, self.sex_dimension, sex)
         if attained_age >= self.terminal_age:
             return 1.0
         value = self.table.lookup_scalar(
@@ -174,6 +212,13 @@ def project_scale_g2(
         terminal_age = _strict_integer(terminal_age, "terminal_age")
     base, target = _validate_projection_years(base_year, projection_year)
     mode = ImprovementProjectionMode(mode)
+    _validate_projection_contract(
+        improvement_table,
+        sex=sex,
+        terminal_age=terminal_age,
+    )
+    if terminal_age is not None and attained_age >= terminal_age:
+        return 1.0
     for year in range(base + 1, target + 1):
         age = _projection_age(attained_age, base, year, mode)
         if terminal_age is not None and age >= terminal_age:
@@ -202,6 +247,13 @@ def project_mp_improvement(
         terminal_age = _strict_integer(terminal_age, "terminal_age")
     base, target = _validate_projection_years(base_year, projection_year)
     mode = ImprovementProjectionMode(mode)
+    _validate_projection_contract(
+        improvement_table,
+        sex=sex,
+        terminal_age=terminal_age,
+    )
+    if terminal_age is not None and attained_age >= terminal_age:
+        return 1.0
     for year in range(base + 1, target + 1):
         age = _projection_age(attained_age, base, year, mode)
         if terminal_age is not None and age >= terminal_age:

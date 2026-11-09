@@ -34,6 +34,15 @@ class IllustrativeLapseSchedule:
     grading_years: int = 3
 
     def __post_init__(self) -> None:
+        if isinstance(self.early_duration_rates, (str, bytes)):
+            raise BehaviorModelError("Early-duration lapse rates must be a numerical sequence.")
+        try:
+            frozen_rates = tuple(float(rate) for rate in self.early_duration_rates)
+        except (TypeError, ValueError) as exc:
+            raise BehaviorModelError(
+                "Early-duration lapse rates must be a numerical sequence."
+            ) from exc
+        object.__setattr__(self, "early_duration_rates", frozen_rates)
         if not self.early_duration_rates:
             raise BehaviorModelError("At least one surrender-period lapse rate is required.")
         rates = (

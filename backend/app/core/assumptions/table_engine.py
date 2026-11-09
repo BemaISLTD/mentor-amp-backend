@@ -80,6 +80,17 @@ class TableDimension:
     values: tuple[Any, ...]
 
     def __post_init__(self) -> None:
+        if isinstance(self.values, (str, bytes)):
+            raise TableSchemaError(
+                f"Dimension '{self.name}' values must be a sequence, not text."
+            )
+        try:
+            frozen_values = tuple(self.values)
+        except TypeError as exc:
+            raise TableSchemaError(
+                f"Dimension '{self.name}' values must be an iterable sequence."
+            ) from exc
+        object.__setattr__(self, "values", frozen_values)
         try:
             object.__setattr__(self, "dimension_type", DimensionType(self.dimension_type))
         except (TypeError, ValueError) as exc:

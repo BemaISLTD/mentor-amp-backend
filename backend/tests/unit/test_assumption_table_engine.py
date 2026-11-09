@@ -272,6 +272,8 @@ def test_configurable_terminal_age_is_validated_against_selected_table():
         MortalityTable(table, terminal_age=46.0)
     with pytest.raises(MortalityMethodError, match="integer"):
         mortality.qx(45.5, "M")
+    with pytest.raises(ValueError, match="Invalid categorical"):
+        mortality.qx(46, "INVALID")
 
 
 def test_scale_g2_fixed_age_and_generational_projection_are_distinct():
@@ -359,6 +361,63 @@ def test_generational_terminal_age_safeguard_overrides_improvement():
     ) == 1.0
 
 
+@pytest.mark.parametrize("projection", [project_scale_g2, project_mp_improvement])
+def test_terminal_age_protection_is_unconditional_for_all_projection_methods(projection):
+    dimensions = [
+        TableDimension("attained_age", DimensionType.INTEGER, (40, 41, 42)),
+        TableDimension("sex", DimensionType.CATEGORICAL, ("M",)),
+    ]
+    values = [[0.01], [0.01], [0.01]]
+    if projection is project_mp_improvement:
+        dimensions.append(
+            TableDimension("calendar_year", DimensionType.INTEGER, (2026, 2027))
+        )
+        values = np.asarray([[[0.01, 0.01]], [[0.01, 0.01]], [[0.01, 0.01]]])
+    table = approved_table(tuple(dimensions), values)
+
+    common = {
+        "improvement_table": table,
+        "sex": "M",
+        "base_year": 2026,
+        "projection_year": 2026,
+        "terminal_age": 42,
+    }
+    assert projection(0.20, attained_age=42, **common) == 1.0
+    assert projection(0.20, attained_age=43, **common) == 1.0
+    assert projection(0.20, attained_age=40, **common) == pytest.approx(0.20)
+
+    with pytest.raises(ValueError, match="Invalid categorical"):
+        projection(0.20, attained_age=42, **{**common, "sex": "INVALID"})
+    with pytest.raises(MortalityMethodError, match="not present"):
+        projection(0.20, attained_age=40, **{**common, "terminal_age": 99})
+
+
+@pytest.mark.parametrize("projection", [project_scale_g2, project_mp_improvement])
+def test_terminal_age_reached_during_generational_projection_is_unconditional(projection):
+    dimensions = [
+        TableDimension("attained_age", DimensionType.INTEGER, (40, 41, 42)),
+        TableDimension("sex", DimensionType.CATEGORICAL, ("M",)),
+    ]
+    values = [[0.01], [0.01], [0.01]]
+    if projection is project_mp_improvement:
+        dimensions.append(
+            TableDimension("calendar_year", DimensionType.INTEGER, (2026, 2027))
+        )
+        values = np.asarray([[[0.01, 0.01]], [[0.01, 0.01]], [[0.01, 0.01]]])
+    table = approved_table(tuple(dimensions), values, table_id="terminal-mid-v1")
+
+    assert projection(
+        0.20,
+        table,
+        attained_age=40,
+        sex="M",
+        base_year=2025,
+        projection_year=2027,
+        mode=ImprovementProjectionMode.GENERATIONAL,
+        terminal_age=42,
+    ) == 1.0
+
+
 def test_illustrative_lapse_schedule_has_exact_expiration_shock_and_grading():
     schedule = IllustrativeLapseSchedule(
         early_duration_rates=(0.02,) * 7,
@@ -424,6 +483,60 @@ def test_table_array_is_immutable_and_self_approval_is_rejected():
             approved_at="2026-01-02T00:00:00Z",
             fingerprint_sha256="0" * 64,
         )
+
+
+def test_constructor_sequences_are_defensively_frozen_against_external_mutation():
+    axis = [0.0, 10.0]
+    dimension = TableDimension("x", DimensionType.CONTINUOUS, axis)
+    table = approved_table(
+        (dimension,),
+        [0.0, 100.0],
+        interpolation=InterpolationMethod.LINEAR,
+    )
+    assert table.lookup_scalar(x=5.0) == pytest.approx(50.0)
+    axis[0] = 4.0
+    assert dimension.values == (0.0, 10.0)
+    assert table.lookup_scalar(x=5.0) == pytest.approx(50.0)
+    assert table.verify_fingerprint()
+    with pytest.raises(TypeError):
+        dimension.values[0] = 4.0
+
+    registry = ActuarialTableRegistry()
+    registry.register(table)
+    registered = registry.get(table.governance.table_id)
+    assert registered.lookup_scalar(x=5.0) == pytest.approx(50.0)
+    assert registered.verify_fingerprint()
+
+
+def test_yield_curve_and_lapse_schedule_defensively_freeze_input_sequences():
+    tenors = [1.0, 2.0]
+    rates = [0.02, 0.04]
+    curve = YieldCurve(
+        curve_id="immutable-spot",
+        curve_type=YieldCurveType.SPOT_ZERO,
+        tenor_years=tenors,
+        rates=rates,
+        source_reference="Synthetic immutable-input test",
+        effective_date="2026-01-01",
+    )
+    assert curve.rate(1.5) == pytest.approx(0.03)
+    tenors[0] = 0.5
+    rates[1] = 0.40
+    assert curve.tenor_years == (1.0, 2.0)
+    assert curve.rates == (0.02, 0.04)
+    assert curve.rate(1.5) == pytest.approx(0.03)
+
+    early_rates = [0.02, 0.03]
+    schedule = IllustrativeLapseSchedule(
+        early_duration_rates=early_rates,
+        expiration_shock_rate=0.20,
+        post_shock_rate=0.08,
+        ultimate_rate=0.06,
+    )
+    assert baseline_lapse_rate(1, schedule) == pytest.approx(0.02)
+    early_rates[0] = 0.40
+    assert schedule.early_duration_rates == (0.02, 0.03)
+    assert baseline_lapse_rate(1, schedule) == pytest.approx(0.02)
 
 
 def test_table_tampering_is_rejected_by_governance_fingerprint():
