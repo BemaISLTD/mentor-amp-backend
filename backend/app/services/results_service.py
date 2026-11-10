@@ -26,6 +26,7 @@ from app.core.execution import run_state
 from app.core.projection_engine.engine import month_end_after
 from app.db.models.modeling import Model, ModelPublishedOutput
 from app.db.models.projection import ProjectionSet, RunSet
+from app.db.models.rollforward import RollforwardSummary
 from app.db.models.run import Run
 from app.db.models.scenario import ScenarioTable
 from app.services import access, catalog_service
@@ -650,4 +651,81 @@ def dashboard(db: Session, project_id: str) -> dict[str, Any]:
         ],
         "recent_investigations": [],
         "continue_investigation": None,
+    }
+
+
+
+def valuation_detail(db: Session, run_id: str) -> dict[str, Any]:
+    """Valuation execution detail and reserve balances for a run."""
+    run = get_run(db, run_id)
+    val_detail = getattr(run, "valuation_detail", None)
+    if isinstance(val_detail, (list, tuple)):
+        val_detail = val_detail[0] if val_detail else None
+    if val_detail is not None:
+        return {
+            "run_id": run.id,
+            "project_id": run.project_id,
+            "status": run.status,
+            "methodology": getattr(run, "methodology", None),
+            "basis": getattr(run, "basis", None),
+            "valuation_date": iso(val_detail.valuation_date),
+            "discount_curve_fingerprint": val_detail.discount_curve_fingerprint,
+            "configuration": val_detail.configuration,
+            "summary_results": val_detail.summary_results,
+            "created_at": iso(val_detail.created_at),
+            "completed_at": iso(val_detail.completed_at) if val_detail.completed_at else None,
+            "has_valuation_detail": True,
+        }
+
+    run_sum = summary(db, run_id) if run.status in run_state.RESULT_STATUSES else {}
+    return {
+        "run_id": run.id,
+        "project_id": run.project_id,
+        "status": run.status,
+        "methodology": getattr(run, "methodology", None) or "GENERAL_PROJECTION",
+        "basis": getattr(run, "basis", None) or "STATUTORY",
+        "valuation_date": run_sum.get("valuation_date"),
+        "headline": run_sum.get("headline"),
+        "totals": run_sum.get("totals"),
+        "has_valuation_detail": False,
+    }
+
+
+def rollforward_summary(db: Session, run_id: str) -> dict[str, Any]:
+    """Rollforward attribution schedule and unbroken continuity evidence."""
+    run = get_run(db, run_id)
+    rows = (
+        db.query(RollforwardSummary)
+        .filter(RollforwardSummary.run_id == run_id)
+        .order_by(RollforwardSummary.cohort_id, RollforwardSummary.component_order)
+        .all()
+    )
+    items = [
+        {
+            "id": r.id,
+            "run_id": r.run_id,
+            "project_id": r.project_id,
+            "cohort_id": r.cohort_id,
+            "methodology": r.methodology,
+            "basis": r.basis,
+            "currency": r.currency,
+            "component_name": r.component_name,
+            "component_order": r.component_order,
+            "is_movement": r.is_movement,
+            "opening_balance": float(r.opening_balance),
+            "movement_amount": float(r.movement_amount),
+            "closing_balance": float(r.closing_balance),
+            "is_continuity_verified": r.is_continuity_verified,
+            "continuity_difference": float(r.continuity_difference),
+            "trace_identifier": r.trace_identifier,
+            "created_at": iso(r.created_at),
+        }
+        for r in rows
+    ]
+    return {
+        "run_id": run_id,
+        "project_id": run.project_id,
+        "count": len(items),
+        "continuity_verified": all(item["is_continuity_verified"] for item in items) if items else None,
+        "items": items,
     }

@@ -151,3 +151,16 @@ def compare_runs(
     return results_service.compare_runs(
         db, user, baseline_run_id, current_run_id, variables, group_by, include_partial,
     )
+
+
+
+@router.get("/runs/{run_id}/valuation-detail")
+def run_valuation_detail(run_id: str, user: RunReader, db: Session = Depends(get_db)):
+    del user
+    return results_service.valuation_detail(db, run_id)
+
+
+@router.get("/runs/{run_id}/rollforward")
+def run_rollforward(run_id: str, user: RunReader, db: Session = Depends(get_db)):
+    del user
+    return results_service.rollforward_summary(db, run_id)
