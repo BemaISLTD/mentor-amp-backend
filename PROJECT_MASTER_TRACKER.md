@@ -5,12 +5,20 @@
 > This document is a **Living Requirements Traceability and Execution Ledger** derived from the project's authoritative source documents. It does **NOT** replace, supersede, or alter them.  
 > **If this ledger conflicts with an authoritative source document, the authoritative source wins until the conflict is deliberately resolved, approved, and formally documented.**
 
-**Document Version:** 3.4 (M5 Technical Foundation Merge Preparation & Formal Review Ready)  
-**Date:** November 7, 2026  
-**Status:** Working Execution Ledger — M5 Technical Foundation Complete & Ready for Formal Merge Review (M5A–M5D Foundation, Independent Rollforward Verification, Dagster Orchestration Verified Locally; M5E Reference Verticals Gated under ACT-DEC-01..09)  
-**Current Git Branch:** `feat/m5-valuation-frameworks-dagster`  
-**Prior Reviewed Baseline SHA:** `1ce25f1fd5f594a7ce21c0dd2cae64868e8b74eb` (`1ce25f1`) — V9 HEAD SHA recorded in `00_FINAL_FOUNDATION_CLOSURE_MANIFEST.md` and `patches/git_log.txt`  
-**Alembic Head Revision:** `c9f4e2d8a615` (Single canonical head)  
+**Document Version:** 3.5 (Backend Convergence Integration: M4 FIA/RILA Foundation + M5 Valuation Frameworks + Central Assumption Engine)  
+**Date:** November 10, 2026  
+**Status:** Working Execution Ledger — Backend Convergence & Integration Ready (M4 FIA/RILA Foundation, M5A–M5D Technical Foundation, Dagster Orchestration, and Noah Assumption & Factor Table Engine)  
+**Current Git Branch:** eat/backend-convergence-apis-integration  
+**Prior Reviewed Baseline SHA:** fe3948 (Merge pull request #9 from BemaISLTD/feat/m5-valuation-frameworks-dagster)  
+**Alembic Head Revision:** c9f4e2d8a615 (Single canonical head)  
+
+**M4 engineering update (2026-11-01 / 2026-11-09): MERGED TO CONVERGENCE BRANCH.**
+Shared indexed primitives, executable illustrative FIA/RILA declarations, fixed crediting post-withdrawal safeguards, and the
+30-policy / 4-scenario / 72-month RILA harness now follow the existing frozen
+projection, Parquet, trace and reconciliation chain. See
+[docs/m4/IMPLEMENTATION.md](docs/m4/IMPLEMENTATION.md) for engineering evidence,
+limitations and ACT-M4-DEC-01..15 pending decisions. Synthetic runs are sandbox;
+Option 1 MYGA reference data and reconciliation are unchanged.
 **Engine Build Identity:** `m3-cpu-dsl-1`  
 
 ---

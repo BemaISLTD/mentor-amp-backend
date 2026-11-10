@@ -78,14 +78,14 @@ def _create_product(client: TestClient) -> str:
     return response.json()["id"]
 
 
-def test_system_status_registers_spia_and_myga(product_client):
+def test_system_status_registers_all_products(product_client):
     client, _session = product_client
     register_all_products()
 
     response = client.get("/v1/system/status")
 
     assert response.status_code == 200, response.text
-    assert response.json()["engine"]["products"] == ["SPIA", "MYGA"]
+    assert response.json()["engine"]["products"] == ["SPIA", "MYGA", "FIA", "RILA"]
 
 
 def test_product_crud_uniqueness_and_audit(product_client):

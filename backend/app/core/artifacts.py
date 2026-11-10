@@ -82,7 +82,9 @@ class LocalParquetArtifactStore:
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_suffix(".tmp")
         try:
-            pl.DataFrame(rows).write_parquet(temporary, compression="zstd")
+            # Dimensions may first appear after the initial 100 portfolio rows.
+            # Infer across the entire buffered partition so sparse segment fields survive.
+            pl.DataFrame(rows, infer_schema_length=None).write_parquet(temporary, compression="zstd")
             os.replace(temporary, destination)
         finally:
             temporary.unlink(missing_ok=True)

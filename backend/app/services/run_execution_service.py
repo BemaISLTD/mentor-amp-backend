@@ -114,6 +114,13 @@ def default_worker_id() -> str:
     return f"{socket.gethostname()}:{os.getpid()}:{threading.get_ident()}"
 
 
+def _row_dimensions(spec, policy):
+    """Optional dimensions from frozen variable metadata; no product-name rules."""
+    dimensions = (spec.source if spec else {}).get("dimensions", {})
+    return {name: str(policy.data.get(value["column"], "")) if isinstance(value, dict) else str(value)
+            for name, value in dimensions.items() if name in {"segment_id", "strategy_type", "index_code"}}
+
+
 # =============================================================================
 # Claiming
 # =============================================================================
@@ -370,6 +377,7 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                     "projection_month": row["projection_month"],
                     "variable_name": row["variable_name"],
                 }
+                common.update({key: row[key] for key in ("segment_id", "strategy_type", "index_code") if key in row})
                 if artifact_type == "outputs":
                     encoded.append({
                         **common,
@@ -449,6 +457,7 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                         "value": {"value": value},
                         "product": product_code,
                         "created_at": created_at,
+                        **_row_dimensions(data.variables.get(variable), policy),
                     })
                 for name, value in result.sums.items():
                     value = _canonical_long_horizon_value(
@@ -469,6 +478,7 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                     "attempt_number": attempt_number,
                     "scenario_id": scenario_id,
                     "created_at": now_utc(),
+                    **_row_dimensions(data.variables.get(row["variable_name"]), policy),
                 })
             run.progress_done = index
             governance_service.update_run_step(
