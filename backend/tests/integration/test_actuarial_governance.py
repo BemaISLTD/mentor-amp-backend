@@ -158,12 +158,10 @@ def test_rollforward_report_and_dataset_lifecycles(governed_client):
 
 def test_deferred_governance_is_not_a_public_v1_contract(governed_client):
     client, _db, _actor, project = governed_client
-    assert client.get(f"/v1/projects/{project.id}/rollforward-templates").status_code == 404
+    # Promoted in backend convergence: M5 governance routes are public under /v1
+    assert client.get(f"/v1/projects/{project.id}/rollforward-templates").status_code == 200
 
     paths = client.get("/openapi.json").json()["paths"]
     assert "/v1/runs/{run_id}/steps" in paths
-    assert not any(
-        fragment in path
-        for path in paths
-        for fragment in ("rollforward", "derived-datasets", "/reports")
-    )
+    assert f"/v1/projects/{{project_id}}/rollforward-templates" in paths
+    assert f"/v1/projects/{{project_id}}/reports" in paths

@@ -192,7 +192,8 @@ def test_get_rollforward_summary(client_with_db):
     data = response.json()
     assert data["run_id"] == "run-val-1"
     assert data["count"] == 2
-    assert data["continuity_verified"] is True
+    assert data["recomputed_continuity_verified"] is True
+    assert data["stored_continuity_verified"] is True
     items = data["items"]
     assert len(items) == 2
     assert items[0]["component_name"] == "Beginning Balance"

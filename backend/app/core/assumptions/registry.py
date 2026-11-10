@@ -307,14 +307,24 @@ def verify_fixture_manifest(directory: str | Path) -> dict[str, str]:
     """Verify every fixture byte checksum declared in ``manifest.json``."""
 
     root = Path(directory)
-    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    manifest_file = root / "manifest.json"
+    if not manifest_file.is_file():
+        raise RegistryError(f"Fixture manifest missing: {manifest_file}")
+    try:
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RegistryError(f"Malformed manifest JSON: {exc}") from exc
+
     results: dict[str, str] = {}
     for record in manifest.get("fixtures", []):
         filename = record.get("filename")
         expected = record.get("sha256")
         if not filename or not isinstance(expected, str):
             raise RegistryError("Fixture manifest entries require filename and sha256.")
-        actual = file_sha256(root / filename)
+        target = root / filename
+        if not target.is_file():
+            raise RegistryError(f"Fixture file missing: {filename}")
+        actual = file_sha256(target)
         if actual != expected:
             raise RegistryError(f"Fixture '{filename}' failed SHA-256 verification.")
         results[filename] = actual

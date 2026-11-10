@@ -3,6 +3,7 @@
 Provides endpoints for factor tables, multi-dimensional grid lookups,
 Scale G2 / MP mortality projections, annual-to-monthly decrements,
 yield/spot curve calculations, and dynamic policyholder behavioral lapse schedules.
+Enforces project authorization boundaries (CONV-03) and registries:read permissions.
 """
 
 from __future__ import annotations
@@ -11,12 +12,18 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
-from app.api.dependencies import get_current_user
+from app.api.dependencies import authorize_path, require_permissions
+from app.db.database import get_db
 from app.db.models.user import User
 from app.services import assumptions_service
 
 router = APIRouter(tags=["assumptions"])
+
+# Access authorization dependencies (CONV-03)
+Reader = Annotated[User, Depends(require_permissions("registries:read"))]
+ProjectReader = Annotated[User, Depends(authorize_path("project", "project_id", "projects:read"))]
 
 
 # =============================================================================
@@ -76,9 +83,7 @@ class DynamicLapseRequest(BaseModel):
 # =============================================================================
 
 @router.get("/assumptions/tables")
-def list_factor_tables(
-    user: Annotated[User, Depends(get_current_user)],
-):
+def list_factor_tables(user: Reader):
     del user
     return {"tables": assumptions_service.list_tables()}
 
@@ -86,16 +91,17 @@ def list_factor_tables(
 @router.get("/projects/{project_id}/assumptions/tables")
 def list_project_factor_tables(
     project_id: str,
-    user: Annotated[User, Depends(get_current_user)],
+    user: ProjectReader,
+    db: Session = Depends(get_db),
 ):
-    del user
-    return {"tables": assumptions_service.list_tables(project_id)}
+    del user, db
+    return assumptions_service.list_project_tables(project_id)
 
 
 @router.get("/assumptions/tables/{table_id}")
 def get_factor_table(
     table_id: str,
-    user: Annotated[User, Depends(get_current_user)],
+    user: Reader,
 ):
     del user
     return assumptions_service.get_table_detail(table_id)
@@ -105,7 +111,7 @@ def get_factor_table(
 def lookup_table_value(
     table_id: str,
     payload: TableLookupRequest,
-    user: Annotated[User, Depends(get_current_user)],
+    user: Reader,
 ):
     del user
     return assumptions_service.lookup_table_value(
@@ -117,9 +123,7 @@ def lookup_table_value(
 
 
 @router.get("/assumptions/mortality/tables")
-def list_mortality_tables(
-    user: Annotated[User, Depends(get_current_user)],
-):
+def list_mortality_tables(user: Reader):
     del user
     return {"mortality_tables": assumptions_service.list_mortality_tables()}
 
@@ -127,7 +131,7 @@ def list_mortality_tables(
 @router.post("/assumptions/mortality/project")
 def project_mortality(
     payload: MortalityProjectionRequest,
-    user: Annotated[User, Depends(get_current_user)],
+    user: Reader,
 ):
     del user
     return assumptions_service.project_mortality_rate(
@@ -146,7 +150,7 @@ def project_mortality(
 @router.post("/assumptions/mortality/monthly-decrement")
 def compute_monthly_decrement(
     payload: MonthlyDecrementRequest,
-    user: Annotated[User, Depends(get_current_user)],
+    user: Reader,
 ):
     del user
     return assumptions_service.compute_monthly_decrement(
@@ -157,9 +161,7 @@ def compute_monthly_decrement(
 
 
 @router.get("/assumptions/curves")
-def list_yield_curves(
-    user: Annotated[User, Depends(get_current_user)],
-):
+def list_yield_curves(user: Reader):
     del user
     return {"curves": assumptions_service.list_yield_curves()}
 
@@ -167,7 +169,7 @@ def list_yield_curves(
 @router.get("/assumptions/curves/{curve_id}")
 def get_curve_detail(
     curve_id: str,
-    user: Annotated[User, Depends(get_current_user)],
+    user: Reader,
 ):
     del user
     return assumptions_service.get_curve_detail(curve_id)
@@ -177,7 +179,7 @@ def get_curve_detail(
 def compute_discount_factor(
     curve_id: str,
     payload: DiscountFactorRequest,
-    user: Annotated[User, Depends(get_current_user)],
+    user: Reader,
 ):
     del user
     return assumptions_service.compute_discount_factor(
@@ -189,7 +191,7 @@ def compute_discount_factor(
 @router.post("/assumptions/behavior/baseline-lapse")
 def evaluate_baseline_lapse(
     payload: BaselineLapseRequest,
-    user: Annotated[User, Depends(get_current_user)],
+    user: Reader,
 ):
     del user
     return assumptions_service.compute_baseline_lapse(
@@ -205,7 +207,7 @@ def evaluate_baseline_lapse(
 @router.post("/assumptions/behavior/evaluate")
 def evaluate_dynamic_lapse(
     payload: DynamicLapseRequest,
-    user: Annotated[User, Depends(get_current_user)],
+    user: Reader,
 ):
     del user
     return assumptions_service.compute_effective_lapse(
