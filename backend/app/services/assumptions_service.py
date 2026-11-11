@@ -92,9 +92,16 @@ def initialize_assumptions_registry(
 
     manifest_classification = manifest_data.get("classification", "SYNTHETIC_NON_PRODUCTION")
 
-    # 2. Strict SHA-256 verification (CONV-01: No silent exception bypass)
-    # verify_fixture_manifest will raise RegistryError if any file checksum mismatches or is missing.
-    verify_fixture_manifest(target_dir)
+    # 2. Strict SHA-256 verification & manifest coverage (CONV-01: Full coverage integrity)
+    # Require every fixture consumed by initializer to have an authenticated manifest entry.
+    required_fixtures = (
+        "synthetic_mortality_sample.csv",
+        "synthetic_scale_g2_sample.csv",
+        "synthetic_mp_sample_matrix.csv",
+        "standard_surrender_tiers.csv",
+        "illustrative_us_treasury_spot_curve.json",
+    )
+    verified_manifest = verify_fixture_manifest(target_dir, expected_fixtures=required_fixtures)
 
     # 3. Create isolated staging instances to guarantee zero partial publication on failure
     staging_registry = ActuarialTableRegistry()
@@ -309,6 +316,7 @@ def _serialize_table_summary(table: ActuarialTable) -> dict[str, Any]:
         "table_id": gov.table_id,
         "version_label": gov.version_label,
         "status": gov.status,
+        "fixture_registration_status": gov.status,
         "source_reference": gov.source_reference,
         "effective_date": gov.effective_date,
         "created_by": gov.created_by,
@@ -323,6 +331,8 @@ def _serialize_table_summary(table: ActuarialTable) -> dict[str, Any]:
         # Explicit synthetic / approval semantics (CONV-02)
         "is_synthetic": meta["is_synthetic"],
         "is_production_approved": meta["is_production_approved"],
+        "production_catalog_eligible": not meta["is_synthetic"] and meta["is_production_approved"],
+        "production_governed_authorized": not meta["is_synthetic"] and meta["is_production_approved"],
         "classification": meta["classification"],
         "approval_authority": meta["approval_authority"],
         "governance_notice": meta["governance_notice"],

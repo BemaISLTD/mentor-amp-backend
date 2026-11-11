@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Collection, Mapping, Sequence
 
 import numpy as np
 
@@ -303,8 +303,14 @@ def load_yield_curve(path: str | Path) -> YieldCurve:
     )
 
 
-def verify_fixture_manifest(directory: str | Path) -> dict[str, str]:
-    """Verify every fixture byte checksum declared in ``manifest.json``."""
+def verify_fixture_manifest(
+    directory: str | Path,
+    expected_fixtures: Collection[str] | None = None,
+) -> dict[str, str]:
+    """Verify every fixture byte checksum declared in ``manifest.json`` and enforce coverage.
+
+    Rejects empty, incomplete, duplicate, malformed, or contradictory manifest entries.
+    """
 
     root = Path(directory)
     manifest_file = root / "manifest.json"
@@ -315,17 +321,43 @@ def verify_fixture_manifest(directory: str | Path) -> dict[str, str]:
     except Exception as exc:
         raise RegistryError(f"Malformed manifest JSON: {exc}") from exc
 
+    if not isinstance(manifest, dict):
+        raise RegistryError("Manifest root must be a JSON object.")
+
+    fixtures_list = manifest.get("fixtures")
+    if not isinstance(fixtures_list, list) or len(fixtures_list) == 0:
+        raise RegistryError("Fixture manifest 'fixtures' list is missing or empty.")
+
     results: dict[str, str] = {}
-    for record in manifest.get("fixtures", []):
+    seen_filenames: set[str] = set()
+
+    for record in fixtures_list:
+        if not isinstance(record, dict):
+            raise RegistryError("Each fixture manifest entry must be a JSON object.")
         filename = record.get("filename")
         expected = record.get("sha256")
-        if not filename or not isinstance(expected, str):
-            raise RegistryError("Fixture manifest entries require filename and sha256.")
+        if not filename or not isinstance(filename, str) or not isinstance(expected, str):
+            raise RegistryError("Fixture manifest entries require valid 'filename' and 'sha256'.")
+        if filename in seen_filenames:
+            raise RegistryError(f"Duplicate fixture manifest entry for '{filename}'.")
+        seen_filenames.add(filename)
+
+        if len(expected) != 64 or not all(c in "0123456789abcdefABCDEF" for c in expected):
+            raise RegistryError(f"Invalid SHA-256 checksum format for fixture '{filename}'.")
+
         target = root / filename
         if not target.is_file():
             raise RegistryError(f"Fixture file missing: {filename}")
         actual = file_sha256(target)
-        if actual != expected:
+        if actual.lower() != expected.lower():
             raise RegistryError(f"Fixture '{filename}' failed SHA-256 verification.")
         results[filename] = actual
+
+    if expected_fixtures is not None:
+        missing_required = set(expected_fixtures) - seen_filenames
+        if missing_required:
+            raise RegistryError(
+                f"Required fixture(s) omitted from manifest: {sorted(missing_required)}"
+            )
+
     return results

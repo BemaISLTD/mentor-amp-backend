@@ -31,6 +31,7 @@ from app.core.assumptions import (
 )
 from app.db.database import get_db
 from app.db.models.project import Project
+from app.db.models.project_member import ProjectMember
 from app.db.models.rollforward import RollforwardSummary
 from app.db.models.run import Run
 from app.db.models.user import Permission, Role, User
@@ -52,24 +53,42 @@ def test_env():
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
-    for table in (
-        Project.__table__,
-        Run.__table__,
-        ValuationRunDetail.__table__,
-        RollforwardSummary.__table__,
-        User.__table__,
-        Role.__table__,
-        Permission.__table__,
-    ):
-        table.create(engine)
+    from app.db.database import Base
+    Base.metadata.create_all(engine)
 
     session = sessionmaker(bind=engine)()
     now = datetime.now(timezone.utc)
 
-    # Authorized project
-    proj_a = Project(id="proj-alpha", name="Alpha Portfolio")
-    proj_b = Project(id="proj-beta", name="Beta Portfolio")
+    # Seed users and roles
+    p_proj_read = Permission(id="perm-p-read", name="projects:read")
+    p_proj_write = Permission(id="perm-p-write", name="projects:write")
+    p_reg_read = Permission(id="perm-r-read", name="registries:read")
+    p_run_read = Permission(id="perm-run-read", name="runs:read")
+
+    r_admin = Role(id="role-admin", name="admin", permissions=[p_proj_read, p_proj_write, p_reg_read, p_run_read])
+    r_actuary = Role(id="role-actuary", name="actuary", permissions=[p_proj_read, p_reg_read, p_run_read])
+    r_limited = Role(id="role-limited", name="limited", permissions=[p_reg_read])
+
+    u_admin = User(id="user-admin", email="admin@example.com", full_name="Admin", password_hash="test-hash", is_active=True, roles=[r_admin])
+    u_alpha = User(id="user-alpha", email="alpha@example.com", full_name="User Alpha", password_hash="test-hash", is_active=True, roles=[r_actuary])
+    u_beta = User(id="user-beta", email="beta@example.com", full_name="User Beta", password_hash="test-hash", is_active=True, roles=[r_actuary])
+    u_general = User(id="user-general", email="general@example.com", full_name="User General", password_hash="test-hash", is_active=True, roles=[r_actuary])
+
+    session.add_all([
+        p_proj_read, p_proj_write, p_reg_read, p_run_read,
+        r_admin, r_actuary, r_limited,
+        u_admin, u_alpha, u_beta, u_general,
+    ])
+
+    # Authorized projects and members
+    proj_a = Project(id="proj-alpha", name="Alpha Portfolio", created_by="user-admin")
+    proj_b = Project(id="proj-beta", name="Beta Portfolio", created_by="user-admin")
     session.add_all([proj_a, proj_b])
+    session.flush()
+
+    pm_alpha = ProjectMember(project_id="proj-alpha", user_id="user-alpha", role="viewer", created_by="user-admin")
+    pm_beta = ProjectMember(project_id="proj-beta", user_id="user-beta", role="viewer", created_by="user-admin")
+    session.add_all([pm_alpha, pm_beta])
 
     # Valuation run with explicit persisted details
     val_run = Run(
@@ -264,34 +283,30 @@ def test_env():
 
 
 # =============================================================================
-# CONV-01: P0 - Fix Fail-Open Fixture Verification
+# CONV-01: P0 - Complete Manifest Coverage Integrity
 # =============================================================================
 
 def test_conv01_fixture_verification_rejects_modified_fixture(tmp_path):
     """Modified fixture fails SHA-256 verification and raises RegistryError."""
-    # Copy fixtures to tmp_path
     shutil.copytree(FIXTURES_DIR, tmp_path / "fixtures")
     fixture_dir = tmp_path / "fixtures"
 
-    # Modify one byte in mortality sample
     mort_file = fixture_dir / "synthetic_mortality_sample.csv"
     text = mort_file.read_text(encoding="utf-8")
     mort_file.write_text(text.replace("0.00120", "0.00999"), encoding="utf-8")
 
-    # initialize_assumptions_registry must reject modified fixture fail-closed
     with pytest.raises(RegistryError, match="failed SHA-256 verification"):
         assumptions_service.initialize_assumptions_registry(fixtures_dir=fixture_dir, force_reload=True)
 
 
 def test_conv01_fixture_verification_rejects_missing_fixture(tmp_path):
-    """Missing declared fixture raises RegistryError."""
+    """Missing physical declared fixture file raises RegistryError."""
     shutil.copytree(FIXTURES_DIR, tmp_path / "fixtures")
     fixture_dir = tmp_path / "fixtures"
 
-    # Delete one declared fixture
     (fixture_dir / "standard_surrender_tiers.csv").unlink()
 
-    with pytest.raises(RegistryError):
+    with pytest.raises(RegistryError, match="missing"):
         assumptions_service.initialize_assumptions_registry(fixtures_dir=fixture_dir, force_reload=True)
 
 
@@ -300,19 +315,82 @@ def test_conv01_fixture_verification_rejects_malformed_manifest(tmp_path):
     shutil.copytree(FIXTURES_DIR, tmp_path / "fixtures")
     fixture_dir = tmp_path / "fixtures"
 
-    # Write invalid JSON
     (fixture_dir / "manifest.json").write_text("{corrupt json: true", encoding="utf-8")
 
     with pytest.raises(RegistryError, match="Malformed manifest.json"):
         assumptions_service.initialize_assumptions_registry(fixtures_dir=fixture_dir, force_reload=True)
 
 
-def test_conv01_no_partial_publication_on_failure(tmp_path):
-    """When verification fails, no partial or unverified fixtures are exposed."""
+def test_conv01_empty_manifest_fixture_list_rejected(tmp_path):
+    """Manifest with empty 'fixtures': [] list is rejected fail-closed."""
     shutil.copytree(FIXTURES_DIR, tmp_path / "fixtures")
     fixture_dir = tmp_path / "fixtures"
 
-    # Modify the first fixture
+    manifest_data = {"classification": "SYNTHETIC_NON_PRODUCTION", "fixtures": []}
+    (fixture_dir / "manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    with pytest.raises(RegistryError, match="missing or empty"):
+        assumptions_service.initialize_assumptions_registry(fixtures_dir=fixture_dir, force_reload=True)
+
+
+def test_conv01_required_mortality_fixture_omitted_from_manifest(tmp_path):
+    """Required mortality fixture physically present but omitted from manifest raises RegistryError."""
+    shutil.copytree(FIXTURES_DIR, tmp_path / "fixtures")
+    fixture_dir = tmp_path / "fixtures"
+
+    manifest_data = json.loads((fixture_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest_data["fixtures"] = [
+        f for f in manifest_data["fixtures"] if f["filename"] != "synthetic_mortality_sample.csv"
+    ]
+    (fixture_dir / "manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    with pytest.raises(RegistryError, match="omitted from manifest"):
+        assumptions_service.initialize_assumptions_registry(fixtures_dir=fixture_dir, force_reload=True)
+
+
+def test_conv01_required_yield_curve_omitted_from_manifest(tmp_path):
+    """Required spot yield curve physically present but omitted from manifest raises RegistryError."""
+    shutil.copytree(FIXTURES_DIR, tmp_path / "fixtures")
+    fixture_dir = tmp_path / "fixtures"
+
+    manifest_data = json.loads((fixture_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest_data["fixtures"] = [
+        f for f in manifest_data["fixtures"] if f["filename"] != "illustrative_us_treasury_spot_curve.json"
+    ]
+    (fixture_dir / "manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    with pytest.raises(RegistryError, match="omitted from manifest"):
+        assumptions_service.initialize_assumptions_registry(fixtures_dir=fixture_dir, force_reload=True)
+
+
+def test_conv01_duplicate_or_invalid_manifest_entries(tmp_path):
+    """Duplicate manifest entries or invalid checksum formats raise RegistryError."""
+    shutil.copytree(FIXTURES_DIR, tmp_path / "fixtures")
+    fixture_dir = tmp_path / "fixtures"
+
+    # 1. Duplicate entry
+    manifest_data = json.loads((fixture_dir / "manifest.json").read_text(encoding="utf-8"))
+    duplicate_entry = dict(manifest_data["fixtures"][0])
+    manifest_data["fixtures"].append(duplicate_entry)
+    (fixture_dir / "manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    with pytest.raises(RegistryError, match="Duplicate fixture manifest entry"):
+        assumptions_service.initialize_assumptions_registry(fixtures_dir=fixture_dir, force_reload=True)
+
+    # 2. Invalid SHA-256 format (non-hex or wrong length)
+    manifest_data["fixtures"].pop()
+    manifest_data["fixtures"][0]["sha256"] = "invalid_hash_short"
+    (fixture_dir / "manifest.json").write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    with pytest.raises(RegistryError, match="Invalid SHA-256 checksum format"):
+        assumptions_service.initialize_assumptions_registry(fixtures_dir=fixture_dir, force_reload=True)
+
+
+def test_conv01_no_unauthenticated_or_partial_registry_published(tmp_path):
+    """When verification fails, no partial or unverified fixtures are exposed in active registry."""
+    shutil.copytree(FIXTURES_DIR, tmp_path / "fixtures")
+    fixture_dir = tmp_path / "fixtures"
+
     curve_file = fixture_dir / "illustrative_us_treasury_spot_curve.json"
     curve_file.write_text(curve_file.read_text(encoding="utf-8").replace("0.0410", "0.0999"), encoding="utf-8")
 
@@ -320,11 +398,14 @@ def test_conv01_no_partial_publication_on_failure(tmp_path):
         assumptions_service.initialize_assumptions_registry(fixtures_dir=fixture_dir, force_reload=True)
 
     # Reload authentic fixtures to restore clean state
-    assumptions_service.initialize_assumptions_registry(force_reload=True)
+    reg, curves = assumptions_service.initialize_assumptions_registry(force_reload=True)
+    assert reg is not None
+    assert len(reg.snapshot()) >= 4
+    assert len(curves) >= 1
 
 
-def test_conv01_authentic_fixtures_verify_cleanly():
-    """Authentic fixtures verify 100% and populate the registry."""
+def test_conv01_authentic_complete_manifest_accepted():
+    """Authentic fixtures with complete manifest verify 100% and populate the registry."""
     reg, curves = assumptions_service.initialize_assumptions_registry(force_reload=True)
     assert reg is not None
     assert len(reg.snapshot()) >= 4
@@ -332,7 +413,7 @@ def test_conv01_authentic_fixtures_verify_cleanly():
 
 
 # =============================================================================
-# CONV-02: P1 - Correct Synthetic Data Approval Semantics
+# CONV-02: P1 - Confirm Synthetic Data Approval Semantics
 # =============================================================================
 
 def test_conv02_tables_explicitly_labeled_as_synthetic(test_env):
@@ -347,6 +428,8 @@ def test_conv02_tables_explicitly_labeled_as_synthetic(test_env):
     for table in data["tables"]:
         assert table["is_synthetic"] is True
         assert table["is_production_approved"] is False
+        assert table["production_catalog_eligible"] is False
+        assert table["production_governed_authorized"] is False
         assert table["classification"] == "SYNTHETIC_NON_PRODUCTION"
         assert table["approval_authority"] == "SYNTHETIC_DEMO_NON_AUTHORITATIVE"
         assert "not authorized for production" in table["governance_notice"].lower()
@@ -360,6 +443,8 @@ def test_conv02_table_detail_labeled_as_synthetic(test_env):
     data = response.json()
     assert data["is_synthetic"] is True
     assert data["is_production_approved"] is False
+    assert data["production_catalog_eligible"] is False
+    assert data["production_governed_authorized"] is False
     assert data["classification"] == "SYNTHETIC_NON_PRODUCTION"
     assert data["approval_authority"] == "SYNTHETIC_DEMO_NON_AUTHORITATIVE"
 
@@ -378,27 +463,109 @@ def test_conv02_curves_labeled_as_synthetic(test_env):
     assert "not published" in curve["governance_notice"].lower()
 
 
+def test_conv02_synthetic_assumptions_cannot_authorize_production():
+    """Synthetic assumptions cannot authorize production-governed calculations or appear in approved catalogs."""
+    registry = assumptions_service.get_registry()
+    table = registry.get("synthetic-mortality-v1")
+    summary = assumptions_service._serialize_table_summary(table)
+
+    # Fixture registration status is distinguished from production actuarial approval
+    assert summary["fixture_registration_status"] == "approved"
+    assert summary["is_production_approved"] is False
+    assert summary["production_catalog_eligible"] is False
+    assert summary["production_governed_authorized"] is False
+    assert summary["approval_authority"] != "Actuarial Product Owner"
+
+
+def test_conv02_four_eyes_approval_preserved_on_tables():
+    """Legitimate four-eyes approval rules are enforced on TableGovernanceEnvelope."""
+    from app.core.assumptions.table_engine import TableGovernanceEnvelope, TableSchemaError
+
+    # Self-approval is rejected fail-closed
+    with pytest.raises(TableSchemaError, match="Four-eyes"):
+        TableGovernanceEnvelope(
+            table_id="test-tbl",
+            version_label="1.0.0",
+            source_reference="test",
+            effective_date="2026-01-01",
+            status="approved",
+            created_by="actuary-1",
+            approved_by="actuary-1",  # Self approval!
+            approved_at="2026-01-02T00:00:00Z",
+            fingerprint_sha256="0" * 64,
+        )
+
+
 # =============================================================================
-# CONV-03: P1 - Enforce Project Authorization and Isolation
+# CONV-03: P1 - Verify Cross-Project Isolation
 # =============================================================================
 
-def test_conv03_project_factor_tables_authorized_access(test_env):
-    """Authorized caller querying existing project gets 200 with labeled scope."""
-    client, _ = test_env
+def test_conv03_cross_project_access_prevented(test_env):
+    """A user authorized for Project Alpha CANNOT access Project Beta without Project Beta authorization."""
+    client, session = test_env
+    u_alpha = session.query(User).filter(User.id == "user-alpha").first()
+    app.dependency_overrides[get_current_user] = lambda: u_alpha
+
+    # Accessing authorized project succeeds
+    res_a = client.get("/v1/projects/proj-alpha/assumptions/tables")
+    assert res_a.status_code == 200
+    assert res_a.json()["project_id"] == "proj-alpha"
+
+    # Accessing Project Beta without Project Beta membership returns 404 (IDOR safe)
+    res_b = client.get("/v1/projects/proj-beta/assumptions/tables")
+    assert res_b.status_code == 404
+    assert "not found" in res_b.json()["error"]["message"].lower()
+
+
+def test_conv03_general_registry_read_cannot_bypass_project_isolation(test_env):
+    """A user with general registry-read and projects:read permissions cannot access unassigned projects."""
+    client, session = test_env
+    u_general = session.query(User).filter(User.id == "user-general").first()
+    app.dependency_overrides[get_current_user] = lambda: u_general
+
+    # General user CAN read global assumptions
+    res_global = client.get("/v1/assumptions/tables")
+    assert res_global.status_code == 200
+
+    # But CANNOT access Project Alpha or Project Beta (not a member)
+    res_a = client.get("/v1/projects/proj-alpha/assumptions/tables")
+    assert res_a.status_code == 404
+    res_b = client.get("/v1/projects/proj-beta/assumptions/tables")
+    assert res_b.status_code == 404
+
+
+def test_conv03_global_reference_tables_distinguished_from_project_owned(test_env):
+    """Globally shared reference tables remain distinguished from project-owned data."""
+    client, session = test_env
+    u_alpha = session.query(User).filter(User.id == "user-alpha").first()
+    app.dependency_overrides[get_current_user] = lambda: u_alpha
+
     response = client.get("/v1/projects/proj-alpha/assumptions/tables")
     assert response.status_code == 200
     data = response.json()
-    assert data["project_id"] == "proj-alpha"
     assert data["scope"] == "project"
+    assert data["project_id"] == "proj-alpha"
+    assert "project_tables" in data
+    assert isinstance(data["project_tables"], list)
     assert "global_reference_tables" in data
     assert len(data["global_reference_tables"]) >= 4
 
+    for tbl in data["global_reference_tables"]:
+        assert tbl["scope"] == "global_reference"
+        assert tbl["is_synthetic"] is True
 
-def test_conv03_project_factor_tables_nonexistent_project_returns_404(test_env):
-    """Querying a nonexistent project ID returns 404 Not Found."""
-    client, _ = test_env
-    response = client.get("/v1/projects/nonexistent-project-9999/assumptions/tables")
+
+def test_conv03_unauthorized_or_nonexistent_project_exposes_no_information(test_env):
+    """Unauthorized or nonexistent project requests fail closed with 404 and expose zero data."""
+    client, session = test_env
+    u_alpha = session.query(User).filter(User.id == "user-alpha").first()
+    app.dependency_overrides[get_current_user] = lambda: u_alpha
+
+    response = client.get("/v1/projects/proj-nonexistent-9999/assumptions/tables")
     assert response.status_code == 404
+    body = response.json()
+    assert "tables" not in body
+    assert "error" in body
 
 
 def test_conv03_unauthorized_user_lacking_registries_read_returns_403(test_env):
@@ -418,7 +585,7 @@ def test_conv03_unauthorized_user_lacking_registries_read_returns_403(test_env):
 
 
 def test_conv03_unauthorized_user_lacking_projects_read_returns_403(test_env):
-    """User without projects:read permission is rejected on project assumptions route."""
+    """User without projects:read permission is rejected on project assumptions route with 403."""
     client, _ = test_env
     app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
         id="limited-user",
