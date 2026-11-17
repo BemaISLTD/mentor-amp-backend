@@ -8,9 +8,9 @@
 **Document Version:** 3.5 (Backend Convergence Integration: M4 FIA/RILA Foundation + M5 Valuation Frameworks + Central Assumption Engine)  
 **Date:** November 10, 2026  
 **Status:** Working Execution Ledger — Backend Convergence & Integration Ready (M4 FIA/RILA Foundation, M5A–M5D Technical Foundation, Dagster Orchestration, and Noah Assumption & Factor Table Engine)  
-**Current Git Branch:** eat/backend-convergence-apis-integration  
-**Prior Reviewed Baseline SHA:** fe3948 (Merge pull request #9 from BemaISLTD/feat/m5-valuation-frameworks-dagster)  
-**Alembic Head Revision:** c9f4e2d8a615 (Single canonical head)  
+**Current Git Branch:** `feat/backend-convergence-apis-integration`  
+**Prior Reviewed Baseline SHA:** `ffe3948` (Merge pull request #9 from BemaISLTD/feat/m5-valuation-frameworks-dagster)  
+**Alembic Head Revision:** `c9f4e2d8a615` (Single canonical head)  
 
 **M4 engineering update (2026-11-01 / 2026-11-09): MERGED TO CONVERGENCE BRANCH.**
 Shared indexed primitives, executable illustrative FIA/RILA declarations, fixed crediting post-withdrawal safeguards, and the

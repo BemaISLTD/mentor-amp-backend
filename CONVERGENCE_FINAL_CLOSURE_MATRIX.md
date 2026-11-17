@@ -41,13 +41,13 @@ This controlling closure matrix delivers the final engineering reconciliation fo
 
 ---
 
-## 3. Authoritative Actuarial Decision Matrix (M5 Governing Specification)
+## 3. Authoritative Actuarial Decision Matrix (M5 & CAS/W0R Governing Specifications)
 
-The following matrix preserves the authoritative definitions and open governance statuses from the approved CAS, Master Plan, and Samuel's M5 Technical Foundation Specification (`SAMUEL_M5_VALUATION_FRAMEWORKS_DAGSTER_IMPLEMENTATION_README.md`).
+The following matrix preserves the authoritative definitions and open governance statuses from Samuel's M5 Technical Foundation Specification (`SAMUEL_M5_VALUATION_FRAMEWORKS_DAGSTER_IMPLEMENTATION_README.md` §9), together with the overarching launch-wide `CAS` §17 / `W0R` §18.1 confirmation gates (`PROJECT_MASTER_TRACKER.md` §1.4) and Assumption Engine data dependencies (`NOAH_ACTUARIAL_ASSUMPTION_AND_FACTOR_TABLE_ENGINE_README.md` §6). No pending actuarial approval is claimed or fabricated.
 
-| Decision ID | Domain | Authoritative Governing Requirement | Impact on Backend Implementation | Status | Sign-off Authority |
+| Decision ID | Domain | Authoritative M5 Governing Requirement (`M5 §9`) | Impact on Backend Implementation | Status | Sign-off Authority |
 | :--- | :--- | :--- | :--- | :---: | :--- |
-| **ACT-DEC-01** | Valuation Frameworks | Formal confirmation of the primary valuation framework implementation order and scope for the six reference verticals (`VM21`, `VM22`, `LDTI`, `DAC`, `MRB`, `ASC815`). | Reference verticals remain cleanly isolated in reference modules; production valuation runs use `GENERIC_PV_FOUNDATION` until sign-off. | **OPEN / GATED** | Actuarial Product Owner |
+| **ACT-DEC-01** | VM-21, MRB | Selection of primary RILA/VA reference product, guaranteed benefit types (GMDB vs GLWB), and fee attribution rules. | Reference verticals remain cleanly isolated in reference modules; production valuation runs use `GENERIC_PV_FOUNDATION` until sign-off. | **OPEN / GATED** | Actuarial Product Owner |
 | **ACT-DEC-02** | VM-21 (Variable Annuities) | VM-21 Valuation Manual edition, reference product/case, hedging/CDHS treatment, supporting asset treatment, prescribed assumptions, and required tail-measure implementation. | Blocks non-illustrative VM-21 reserve production release; reference engine operates as an illustrative template. | **OPEN / GATED** | Actuarial Product Owner |
 | **ACT-DEC-03** | VM-22 (Fixed Annuities) | Selection of VM-22 reference case (MYGA vs SPIA vs PRT), applicable Valuation Manual edition (2026 vs 2027), and SST eligibility. | Blocks non-illustrative VM-22 reserve production release; statutory runs operate under verified foundation formulas. | **OPEN / GATED** | Actuarial Product Owner |
 | **ACT-DEC-04** | LDTI (GAAP LFPB) | LDTI reference contract/cohort, initial Net Premium Ratio ceiling, and prescribed A-grade discount curve provider. | Reference LDTI rollforward template in `rollforward.py` operates as an illustrative test fixture, not signed accounting truth. | **OPEN / GATED** | Actuarial Product Owner |
@@ -57,29 +57,33 @@ The following matrix preserves the authoritative definitions and open governance
 | **ACT-DEC-08** | Rollforward Components | Specific rollforward attribution component lists and tolerance thresholds for each of the six frameworks. | Authoritative framework is configurable; default tolerance is non-universal and movement templates remain reference fixtures. | **OPEN / GATED** | Actuarial Product Owner |
 | **ACT-DEC-09** | Reporting Disclosures | Formal confirmation of ASU 2018-12 disclosure table layouts and disaggregation levels. | Governed reporting endpoints under `/v1/projects/{project_id}/reports` operate as configurable frameworks pending final presentation templates. | **OPEN / GATED** | Actuarial Product Owner |
 
+> **Cross-Reference — Authoritative `CAS` §17 / `W0R` §18.1 Confirmation Gates & Assumption Dependencies (All OPEN):**
+> - The 7 overarching `CAS` §17 / `W0R` §18.1 confirmation gates tracked in `PROJECT_MASTER_TRACKER.md` §1.4 (**Fixed-Account Attribution**, **ASC 815 Terminology**, **Variable Annuity Scope**, **VM-22 Reference Case**, **Disclosure Package**, **Performance Benchmark**, and **Life-Readiness Minimum Fields**) remain **OPEN** pending Actuarial Product Owner sign-off.
+> - Assumption Engine unresolved dependencies `ACT-DEP-TABLE-01` (SOA Official CSV Acquisition), `ACT-DEP-TABLE-02` (VM-20/VM-22 Prescribed Tables), and `ACT-DEP-TABLE-03` (Production Dynamic Lapse Calibration) from `NOAH_ACTUARIAL_ASSUMPTION_AND_FACTOR_TABLE_ENGINE_README.md` §6 remain **OPEN**. Current bundled tables and curves are strictly `SYNTHETIC_NON_PRODUCTION`.
+
 ---
 
-## 4. Preserved M4 Indexed Crediting Decisions (ACT-M4-DEC-01 — ACT-M4-DEC-15)
+## 4. Preserved M4 Indexed Crediting Owner Decisions (`ACT-M4-DEC-01` — `ACT-M4-DEC-15`)
 
-The 15 controlling actuarial decisions for Milestone 4 (FIA & RILA indexed crediting) established by Noah remain intact, operational, and governed:
+The 15 controlling actuarial owner decisions for Milestone 4 (FIA & RILA) established in `NOAH_M4_FIA_RILA_IMPLEMENTATION_README.md` §28 retain their exact original meanings and **remain OPEN / PENDING PROJECT OWNER APPROVAL** (`docs/m4/IMPLEMENTATION.md`). Shared indexed primitives, illustrative FIA/RILA declarations, and post-crediting withdrawal sequencing (`b6701d2`) provide configurable engineering infrastructure only and are **not** formally approved actuarial contract terms:
 
-| Decision ID | Description & Applied Crediting Policy | Status |
-| :--- | :--- | :---: |
-| **ACT-M4-DEC-01** | Multi-index crediting support: Index options (S&P 500, MSCI EAFE, Russell 2000) evaluated with discrete strategy parameters. | **ENFORCED** |
-| **ACT-M4-DEC-02** | Crediting term structures: Annual point-to-point, 2-year point-to-point, and monthly averaging supported. | **ENFORCED** |
-| **ACT-M4-DEC-03** | Point-to-point return formula: $R = \frac{I_t - I_0}{I_0}$ based on index strike values without dividend reinvestment. | **ENFORCED** |
-| **ACT-M4-DEC-04** | Monthly averaging return formula: Arithmetic average of monthly index values compared against initial index. | **ENFORCED** |
-| **ACT-M4-DEC-05** | Cap rate application: Credited rate $C = \min(R, \text{Cap})$ for capped strategies. | **ENFORCED** |
-| **ACT-M4-DEC-06** | Participation rate application: Credited rate $C = R \times \text{ParticipationRate}$. | **ENFORCED** |
-| **ACT-M4-DEC-07** | Spread / margin rate deduction: Credited rate $C = \max(0, R - \text{Spread})$. | **ENFORCED** |
-| **ACT-M4-DEC-08** | Combined strategy ordering: Participation applied before spread, capped at cap rate: $C = \min(\text{Cap}, \max(0, R \times \text{Part} - \text{Spread}))$. | **ENFORCED** |
-| **ACT-M4-DEC-09** | FIA Zero-Floor Guarantee: Invariant $C \ge 0.0$ strictly enforced across all FIA index segments. | **ENFORCED** |
-| **ACT-M4-DEC-10** | RILA Buffer loss absorption: Insurer absorbs loss up to buffer rate $B$; policyholder absorbs excess loss: $C = \min(0, R + B)$ when $R < -B$. | **ENFORCED** |
-| **ACT-M4-DEC-11** | RILA Floor maximum loss: Insurer absorbs loss exceeding floor rate $F$; policyholder absorbs loss down to floor: $C = \max(-F, R)$. | **ENFORCED** |
-| **ACT-M4-DEC-12** | Multi-bucket sweep & conservation: Segment allocations sum to 100% of account value; values conserved across segment sweeps. | **ENFORCED** |
-| **ACT-M4-DEC-13** | Crediting date convention: Anniversary / term-end crediting applied strictly at period end before subsequent term renewal. | **ENFORCED** |
-| **ACT-M4-DEC-14** | Mid-term surrender / withdrawal interim value: Prorated index participation without interim penalty compounding. | **ENFORCED** |
-| **ACT-M4-DEC-15** | Post-crediting withdrawal sequencing: Fixed-account crediting processed prior to deduction of anniversary withdrawals (Noah commit `b6701d2`). | **ENFORCED** |
+| Decision ID | Scope & Subject (`M4 §28`) | Candidate Options & Engineering Fixture Baseline | Blocking Gate | Governance Status |
+| :--- | :--- | :--- | :--- | :---: |
+| **ACT-M4-DEC-01** | **FIA Reference Strategy Selection** | 1. Annual PTP Cap & PR (engineering baseline) · 2. Annual PTP Spread · 3. Monthly Average Cap | Blocks FIA Model Finalization | **OPEN / PENDING OWNER APPROVAL** |
+| **ACT-M4-DEC-02** | **FIA Option-Budget Methodology** | 1. Governed factor table lookup (engineering baseline) · 2. Analytical Black-Scholes formula | Blocks FIA Verification | **OPEN / PENDING OWNER APPROVAL** |
+| **ACT-M4-DEC-03** | **FIA Nonforfeiture (Model 805) Rule** | 1. Model 805 standard (87.5% @ 3.00%) subject to confirmed rate · 2. Alternate statutory rate/rule | Blocks FIA Statutory Acceptance | **OPEN / PENDING OWNER APPROVAL** |
+| **ACT-M4-DEC-04** | **FIA Withdrawal & MVA Mechanics** | 1. Pro-rata withdrawal, duration SC schedule, standard MVA (MYGA-style tables) · 2. Alternate schedule | Blocks FIA Verification | **OPEN / PENDING OWNER APPROVAL** |
+| **ACT-M4-DEC-05** | **FIA Death-Benefit Mechanics** | 1. Account value · 2. Greater of AV and MGSV (engineering baseline) | Blocks FIA Acceptance | **OPEN / PENDING OWNER APPROVAL** |
+| **ACT-M4-DEC-06** | **RILA Reference Segments & Terms** | 1. 1-Yr S&P 500 Buffer 10%, 3-Yr Russell Buffer 15% (engineering baseline) · 2. Alternate terms/indices | Blocks RILA Model Finalization | **OPEN / PENDING OWNER APPROVAL** |
+| **ACT-M4-DEC-07** | **RILA Maturity Payoff Rules** | 1. Buffer and Floor standard payoffs (engineering baseline) · 2. Include Dual Direction | Blocks RILA Implementation | **OPEN / PENDING OWNER APPROVAL** |
+| **ACT-M4-DEC-08** | **RILA Interim-Value Methodology** | 1. AG 54 Replicating Option Portfolio · 2. Prorated Intrinsic Approximation (illustrative fixture; AG 54 oracle external) | Blocks RILA Interim Value Implementation | **OPEN / PENDING OWNER APPROVAL** |
+| **ACT-M4-DEC-09** | **Active Segment Withdrawal Adjustment** | 1. Pro-Rata reduction (engineering baseline) · 2. Dollar-for-Dollar reduction | Blocks RILA Withdrawal Finalization | **OPEN / PENDING OWNER APPROVAL** |
+| **ACT-M4-DEC-10** | **Segment Maturity Rollover Rule** | 1. Auto-renew into same strategy (engineering baseline) · 2. Sweep to Fixed Account | Blocks RILA Multi-Year Projection | **OPEN / PENDING OWNER APPROVAL** |
+| **ACT-M4-DEC-11** | **Index Observation Timing Convention** | 1. End of Month (EOM) spot value (engineering baseline) · 2. Exact trading anniversary | Blocks RILA Implementation | **OPEN / PENDING OWNER APPROVAL** |
+| **ACT-M4-DEC-12** | **Contract Fee Timing & Order** | 1. Deduct at beginning of month · 2. Deduct at end of month after interest (post-crediting sequencing implemented as fixture) | Blocks Verification | **OPEN / PENDING OWNER APPROVAL** |
+| **ACT-M4-DEC-13** | **Benefit / Claim Timing Convention** | 1. Mid-month average · 2. End-of-month post crediting (engineering baseline) | Blocks Verification | **OPEN / PENDING OWNER APPROVAL** |
+| **ACT-M4-DEC-14** | **Synthetic RILA Block Sizing & Paths** | 1. 30 policies, 4 scenarios, 72 months (proposed synthetic test block) · 2. Alternate block composition | Blocks Block Acceptance | **OPEN / PENDING OWNER APPROVAL** |
+| **ACT-M4-DEC-15** | **Governed Reconciliation Tolerances** | 1. Absolute $1.00, relative 0.01% on AV · 2. Tighter/custom governed tolerance profile per reference case | Blocks Final Acceptance | **OPEN / PENDING OWNER APPROVAL** |
 
 ---
 
@@ -107,11 +111,11 @@ To clearly separate engineering principles from open business/actuarial governan
    - `tests/golden_policy/test_fia_golden.py::test_owner_approved_fia_golden`
    - `tests/golden_policy/test_rila_golden.py::test_owner_approved_rila_golden`
    *Status:* **PRESERVED & SKIPPED SAFELY.** These tests assert cryptographic signatures on external Actuarial Product Owner signed Excel workbooks that remain gated until formal business signoff.
-2. **PostgreSQL Test Environment Isolation (Gated / Skipped Tests):**
-   - `tests/integration/test_myga_end_to_end.py::test_myga_workflow_on_disposable_postgres`
-   - `tests/integration/test_spia_reference_workflow.py::test_reference_model_workflow_on_disposable_postgres`
-   - `tests/postgres/` (25 opt-in tests)
-   *Status:* **PRESERVED & SKIPPED SAFELY.** These tests require an explicit `MENTORAMP_TEST_POSTGRES_URL` pointing to a disposable scratch database to drop/recreate schemas without risking developer databases. Alembic migration chain was independently verified at head `c9f4e2d8a615`.
+2. **PostgreSQL Test Environment Verification (Executed on Disposable Local PostgreSQL 18):**
+   - `tests/postgres/` (25 tests: migrations zero-to-head `c9f4e2d8a615`, `c9 <-> b8` multi-row downgrade/upgrade, immutability triggers, concurrency locks, Dagster 8-asset E2E & retry recovery): **25 passed**
+   - `tests/integration/test_myga_end_to_end.py::test_myga_workflow_on_disposable_postgres`: **1 passed**
+   - `tests/integration/test_spia_reference_workflow.py -k postgres` (including `test_reference_model_workflow_on_disposable_postgres` and 4 unsafe-DB guard tests): **5 passed**
+   *Status:* **VERIFIED ON DISPOSABLE LOCAL POSTGRESQL 18** (`mentoramp_conv_disposable_test`; Alembic canonical head `c9f4e2d8a615`). Safe opt-in `MENTORAMP_TEST_POSTGRES_URL` guard remains preserved so default CI/SQLite runs never touch developer or production databases.
 
 ---
 
