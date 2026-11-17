@@ -26,6 +26,7 @@ from app.core.execution import run_state
 from app.core.projection_engine.engine import month_end_after
 from app.db.models.modeling import Model, ModelPublishedOutput
 from app.db.models.projection import ProjectionSet, RunSet
+from app.db.models.rollforward import RollforwardSummary
 from app.db.models.run import Run
 from app.db.models.scenario import ScenarioTable
 from app.services import access, catalog_service
@@ -650,4 +651,174 @@ def dashboard(db: Session, project_id: str) -> dict[str, Any]:
         ],
         "recent_investigations": [],
         "continue_investigation": None,
+    }
+
+
+
+def valuation_detail(db: Session, run_id: str) -> dict[str, Any]:
+    """Valuation execution detail and reserve balances for a run.
+
+    CONV-05 Invariant:
+    Never fabricate basis, methodology, reserve values, or approval status.
+    Distinguish projection runs from dedicated valuation runs.
+    """
+    run = get_run(db, run_id)
+    val_detail = getattr(run, "valuation_detail", None)
+    if isinstance(val_detail, (list, tuple)):
+        val_detail = val_detail[0] if val_detail else None
+
+    if val_detail is not None:
+        return {
+            "run_id": run.id,
+            "project_id": run.project_id,
+            "status": run.status,
+            "is_valuation_run": True,
+            "has_valuation_detail": True,
+            "methodology": getattr(run, "methodology", None),
+            "basis": getattr(run, "basis", None),
+            "valuation_date": iso(val_detail.valuation_date),
+            "discount_curve_fingerprint": val_detail.discount_curve_fingerprint,
+            "configuration": val_detail.configuration,
+            "summary_results": val_detail.summary_results,
+            "created_at": iso(val_detail.created_at),
+            "completed_at": iso(val_detail.completed_at) if val_detail.completed_at else None,
+        }
+
+    run_sum = summary(db, run_id) if run.status in run_state.RESULT_STATUSES else {}
+    return {
+        "run_id": run.id,
+        "project_id": run.project_id,
+        "status": run.status,
+        "is_valuation_run": False,
+        "has_valuation_detail": False,
+        "methodology": getattr(run, "methodology", None),
+        "basis": getattr(run, "basis", None),
+        "valuation_date": run_sum.get("valuation_date"),
+        "headline": run_sum.get("headline"),
+        "totals": run_sum.get("totals"),
+        "notice": "This execution is a projection run without dedicated subordinate valuation records.",
+    }
+
+
+def rollforward_summary(db: Session, run_id: str, tolerance: Decimal = Decimal("0.01")) -> dict[str, Any]:
+    """Rollforward attribution schedule and independent arithmetic continuity evidence.
+
+    CONV-05 Invariant:
+    Never accept stored continuity boolean without independent arithmetic recomputation:
+        ExpectedClosing = OpeningBalance + Sum(VerifiedMovements)
+        Difference = abs(ActualClosing - ExpectedClosing)
+        RecomputedContinuity = Difference <= tolerance
+    """
+    run = get_run(db, run_id)
+    rows = (
+        db.query(RollforwardSummary)
+        .filter(RollforwardSummary.run_id == run_id)
+        .order_by(RollforwardSummary.cohort_id, RollforwardSummary.component_order)
+        .all()
+    )
+
+    if not rows:
+        return {
+            "run_id": run_id,
+            "project_id": run.project_id,
+            "count": 0,
+            "stored_continuity_verified": None,
+            "recomputed_continuity_verified": None,
+            "is_tampered_or_forged": False,
+            "max_continuity_difference": 0.0,
+            "tolerance": float(tolerance),
+            "cohort_evaluations": {},
+            "items": [],
+        }
+
+    cohorts: dict[str, list[RollforwardSummary]] = {}
+    for r in rows:
+        cohorts.setdefault(r.cohort_id, []).append(r)
+
+    cohort_evals: dict[str, dict[str, Any]] = {}
+    all_recomputed_verified = True
+    all_stored_verified = True
+    max_difference = Decimal("0.0")
+
+    for cohort_id, cohort_rows in cohorts.items():
+        opening_item = next((r for r in cohort_rows if not r.is_movement and r.component_order == 1), None)
+        if opening_item is None:
+            opening_item = cohort_rows[0]
+        opening_bal = Decimal(str(opening_item.opening_balance))
+
+        movement_items = [r for r in cohort_rows if r.is_movement]
+        movement_sum = sum((Decimal(str(r.movement_amount)) for r in movement_items), Decimal("0.0"))
+
+        # Rollforward continuity invariant: Beginning + sum(Movements) = Ending.
+        # In Mentor AMP persistence (and standard schedules), cohort_rows[-1] or explicit
+        # ending rows reflect the target actual closing balance.
+        closing_item = cohort_rows[-1]
+        for r in reversed(cohort_rows):
+            if (r.component_name or "").lower() in ("ending_balance", "closing_balance", "ending balance", "closing balance", "ending fair value", "ending_fair_value"):
+                closing_item = r
+                break
+        actual_closing = Decimal(str(closing_item.closing_balance))
+
+        expected_closing = opening_bal + movement_sum
+        diff = abs(actual_closing - expected_closing)
+        cohort_recomputed = bool(diff <= tolerance)
+
+        if diff > max_difference:
+            max_difference = diff
+        if not cohort_recomputed:
+            all_recomputed_verified = False
+
+        cohort_stored = all(r.is_continuity_verified for r in cohort_rows)
+        if not cohort_stored:
+            all_stored_verified = False
+
+        cohort_evals[cohort_id] = {
+            "cohort_id": cohort_id,
+            "opening_balance": float(opening_bal),
+            "sum_movements": float(movement_sum),
+            "expected_closing_balance": float(expected_closing),
+            "actual_closing_balance": float(actual_closing),
+            "arithmetic_difference": float(diff),
+            "tolerance": float(tolerance),
+            "recomputed_continuity_verified": cohort_recomputed,
+            "stored_continuity_flag": cohort_stored,
+            "is_tampered": bool(cohort_stored and not cohort_recomputed),
+        }
+
+    is_tampered_global = bool(all_stored_verified and not all_recomputed_verified)
+
+    items = [
+        {
+            "id": r.id,
+            "run_id": r.run_id,
+            "project_id": r.project_id,
+            "cohort_id": r.cohort_id,
+            "methodology": r.methodology,
+            "basis": r.basis,
+            "currency": r.currency,
+            "component_name": r.component_name,
+            "component_order": r.component_order,
+            "is_movement": r.is_movement,
+            "opening_balance": float(r.opening_balance),
+            "movement_amount": float(r.movement_amount),
+            "closing_balance": float(r.closing_balance),
+            "stored_continuity_flag": r.is_continuity_verified,
+            "continuity_difference": float(r.continuity_difference),
+            "trace_identifier": r.trace_identifier,
+            "created_at": iso(r.created_at),
+        }
+        for r in rows
+    ]
+
+    return {
+        "run_id": run_id,
+        "project_id": run.project_id,
+        "count": len(items),
+        "stored_continuity_verified": all_stored_verified,
+        "recomputed_continuity_verified": all_recomputed_verified,
+        "is_tampered_or_forged": is_tampered_global,
+        "max_continuity_difference": float(max_difference),
+        "tolerance": float(tolerance),
+        "cohort_evaluations": cohort_evals,
+        "items": items,
     }

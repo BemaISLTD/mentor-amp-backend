@@ -5,6 +5,7 @@ from app.api.analysis import router as analysis_router
 from app.api.auth import router as auth_router
 from app.api.audit_logs import router as audit_logs_router
 from app.api.assets import router as assets_router
+from app.api.assumptions import router as assumptions_router
 from app.api.dashboard import router as dashboard_router
 from app.api.data_manager import router as data_manager_router
 from app.api.dependencies import get_current_user, require_permissions
@@ -105,6 +106,9 @@ app.include_router(execution_router, prefix=API_PREFIX)
 app.include_router(expected_results_router, prefix=API_PREFIX)
 app.include_router(analysis_router, prefix=API_PREFIX)
 app.include_router(run_steps_router, prefix=API_PREFIX)
+app.include_router(assumptions_router, prefix=API_PREFIX)
+# Governance & reporting endpoints exposed under /v1 for frontend integration
+app.include_router(experimental_governance_router, prefix=API_PREFIX)
 # Metadata-only future capabilities are intentionally unavailable under /v1 and omitted
 # from OpenAPI until their actuarial execution/reporting behavior is implemented.
 app.include_router(

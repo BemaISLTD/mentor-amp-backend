@@ -23,14 +23,21 @@ def register_all_products() -> list[str]:
     from app.products.spia_lite import config as spia
     from app.products.spia_reference import config as spia_reference
     from app.products.myga_lite import config as myga
+    from app.products.fia_lite import config as fia
+    from app.products.rila_lite import config as rila
 
     spia.register_functions()
     spia_reference.register_functions()
     myga.register_functions()
+    fia.register_functions()
+    rila.register_functions()
     if spia.PRODUCT_CODE not in REGISTERED_PRODUCTS:
         REGISTERED_PRODUCTS.append(spia.PRODUCT_CODE)
     if myga.PRODUCT_CODE not in REGISTERED_PRODUCTS:
         REGISTERED_PRODUCTS.append(myga.PRODUCT_CODE)
+    for product in (fia, rila):
+        if product.PRODUCT_CODE not in REGISTERED_PRODUCTS:
+            REGISTERED_PRODUCTS.append(product.PRODUCT_CODE)
     return list(REGISTERED_PRODUCTS)
 
 
