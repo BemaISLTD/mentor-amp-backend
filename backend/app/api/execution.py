@@ -1,12 +1,13 @@
 """Run Sets and runs: preflight, submit, monitor, events, attempts, package, manifest (contract §E.7)."""
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import authorize_path, require_permissions
+from app.core.execution.backends import current_capability_registry
 from app.db.database import get_db
 from app.db.models.user import User
 from app.services import (
@@ -33,6 +34,15 @@ class RunSetRequest(BaseModel):
     projection_set_ids: list[str] = Field(min_length=1)
     scenario_ids: list[str] = Field(default_factory=list)
     notes: str | None = None
+    execution_backend: str | None = None
+    fallback_policy: str | None = None
+    execution_options: dict[str, Any] | None = None
+
+
+@router.get("/execution/capabilities")
+def execution_capabilities(user: Reader):
+    del user
+    return current_capability_registry().discovery_payload()
 
 
 @router.get("/projects/{project_id}/run-sets")

@@ -75,6 +75,30 @@ def _configuration_identity(package: RunPackage | None) -> dict[str, Any]:
     }
 
 
+def _runtime_execution_metadata(
+    attempt: RunAttempt | None,
+    package: RunPackage | None,
+) -> dict[str, Any]:
+    if attempt is not None and isinstance(attempt.metrics, dict):
+        execution = attempt.metrics.get("execution")
+        if isinstance(execution, dict):
+            return dict(execution)
+    cfg_backend = "cpu"
+    if package is not None and isinstance(package.package, dict):
+        cfg_backend = str(
+            (package.package.get("configuration") or {}).get("execution_backend") or "cpu"
+        )
+    return {
+        "requested_backend": cfg_backend,
+        "planned_backend": cfg_backend,
+        "actual_backend": cfg_backend,
+        "fallback_policy": "allow_cpu_fallback",
+        "fallback_used": False,
+        "fallback_reason": None,
+        "accelerated": False,
+    }
+
+
 def build_final_manifest(
     db: Session,
     run: Run,
@@ -84,6 +108,7 @@ def build_final_manifest(
     errors: list[str],
     environment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    execution_meta = _runtime_execution_metadata(attempt, package)
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "run": {
@@ -113,6 +138,7 @@ def build_final_manifest(
                 }
                 if attempt is not None else None
             ),
+            "execution": execution_meta,
             "accepted_attempt_number": run.accepted_attempt_number,
             "executed_build": attempt.executed_build if attempt is not None else None,
             "environment": environment or runtime_environment(),

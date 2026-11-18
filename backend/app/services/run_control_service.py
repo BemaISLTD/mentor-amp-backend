@@ -10,7 +10,7 @@ from app.core.audit import record_audit
 from app.core.execution import run_state
 from app.core.execution.run_package import RunPackageError
 from app.core.project_lifecycle import require_active_project
-from app.db.models.projection import RunSet
+from app.db.models.projection import RunEvent, RunSet
 from app.db.models.run import Run
 from app.db.models.run_package import RunPackage
 from app.services import run_package_verification, run_query_service
@@ -152,13 +152,27 @@ def retry_run(db: Session, run_id: str, user: Any) -> dict[str, Any]:
         package=document,
         created_by=user.id,
     ))
+    source_queued = (
+        db.query(RunEvent)
+        .filter(RunEvent.run_id == source.id, RunEvent.step == "queued")
+        .order_by(RunEvent.id.asc())
+        .first()
+    )
+    source_exec_req = (
+        dict((source_queued.data or {}).get("execution_request") or {})
+        if source_queued and source_queued.data
+        else {}
+    )
+    queued_data: dict[str, Any] = {
+        "retried_from_run_id": source.id,
+        "run_package_fingerprint": package.fingerprint,
+    }
+    if source_exec_req:
+        queued_data["execution_request"] = source_exec_req
     add_event(
         db, retried.id, "queued",
         f"Retry queued from run {source.id} with the same frozen configuration.",
-        data={
-            "retried_from_run_id": source.id,
-            "run_package_fingerprint": package.fingerprint,
-        },
+        data=queued_data,
     )
     add_event(
         db, source.id, "retried", f"Retry created as run {retried.id}.",

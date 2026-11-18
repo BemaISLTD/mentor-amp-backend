@@ -12,7 +12,16 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core import lifecycle
+from app.core.audit import record_audit
 from app.core.execution import run_state
+from app.core.execution.backends import (
+    ExecutionPlanContext,
+    ExecutionPlanner,
+    ExecutionPlanningError,
+    ExecutionRequest,
+    current_capability_registry,
+    validate_execution_request,
+)
 from app.db.models.projection import ProjectionSet, RunSet
 from app.db.models.run import Run
 from app.db.models.run_package import RunPackage
@@ -43,25 +52,66 @@ def _plan(db: Session, user: Any, payload: dict, write: bool):
     return project, plan
 
 
+def _validated_execution_request(payload: dict) -> ExecutionRequest:
+    try:
+        return validate_execution_request(
+            payload.get("execution_backend"),
+            payload.get("fallback_policy"),
+            payload.get("execution_options"),
+        )
+    except ExecutionPlanningError as error:
+        raise ServiceError(error.status_code, error.code, error.message, error.details) from error
+
+
+def _plan_context_from_configuration(
+    configuration: dict[str, Any] | None, *, scenario_count: int = 1
+) -> ExecutionPlanContext:
+    cfg = configuration or {}
+    inforce_items = (cfg.get("datasets") or {}).get("inforce") or []
+    policy_count = sum(int(item.get("record_count") or 0) for item in inforce_items)
+    return ExecutionPlanContext(
+        product_code=(cfg.get("model") or {}).get("product_code"),
+        policy_count=policy_count,
+        horizon_months=int(cfg.get("horizon_months") or 0),
+        scenario_count=max(scenario_count, 1),
+    )
+
+
 def preflight(db: Session, payload: dict, user: Any) -> dict[str, Any]:
     """Dry run of submission: freeze every planned package without saving anything."""
+    exec_request = _validated_execution_request(payload)
     project, plan = _plan(db, user, payload, write=True)
+    planner = ExecutionPlanner(current_capability_registry())
     planned = []
     problems: list[dict[str, Any]] = []
+    execution_ok = True
     for projection_set, scenario_ids, _source in plan:
         if not scenario_ids:
             problems.append({"code": "NO_SCENARIOS", "message": f"'{projection_set.name}' has no scenarios."})
         for scenario_id in scenario_ids:
             configuration, _governance, found = packages.collect(db, project, projection_set, scenario_id)
+            exec_plan = planner.plan(
+                exec_request,
+                _plan_context_from_configuration(configuration, scenario_count=len(scenario_ids)),
+            )
+            run_problems = [problem.as_dict() for problem in found]
+            if not exec_plan.runnable:
+                execution_ok = False
+                run_problems.append({
+                    "code": exec_plan.error_code or "EXECUTION_BACKEND_UNAVAILABLE",
+                    "message": exec_plan.error_message or "Requested execution backend is unavailable.",
+                    "reasons": list(exec_plan.reasons),
+                })
             item = {
                 "projection_set_id": projection_set.id,
                 "scenario_id": scenario_id,
                 "name": _run_name(projection_set, configuration, scenario_id),
-                "ok": not found,
-                "problems": [problem.as_dict() for problem in found],
+                "ok": not run_problems,
+                "problems": run_problems,
+                "execution_plan": exec_plan.as_provenance(),
             }
             planned.append(item)
-            problems += item["problems"]
+            problems += run_problems
     codes = {problem["code"] for problem in problems}
     checks = [
         _check("projection_sets_validated", "Projection compatibility",
@@ -78,6 +128,12 @@ def preflight(db: Session, payload: dict, user: Any) -> dict[str, Any]:
         _check("scenarios_valid", "Scenarios valid",
                bool(planned) and not {code for code in codes if code.startswith("SCENARIO") or code == "NO_SCENARIOS"},
                f"{len(planned)} scenario run(s)"),
+        _check(
+            "execution_backend",
+            "Execution backend",
+            execution_ok,
+            f"requested={exec_request.requested_backend}, policy={exec_request.fallback_policy}",
+        ),
         # Reports are not implemented yet: "deferred" is neither a pass nor a failure, and it
         # does not affect "ok" (a capability that does not exist is never reported as passing).
         {"code": "reports_attached", "label": "Report attachment", "status": DEFERRED,
@@ -86,6 +142,7 @@ def preflight(db: Session, payload: dict, user: Any) -> dict[str, Any]:
     return {
         "ok": bool(planned) and not problems
         and all(check["status"] in ("pass", DEFERRED) for check in checks),
+        "execution": exec_request.as_dict(),
         "checks": checks,
         "planned_runs": planned,
         "problems": problems,
@@ -105,7 +162,9 @@ def _run_name(projection_set: ProjectionSet, configuration: dict | None, scenari
 
 
 def submit_run_set(db: Session, payload: dict, user: Any) -> dict[str, Any]:
+    exec_request = _validated_execution_request(payload)
     project, plan = _plan(db, user, payload, write=True)
+    planner = ExecutionPlanner(current_capability_registry())
     for projection_set, scenario_ids, _source in plan:
         if projection_set.status not in lifecycle.RUNNABLE_PROJECTION_SET_STATUSES:
             raise conflict(
@@ -119,14 +178,25 @@ def submit_run_set(db: Session, payload: dict, user: Any) -> dict[str, Any]:
 
     submitted_at = now_utc()
     run_set_id = str(uuid.uuid4())
-    frozen: list[tuple[ProjectionSet, str, packages.FrozenPackage]] = []
+    frozen: list[tuple[ProjectionSet, str, packages.FrozenPackage, Any]] = []
     for projection_set, scenario_ids, _source in plan:
         for scenario_id in scenario_ids:
             run_id = str(uuid.uuid4())
             package = packages.freeze(
                 db, project, projection_set, scenario_id, user, run_id=run_id, run_set_id=run_set_id,
             )
-            frozen.append((projection_set, run_id, package))
+            exec_plan = planner.plan(
+                exec_request,
+                _plan_context_from_configuration(package.configuration, scenario_count=len(scenario_ids)),
+            )
+            if not exec_plan.runnable:
+                raise ServiceError(
+                    409,
+                    exec_plan.error_code or "EXECUTION_BACKEND_UNAVAILABLE",
+                    exec_plan.error_message or "Requested execution backend cannot run this model.",
+                    exec_plan.as_provenance(),
+                )
+            frozen.append((projection_set, run_id, package, exec_plan))
 
     run_set = RunSet(
         id=run_set_id,
@@ -138,14 +208,19 @@ def submit_run_set(db: Session, payload: dict, user: Any) -> dict[str, Any]:
         scenario_ids=list(dict.fromkeys(scenario_id for _ps, ids, _source in plan for scenario_id in ids)),
         resolution={
             "requested_scenario_ids": list(dict.fromkeys(payload.get("scenario_ids") or [])),
+            "execution": exec_request.as_dict(),
             "projection_sets": [
                 {
                     "projection_set_id": projection_set.id,
                     "scenario_source": source,
                     "scenario_ids": list(ids),
                     "runs": [
-                        {"run_id": run_id, "scenario_id": package.configuration["scenario"]["id"]}
-                        for ps, run_id, package in frozen if ps.id == projection_set.id
+                        {
+                            "run_id": run_id,
+                            "scenario_id": package.configuration["scenario"]["id"],
+                            "execution": exec_plan.as_provenance(),
+                        }
+                        for ps, run_id, package, exec_plan in frozen if ps.id == projection_set.id
                     ],
                 }
                 for projection_set, ids, source in plan
@@ -158,8 +233,8 @@ def submit_run_set(db: Session, payload: dict, user: Any) -> dict[str, Any]:
     db.add(run_set)
     db.flush()
 
-    created: list[tuple[Run, packages.FrozenPackage]] = []
-    for projection_set, run_id, package in frozen:
+    created: list[tuple[Run, packages.FrozenPackage, Any]] = []
+    for projection_set, run_id, package, exec_plan in frozen:
         configuration = package.configuration
         run = Run(
             id=run_id,
@@ -191,9 +266,28 @@ def submit_run_set(db: Session, payload: dict, user: Any) -> dict[str, Any]:
             package=document,
             created_by=user.id,
         ))
-        add_event(db, run.id, "queued", f"Run queued with run package {package.fingerprint[:12]}….",
-                  data={"run_package_fingerprint": package.fingerprint})
-        created.append((run, package))
+        add_event(
+            db, run.id, "queued",
+            f"Run queued with run package {package.fingerprint[:12]}… (requested_backend={exec_request.requested_backend}, planned_backend={exec_plan.planned_backend}).",
+            data={
+                "run_package_fingerprint": package.fingerprint,
+                "execution_request": exec_request.as_dict(),
+                "execution_plan": exec_plan.as_provenance(),
+            },
+        )
+        created.append((run, package, exec_plan))
+    record_audit(
+        db,
+        actor_user_id=user.id,
+        action="run_set.submitted",
+        entity_type="run_set",
+        entity_id=run_set.id,
+        after_state={
+            "project_id": project.id,
+            "execution": exec_request.as_dict(),
+            "run_ids": [run.id for run, _pkg, _plan in created],
+        },
+    )
     db.commit()
 
     return {
@@ -202,6 +296,7 @@ def submit_run_set(db: Session, payload: dict, user: Any) -> dict[str, Any]:
             "name": run_set.name,
             "status": run_set.status,
             "run_count": len(created),
+            "execution": exec_request.as_dict(),
             "submitted_at": iso(submitted_at),
         },
         "runs": [
@@ -216,8 +311,9 @@ def submit_run_set(db: Session, payload: dict, user: Any) -> dict[str, Any]:
                 },
                 "run_package_id": package.document["identity"]["package_id"],
                 "run_package_fingerprint": package.fingerprint,
+                "execution": exec_plan.as_provenance(),
             }
-            for run, package in created
+            for run, package, exec_plan in created
         ],
     }
 

@@ -32,6 +32,14 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.execution import run_package, run_state
+from app.core.execution.backends import (
+    ExecutionPlanContext,
+    ExecutionPlanner,
+    ExecutionPlanningError,
+    ExecutionRequest,
+    current_capability_registry,
+    validate_execution_request,
+)
 from app.core.artifacts import IDENTITY_NEUTRAL_SCHEMA, get_artifact_store
 from app.config import settings
 from app.core.execution.run_package import RunPackageError
@@ -41,7 +49,7 @@ from app.db.database import SessionLocal
 _ORIG_SESSION_LOCAL = SessionLocal
 def _get_session_local():
     return SessionLocal if SessionLocal is not _ORIG_SESSION_LOCAL else _db_mod.SessionLocal
-from app.db.models.projection import RunSet
+from app.db.models.projection import RunEvent, RunSet
 from app.db.models.run import Run
 from app.db.models.run_artifact import RunArtifact
 from app.db.models.run_package import RunAttempt, RunPackage
@@ -236,6 +244,32 @@ class _PreflightFailure(Exception):
         self.details = details or {}
 
 
+def _resolve_execution_request(db: Session, run: Run) -> ExecutionRequest:
+    """Resolve the run's requested execution backend & policy from persisted submission metadata."""
+    queued_event = (
+        db.query(RunEvent)
+        .filter(RunEvent.run_id == run.id, RunEvent.step == "queued")
+        .order_by(RunEvent.id.asc())
+        .first()
+    )
+    req_data: dict[str, Any] = {}
+    if queued_event is not None and isinstance(queued_event.data, dict):
+        maybe = queued_event.data.get("execution_request")
+        if isinstance(maybe, dict):
+            req_data = dict(maybe)
+    if not req_data and run.run_set_id:
+        run_set = db.get(RunSet, run.run_set_id)
+        if run_set is not None and isinstance(run_set.resolution, dict):
+            maybe = run_set.resolution.get("execution")
+            if isinstance(maybe, dict):
+                req_data = dict(maybe)
+    return validate_execution_request(
+        req_data.get("execution_backend"),
+        req_data.get("fallback_policy"),
+        req_data.get("execution_options"),
+    )
+
+
 def _load(db: Session, run: Run, package: RunPackage | None):
     """Verify the package, build, implementations and datasets; return what execution needs."""
     try:
@@ -350,6 +384,100 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
     product_code = configuration["model"]["product_code"]
     # Evidence is labelled with the FROZEN scenario identity (verified equal to the run index).
     scenario_id = configuration["scenario"]["id"] or ""
+
+    try:
+        exec_request = _resolve_execution_request(db, run)
+        planner = ExecutionPlanner(current_capability_registry())
+        exec_plan = planner.plan(
+            exec_request,
+            ExecutionPlanContext(
+                product_code=product_code,
+                policy_count=len(data.policies),
+                horizon_months=data.horizon_months,
+                scenario_count=1,
+            ),
+        )
+    except ExecutionPlanningError as error:
+        governance_service.update_run_step(
+            db, run_id, "calculate", "failed", error_code=error.code, error_message=error.message,
+        )
+        governance_service.update_run_step(db, run_id, "finalize", "running")
+        db.commit()
+        result = _fail(
+            db, run_id, attempt_id, attempt_number, error.code, error.message, error.details,
+            rows_written=False, metrics=metrics,
+        )
+        governance_service.update_run_step(
+            db, run_id, "finalize", "success" if result is not None else "failed",
+            error_code=None if result is not None else "FINALIZATION_ERROR",
+        )
+        db.commit()
+        return result
+
+    if not exec_plan.runnable:
+        rejected_prov = exec_plan.as_provenance()
+        attempt.metrics = {"execution": rejected_prov}
+        governance_service.update_run_step(
+            db, run_id, "calculate", "failed",
+            error_code=exec_plan.error_code or "EXECUTION_BACKEND_UNAVAILABLE",
+            error_message=exec_plan.error_message,
+        )
+        governance_service.update_run_step(db, run_id, "finalize", "running")
+        db.commit()
+        result = _fail(
+            db, run_id, attempt_id, attempt_number,
+            exec_plan.error_code or "EXECUTION_BACKEND_UNAVAILABLE",
+            exec_plan.error_message or "Requested execution backend is unavailable.",
+            rejected_prov, rows_written=False, metrics=metrics,
+            execution_provenance=rejected_prov,
+        )
+        governance_service.update_run_step(
+            db, run_id, "finalize", "success" if result is not None else "failed",
+            error_code=None if result is not None else "FINALIZATION_ERROR",
+        )
+        db.commit()
+        return result
+
+    try:
+        backend = planner.registry.get_backend(
+            exec_plan.planned_backend, policy_runner=run_policy
+        )
+    except ExecutionPlanningError as error:
+        governance_service.update_run_step(
+            db, run_id, "calculate", "failed", error_code=error.code, error_message=error.message,
+        )
+        governance_service.update_run_step(db, run_id, "finalize", "running")
+        db.commit()
+        result = _fail(
+            db, run_id, attempt_id, attempt_number, error.code, error.message, error.details,
+            rows_written=False, metrics=metrics, execution_provenance=exec_plan.as_provenance(),
+        )
+        governance_service.update_run_step(
+            db, run_id, "finalize", "success" if result is not None else "failed",
+            error_code=None if result is not None else "FINALIZATION_ERROR",
+        )
+        db.commit()
+        return result
+
+    execution_provenance = exec_plan.as_provenance(
+        backend_description=backend.capability().description,
+    )
+    attempt.metrics = {"execution": execution_provenance}
+    add_event(
+        db,
+        run.id,
+        "execution_fallback" if exec_plan.fallback_used else "execution_planned",
+        (
+            f"Requested backend '{exec_plan.requested_backend}' fell back to '{exec_plan.actual_backend}': "
+            f"{exec_plan.fallback_message}"
+            if exec_plan.fallback_used
+            else f"Execution backend '{exec_plan.actual_backend}' selected ({exec_plan.planner_reason})."
+        ),
+        level="warning" if exec_plan.fallback_used else "info",
+        data=execution_provenance,
+    )
+    db.commit()
+
     output_rows: list[dict[str, Any]] = []
     trace_rows: list[dict[str, Any]] = []
     total_values: dict[str, list[float]] = {}
@@ -431,7 +559,7 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                 cancelled = True
                 break
             began = perf_counter()
-            result = run_policy(data, policy, functions)
+            _, result = next(iter(backend.execute_policies(data, [policy], functions)))
             timing["calc"] += perf_counter() - began
             if result.error is not None:
                 failed_policies += 1
@@ -522,7 +650,8 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
         db.commit()
         result = _fail(db, run_id, attempt_id, attempt_number, "EXECUTION_ERROR",
                        f"Run failed during execution: {error}", {}, rows_written=True,
-                       metrics=metrics, prior_errors=errors, warnings=warnings)
+                       metrics=metrics, prior_errors=errors, warnings=warnings,
+                       execution_provenance=execution_provenance)
         governance_service.update_run_step(
             db, run_id, "finalize", "success" if result is not None else "failed",
             error_code=None if result is not None else "FINALIZATION_ERROR",
@@ -560,7 +689,8 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
         cleanup_status = _delete_attempt_rows(db, run_id, attempt_number)
         error_type, error_message = "ALL_POLICIES_FAILED", (errors[0] if errors else None)
     succeeded = len(data.policies) - failed_policies
-    rounded = {key: round(value, 4) for key, value in metrics.items()}
+    rounded: dict[str, Any] = {key: round(value, 4) for key, value in metrics.items()}
+    rounded["execution"] = execution_provenance
     outcome = TerminalOutcome(
         run_id=run_id,
         attempt_id=attempt_id,
@@ -575,7 +705,8 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
         error_type=error_type,
         error_message=error_message,
         summary=_build_summary(run, status, configuration, data, totals, counts, failed_policies,
-                               attempt_number, len(errors), len(warnings)),
+                               attempt_number, len(errors), len(warnings),
+                               execution_provenance=execution_provenance),
         metrics=rounded,
         warnings=warnings,
         errors=errors,
@@ -625,9 +756,13 @@ def _fail(
     metrics: dict[str, float] | None = None,
     prior_errors: list[str] | None = None,
     warnings: list[str] | None = None,
+    execution_provenance: dict[str, Any] | None = None,
 ) -> str | None:
     cleanup_status = _delete_attempt_rows(db, run_id, attempt_number) if rows_written else "not_needed"
     errors = [*(prior_errors or []), message]
+    rounded_metrics: dict[str, Any] = {key: round(value, 4) for key, value in (metrics or {}).items()}
+    if execution_provenance is not None:
+        rounded_metrics["execution"] = execution_provenance
     outcome = TerminalOutcome(
         run_id=run_id,
         attempt_id=attempt_id,
@@ -639,7 +774,7 @@ def _fail(
         cleanup_status=cleanup_status,
         error_type=error_type,
         error_message=message,
-        metrics={key: round(value, 4) for key, value in (metrics or {}).items()} or None,
+        metrics=rounded_metrics or None,
         warnings=list(warnings or []),
         errors=errors,
         environment=runtime_environment(),
@@ -662,6 +797,7 @@ def _build_summary(
     attempt_number: int,
     error_count: int,
     warning_count: int,
+    execution_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     published = configuration["outputs"].get("published") or {}
     illustrative = bool(configuration["model_version"]["illustrative"])
@@ -711,4 +847,5 @@ def _build_summary(
             "captured_policy_count": len(data.traced_policy_ids),
             "policy_ids": sorted(data.traced_policy_ids),
         },
+        "execution": execution_provenance,
     }

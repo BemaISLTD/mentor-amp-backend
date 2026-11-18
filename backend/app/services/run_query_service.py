@@ -49,6 +49,46 @@ def results_available(db: Session, run: Run) -> bool:
     return evidence_consistent(db, run)
 
 
+def _execution_provenance(db: Session, run: Run) -> dict[str, Any]:
+    """Return actual/planned execution metadata from attempt, manifest, queued event, or CPU default."""
+    target_attempt = run.accepted_attempt_number or run.attempt_count
+    if target_attempt:
+        attempt = (
+            db.query(RunAttempt)
+            .filter(RunAttempt.run_id == run.id, RunAttempt.attempt_number == target_attempt)
+            .first()
+        )
+        if attempt is not None and isinstance(attempt.metrics, dict):
+            exec_meta = attempt.metrics.get("execution")
+            if isinstance(exec_meta, dict):
+                return dict(exec_meta)
+    manifest = db.get(RunManifest, run.id)
+    if manifest is not None and isinstance(manifest.manifest, dict):
+        exec_meta = (manifest.manifest.get("runtime") or {}).get("execution")
+        if isinstance(exec_meta, dict):
+            return dict(exec_meta)
+    queued_event = (
+        db.query(RunEvent)
+        .filter(RunEvent.run_id == run.id, RunEvent.step == "queued")
+        .order_by(RunEvent.id.asc())
+        .first()
+    )
+    if queued_event is not None and isinstance(queued_event.data, dict):
+        exec_plan = queued_event.data.get("execution_plan")
+        if isinstance(exec_plan, dict):
+            return dict(exec_plan)
+    return {
+        "requested_backend": "cpu",
+        "planned_backend": "cpu",
+        "actual_backend": "cpu",
+        "fallback_policy": "allow_cpu_fallback",
+        "fallback_used": False,
+        "fallback_reason": None,
+        "accelerated": False,
+        "backend_description": "Local CPU reference path",
+    }
+
+
 def run_view(db: Session, run: Run, lookups: Lookups | None = None, include_summary: bool = True) -> dict:
     lookups = lookups or Lookups(db)
     run_set = lookups.get(RunSet, run.run_set_id)
@@ -68,6 +108,10 @@ def run_view(db: Session, run: Run, lookups: Lookups | None = None, include_summ
         duration = round((end - started).total_seconds(), 1)
         if run.status == run_state.RUNNING and done and total > done:
             eta = int(duration / done * (total - done))
+
+    exec_prov = _execution_provenance(db, run)
+    actual_backend = str(exec_prov.get("actual_backend") or "cpu")
+    backend_desc = str(exec_prov.get("backend_description") or "Local CPU reference path")
 
     return {
         "id": run.id,
@@ -102,7 +146,8 @@ def run_view(db: Session, run: Run, lookups: Lookups | None = None, include_summ
         },
         "error_count": run.error_count or 0,
         "warning_count": run.warning_count or 0,
-        "compute": {"backend": "cpu", "description": "Local CPU reference path"},
+        "compute": {"backend": actual_backend, "description": backend_desc},
+        "execution": exec_prov,
         "created_at": iso(run.created_at),
         "started_at": iso(run.started_at),
         "completed_at": iso(run.completed_at),
@@ -294,6 +339,7 @@ def list_attempts(db: Session, run_id: str) -> dict[str, Any]:
                 "trace_row_count": row.trace_row_count,
                 "executed_build": row.executed_build,
                 "metrics": row.metrics,
+                "execution": (row.metrics or {}).get("execution") if isinstance(row.metrics, dict) else None,
             }
             for row in rows
         ],

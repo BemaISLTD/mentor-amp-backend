@@ -42,7 +42,7 @@ jobs:
       - name: Install pure-CPU backend dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest
+          pip install -r requirements.txt "dagster>=1.10,<2.0" pytest
 
       - name: Verify Alembic canonical single head
         run: python -m pytest -q tests/unit/test_wp1_alembic_history.py
@@ -84,7 +84,7 @@ jobs:
       - name: Install pure-CPU backend dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest
+          pip install -r requirements.txt "dagster>=1.10,<2.0" pytest
 
       - name: Run PostgreSQL migration and concurrency suite
         run: python -m pytest -q tests/postgres

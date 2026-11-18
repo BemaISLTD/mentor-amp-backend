@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
 from app.config import settings
+from app.core.execution.backends import current_capability_registry
 from app.core.projection_engine.engine import ENGINE_VERSION
 from app.db.database import get_db
 from app.products.registry import REGISTERED_PRODUCTS, registered_function_count
@@ -28,6 +29,7 @@ def system_status(db: Session = Depends(get_db)):
     except Exception:  # noqa: BLE001 - report, never raise
         database["status"] = "error"
     functions = registered_function_count()
+    discovery = current_capability_registry().discovery_payload()
     degraded = (
         database["status"] != "ok"
         or (database["latency_ms"] or 0) > SLOW_DATABASE_MS
@@ -45,6 +47,10 @@ def system_status(db: Session = Depends(get_db)):
             "registered_functions": functions,
             "products": list(REGISTERED_PRODUCTS),
             "execution_backend": "cpu",
+            "available_execution_backends": [
+                name for name, item in discovery["backends"].items() if item["available"]
+            ],
+            "execution_capabilities": discovery["backends"],
             "engine_version": ENGINE_VERSION,
         },
         "time": iso(now_utc()),
