@@ -1,0 +1,7 @@
+# Optional PySpark Classic execution dependencies for Mentor AMP Phase 6 (Python 3.14 + Java 17+)
+# Verified in isolated venv-spark against backend/requirements.txt (pip check -> 0 broken deps).
+# Note: Spark Classic 4.1+ is required on Python 3.14 (Spark 3.5 is incompatible with Python 3.14).
+pyspark==4.1.1
+py4j==0.10.9.9
+pyarrow==26.0.1
+pandas==3.1.1

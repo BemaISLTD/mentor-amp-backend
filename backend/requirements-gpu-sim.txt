@@ -1,0 +1,8 @@
+# Optional GPU / CUDA Simulator dependencies for Mentor AMP Phase 6 (Python 3.14 + NumPy 2.5 compatible)
+# Tested in isolated venv-gpu-sim against backend/requirements.txt (pip check -> 0 broken deps).
+# Note: On machines without an NVIDIA GPU or CUDA Toolkit, run with NUMBA_ENABLE_CUDASIM=1;
+# nvidia-cuda-runtime provides cudart DLL/SO required by numba-cuda at module import time.
+# Simulator runs prove kernel API/parity only and MUST NOT be reported as NVIDIA hardware timing evidence.
+numba==0.68.1
+numba-cuda==0.30.4
+nvidia-cuda-runtime==13.5.37

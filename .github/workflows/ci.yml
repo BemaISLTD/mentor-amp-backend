@@ -1,0 +1,119 @@
+name: Mentor AMP Backend CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mentoramp-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_ENV: test
+  DEBUG: "true"
+  AUTH_MODE: jwt
+  JWT_SECRET_KEY: ci-test-only-jwt-secret-not-for-production-32bytes
+  DATABASE_URL: sqlite:////tmp/mentoramp_ci_unit.db
+
+jobs:
+  cpu-and-migrations:
+    name: CPU Reference Tests & Alembic Single-Head
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install pure-CPU backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Verify Alembic canonical single head
+        run: python -m pytest -q tests/unit/test_wp1_alembic_history.py
+
+      - name: Run CPU unit, golden policy, and integration suites
+        run: python -m pytest -q tests/unit tests/golden_policy tests/integration
+
+  postgres-disposable:
+    name: Disposable PostgreSQL Governance & Migrations
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: mentoramp_ci
+          POSTGRES_PASSWORD: mentoramp_ci_test_only_password
+          POSTGRES_DB: mentoramp_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U mentoramp_ci -d mentoramp_ci_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      MENTORAMP_TEST_POSTGRES_URL: postgresql://mentoramp_ci:mentoramp_ci_test_only_password@localhost:5432/mentoramp_ci_test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install pure-CPU backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Run PostgreSQL migration and concurrency suite
+        run: python -m pytest -q tests/postgres
+
+  spark-local-smoke:
+    name: PySpark Local Partition Smoke (Python 3.14 + Java 17)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Set up Temurin Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install backend + Spark optional dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-spark.txt pytest
+
+      - name: Run local PySpark partition smoke test
+        run: python scripts/smoke_spark_m6_00.py
