@@ -17,6 +17,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  APP_ENV: test
+  DEBUG: "true"
+  AUTH_MODE: jwt
   DATABASE_URL: sqlite:////tmp/mentoramp_ci_unit.db
 
 jobs:
