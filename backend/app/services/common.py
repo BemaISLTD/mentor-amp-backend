@@ -19,6 +19,7 @@ PRODUCT_NAMES = {
     "IDI": "Individual Disability Income",
     "VA": "Variable Annuity",
     "PRT": "Pension Risk Transfer",
+    "LIFE": "Life Readiness (Schema Only)",
 }
 
 TERMINAL_RUN_STATUSES = {"success", "partial_success", "failed", "cancelled"}

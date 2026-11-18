@@ -3,7 +3,7 @@ import pytest
 from app.db.models.data_manager import ImportSession
 from app.products.shared_modules.synthetic import block_rows
 from app.services.data_manager_service import _validate_inforce
-from app.products.registry import register_all_products
+from app.products.registry import register_all_products, registered_function_count
 
 
 @pytest.mark.parametrize("code", ["FIA", "RILA"])
@@ -19,8 +19,11 @@ def test_indexed_block_schema_and_conservation(code):
 
 
 def test_registration_is_idempotent():
-    assert register_all_products() == ["SPIA", "MYGA", "FIA", "RILA"]
-    assert register_all_products() == ["SPIA", "MYGA", "FIA", "RILA"]
+    expected = ["SPIA", "MYGA", "FIA", "RILA", "IDI", "VA", "PRT"]
+    assert register_all_products() == expected
+    function_count = registered_function_count()
+    assert register_all_products() == expected
+    assert registered_function_count() == function_count
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf")])

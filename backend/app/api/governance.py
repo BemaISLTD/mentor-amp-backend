@@ -4,6 +4,8 @@ from datetime import date
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Response, status
+from fastapi.responses import StreamingResponse
+from io import BytesIO
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
@@ -11,7 +13,7 @@ from app.api.dependencies import authorize_path
 from app.db.database import get_db
 from app.db.models.governance import DerivedDataset, Report
 from app.db.models.user import User
-from app.services import governance_service
+from app.services import governance_service, reporting_service
 
 router = APIRouter(tags=["experimental actuarial governance"])
 run_steps_router = APIRouter(tags=["run steps"])
@@ -20,6 +22,12 @@ ProjectWriter = Annotated[
     User, Depends(authorize_path("project", "project_id", "registries:write", write=True))
 ]
 RunReader = Annotated[User, Depends(authorize_path("run", "run_id", "runs:read"))]
+ReportReader = Annotated[User, Depends(authorize_path(
+    "report", "report_id", "projects:read"
+))]
+ReportWriter = Annotated[User, Depends(authorize_path(
+    "report", "report_id", "registries:write", write=True
+))]
 
 
 class RollforwardStepDefinition(BaseModel):
@@ -194,12 +202,38 @@ def create_report(project_id: str, payload: ReportCreate, user: ProjectWriter,
     return governance_service.create_report(db, project_id, payload.model_dump(), user)
 
 
+@router.post("/projects/{project_id}/reports/{report_id}/generate")
+def generate_report(project_id: str, report_id: str, user: ProjectWriter,
+                    db: Session = Depends(get_db)):
+    return reporting_service.generate(db, project_id, report_id, user)
+
+
 @router.get("/reports/{report_id}")
 def get_report(report_id: str, user: Annotated[User, Depends(authorize_path(
     "report", "report_id", "projects:read"
 ))], db: Session = Depends(get_db)):
     del user
     return governance_service.versioned_detail(db, Report, report_id)
+
+
+@router.get("/reports/{report_id}/payload")
+def report_payload(report_id: str, user: ReportReader, db: Session = Depends(get_db)):
+    del user
+    return reporting_service.payload(db, report_id)
+
+
+@router.get("/reports/{report_id}/export.csv")
+def report_export(report_id: str, user: ReportReader, db: Session = Depends(get_db)):
+    content, report = reporting_service.export_csv(db, report_id, user)
+    headers = {
+        "Content-Disposition": f'attachment; filename="report-{report.id}-v{report.version_number}.csv"',
+        "X-MentorAmp-Report-Id": report.id,
+        "X-MentorAmp-Report-Version": str(report.version_number),
+        "X-MentorAmp-Synthetic": str(bool(
+            ((report.definition or {}).get("generated") or {}).get("is_synthetic")
+        )).lower(),
+    }
+    return StreamingResponse(BytesIO(content), media_type="text/csv; charset=utf-8", headers=headers)
 
 
 @router.patch("/reports/{report_id}")

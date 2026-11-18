@@ -51,7 +51,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition", "X-MentorAmp-Run-Id", "X-MentorAmp-Illustrative", "X-MentorAmp-Complete"],
+    expose_headers=[
+        "Content-Disposition", "X-MentorAmp-Run-Id", "X-MentorAmp-Illustrative",
+        "X-MentorAmp-Complete", "X-MentorAmp-Report-Id", "X-MentorAmp-Report-Version",
+        "X-MentorAmp-Synthetic",
+    ],
 )
 
 register_exception_handlers(app)

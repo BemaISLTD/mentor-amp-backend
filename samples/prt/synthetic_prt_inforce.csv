@@ -1,0 +1,5 @@
+policy_id,product_type,issue_date,issue_age,gender,premium,participant_id,plan_group_id,participant_status,monthly_benefit,deferral_months,form_of_annuity,certain_months,joint_survivor_pct,cola_rate,cola_cap,expense_pct_of_benefit,discount_rate,spouse_age,spouse_gender
+PRT-LIFE-10001,PRT,2026-01-01,65,M,0,PART-10001,PLAN-A,in_pay,1000,0,life_only,0,0,0.02,0.03,0.01,0.04,,
+PRT-CERT-10002,PRT,2026-01-01,68,F,0,PART-10002,PLAN-A,in_pay,1250,0,certain_and_life,120,0,0.02,0.03,0.01,0.04,,
+PRT-JS-10003,PRT,2026-01-01,67,M,0,PART-10003,PLAN-B,in_pay,1500,0,joint_survivor,0,0.5,0.02,0.03,0.01,0.04,64,F
+PRT-DEF-10004,PRT,2026-01-01,55,F,0,PART-10004,PLAN-B,deferred,900,24,life_only,0,0,0.02,0.03,0.01,0.04,,
