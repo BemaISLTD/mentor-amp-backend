@@ -87,14 +87,16 @@ Focused verification completed during implementation:
 - Isolated Phase 7 E2E workflow: `1 passed`.
 - Phase 7 focused product, Data Manager, report, seed, and golden suites:
   `51 passed, 3 skipped`.
-- Exact final full SQLite suite: `792 passed, 33 skipped, 1 warning` in
-  `2259.30s`. The warning is the known Starlette `TestClient`/`httpx`
+- Post-review reporting, shared-module, LIFE-gate, and E2E regression suite:
+  `21 passed`.
+- Exact final full SQLite suite: `796 passed, 33 skipped, 1 warning` in
+  `2364.50s`. The warning is the known Starlette `TestClient`/`httpx`
   deprecation warning and is not a calculation or API failure.
 - Exact final disposable PostgreSQL 15 suite plus Phase 7 E2E:
-  `26 passed, 1 warning` in `742.05s`. The database name was
+  `26 passed, 1 warning` in `966.07s`. The database name was
   `mentoramp_phase7_test`; it was removed after verification. Canonical
   Alembic head: `c9f4e2d8a615`.
 
-The skipped cases are the three owner-signed actuarial oracle placeholders as
-applicable to the selected focused suite; they remain gated rather than being
-replaced by illustrative approval claims.
+The skips include the owner-signed actuarial oracle placeholders and other
+explicitly gated or environment-specific cases; none is replaced by an
+illustrative approval claim.

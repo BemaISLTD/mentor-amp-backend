@@ -1,3 +1,4 @@
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -6,6 +7,8 @@ from app.db.database import Base
 from app.db.models.inforce import InforceFile
 from app.db.models.project import Project
 from app.db.models.projection import ProjectionSet
+from app.services import run_submission_service
+from app.services.common import ServiceError
 from scripts.seed_phase7 import seed_phase7
 
 
@@ -35,5 +38,23 @@ def test_phase7_seed_is_idempotent_and_life_versions_are_four_eyes_approved(tmp_
             assert all(row.committed_by and row.approved_by for row in life_versions)
             assert all(row.committed_by != row.approved_by for row in life_versions)
             assert life_versions[1].parent_file_id == life_versions[0].id
+
+            life_projection = ProjectionSet(
+                project_id=first_ids["LIFE"], name="LIFE calculations excluded",
+                status=lifecycle.DRAFT, model_version_id=None,
+                inforce_file_ids=[life_versions[-1].id],
+                valuation_date=life_versions[-1].uploaded_at.date(), horizon_months=12,
+                created_by=first["LIFE"]["user"].id, updated_by=first["LIFE"]["user"].id,
+            )
+            db.add(life_projection)
+            db.flush()
+            with pytest.raises(ServiceError) as excluded:
+                run_submission_service.submit_run_set(db, {
+                    "project_id": first_ids["LIFE"],
+                    "projection_set_ids": [life_projection.id],
+                    "name": "LIFE exclusion proof",
+                }, first["LIFE"]["user"])
+            assert excluded.value.status_code == 422
+            assert excluded.value.code == "MODEL_NOT_CONFIGURED"
     finally:
         engine.dispose()

@@ -217,6 +217,30 @@ def test_va_glwb_excess_withdrawal_reduces_base_pro_rata():
     assert annual_result["benefit_base_close"] == pytest.approx(89_333.33333333333)
 
 
+@pytest.mark.parametrize(
+    ("withdrawal_mode", "expected_close"),
+    (("dollar_for_dollar", 87_000.0), ("pro_rata", 84_866.66666666667)),
+)
+def test_va_gmwb_excess_withdrawal_honors_explicit_reduction_mode(
+    withdrawal_mode, expected_close
+):
+    result = va_guarantee_step(
+        rider_type="GMWB",
+        benefit_base_open=100_000.0,
+        gmwb_remaining_open=100_000.0,
+        gmdb_base_open=0.0,
+        account_value_before_withdrawal=80_000.0,
+        account_value_close=67_000.0,
+        av_paid_withdrawal=13_000.0,
+        gross_withdrawal=13_000.0,
+        gwb_pct=0.60,
+        withdrawal_mode=withdrawal_mode,
+    )
+    assert result["guaranteed_withdrawal_paid"] == 5_000.0
+    assert result["benefit_base_close"] == pytest.approx(expected_close)
+    assert result["gmwb_remaining_close"] == pytest.approx(expected_close)
+
+
 def test_va_death_benefit_structured_contract_and_scalar_wrappers():
     result = va_death_benefit(80_000.0, 100_000.0, "GMDB_ROP")
     assert result == {"total_death_benefit": 100_000.0, "nar_death_claim": 20_000.0}

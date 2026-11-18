@@ -27,6 +27,7 @@ from app.core.artifacts import LocalParquetArtifactStore, verified_artifact_byte
 from app.db.database import Base
 from app.db.models.audit_log import AuditLog
 from app.db.models.governance import Report
+from app.db.models.projection import ProjectionSet
 from app.db.models.run import Run
 from app.db.models.run_artifact import RunArtifact
 from app.db.models.run_package import RunPackage
@@ -39,6 +40,7 @@ from app.services import (
     run_submission_service,
     trace_service,
 )
+from app.services.common import ServiceError
 from scripts.seed_phase7 import seed_phase7
 
 
@@ -96,6 +98,32 @@ def generate(output: str | Path) -> dict:
                 stack.enter_context(patch.object(run_execution_service, "SessionLocal", Session))
                 with Session() as db:
                     seeded = seed_phase7(db)
+                    life = seeded["LIFE"]
+                    life_projection = ProjectionSet(
+                        project_id=life["project"].id,
+                        name="LIFE calculations excluded",
+                        status="draft",
+                        model_version_id=None,
+                        inforce_file_ids=[life["versions"][-1].id],
+                        valuation_date=life["versions"][-1].uploaded_at.date(),
+                        horizon_months=12,
+                        created_by=life["user"].id,
+                        updated_by=life["user"].id,
+                    )
+                    db.add(life_projection)
+                    db.flush()
+                    try:
+                        run_submission_service.submit_run_set(db, {
+                            "project_id": life["project"].id,
+                            "projection_set_ids": [life_projection.id],
+                            "name": "LIFE exclusion proof",
+                        }, life["user"])
+                    except ServiceError as exc:
+                        if exc.code != "MODEL_NOT_CONFIGURED":
+                            raise
+                        life_calculation_status = exc.code
+                    else:
+                        raise RuntimeError("LIFE execution was not rejected as MODEL_NOT_CONFIGURED.")
                     submissions = {}
                     for code in ("IDI", "VA", "PRT"):
                         item = seeded[code]
@@ -188,7 +216,7 @@ def generate(output: str | Path) -> dict:
                     governance_service.publish_versioned(db, Report, report_id, actor)
                     version = governance_service.version_versioned(db, Report, report_id, actor)
                     actions = [row.action for row in db.query(AuditLog).filter(
-                        AuditLog.entity_id == report_id
+                        AuditLog.entity_id.in_((report_id, version["id"]))
                     ).order_by(AuditLog.created_at).all()]
                     evidence["report"] = {
                         "report_id": report_id,
@@ -205,7 +233,7 @@ def generate(output: str | Path) -> dict:
                             row.approved_by and row.approved_by != row.committed_by
                             for row in seeded["LIFE"]["versions"]
                         ),
-                        "calculation_status": "MODEL_NOT_CONFIGURED",
+                        "calculation_status": life_calculation_status,
                     }
                 _write(destination / "phase7-evidence.json", evidence)
                 return evidence

@@ -15,7 +15,7 @@ from app.db.models.project import Project
 from app.db.models.project_member import ProjectMember
 from app.db.models.run import Run
 from app.db.models.user import User
-from app.services import reporting_service
+from app.services import governance_service, reporting_service
 from app.services.common import ServiceError
 
 
@@ -80,6 +80,30 @@ def test_report_payload_is_honest_when_optional_persisted_evidence_is_absent(rep
     assert payload["asu_2018_12_disclosure_supporting"]["actuarial_review_status"] == (
         "PENDING_ACT_DEC_09_AND_CAS_17"
     )
+
+
+def test_report_ending_balances_sum_all_policies_at_latest_month():
+    totals, endings = reporting_service._output_summaries([
+        {"policy_id": "A", "variable_name": "reserve", "projection_month": 1, "value_json": "10"},
+        {"policy_id": "A", "variable_name": "reserve", "projection_month": 2, "value_json": "80"},
+        {"policy_id": "B", "variable_name": "reserve", "projection_month": 2, "value_json": "20"},
+    ])
+    assert totals["reserve"] == 110
+    assert endings["reserve"] == 100
+
+
+def test_generated_report_cannot_be_edited_in_place(reporting_db):
+    db, user, _project, _run, report = reporting_db
+    report.artifact_uri = "local://reports/report.json"
+    report.artifact_fingerprint = "b" * 64
+    db.commit()
+
+    with pytest.raises(ServiceError) as generated:
+        governance_service.update_versioned(
+            db, Report, report.id, {"name": "Mutated generated report"}, SimpleNamespace(id=user.id)
+        )
+    assert generated.value.status_code == 409
+    assert "create a new version" in generated.value.message
 
 
 def test_report_payload_and_csv_fail_closed_on_physical_tamper(reporting_db):

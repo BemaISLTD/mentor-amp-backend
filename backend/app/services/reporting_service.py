@@ -98,7 +98,8 @@ def _value(row: dict[str, Any]) -> Decimal | None:
 
 def _output_summaries(rows: list[dict[str, Any]]) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
     totals: dict[str, Decimal] = {}
-    endings: dict[str, tuple[int, Decimal]] = {}
+    ending_months: dict[str, int] = {}
+    endings: dict[str, Decimal] = {}
     for row in rows:
         name = str(row.get("variable_name") or "")
         value = _value(row)
@@ -106,9 +107,12 @@ def _output_summaries(rows: list[dict[str, Any]]) -> tuple[dict[str, Decimal], d
             continue
         totals[name] = totals.get(name, Decimal("0")) + value
         month = int(row.get("projection_month") or 0)
-        if name not in endings or month >= endings[name][0]:
-            endings[name] = (month, value)
-    return totals, {name: item[1] for name, item in endings.items()}
+        if name not in ending_months or month > ending_months[name]:
+            ending_months[name] = month
+            endings[name] = value
+        elif month == ending_months[name]:
+            endings[name] += value
+    return totals, endings
 
 
 def _first(mapping: dict[str, Decimal], names: tuple[str, ...]) -> Decimal | None:
@@ -214,7 +218,7 @@ def _payload(db: Session, report: Report, run, configuration: dict[str, Any],
     disclosure_items = [{
         "basis": item.get("basis"), "methodology": item.get("methodology"),
         "product_code": product_code, "cohort_id": item.get("cohort_id"),
-        "scenario_id": scenario_id, "projection_year": None,
+        "scenario_id": scenario_id, "projection_year": item.get("projection_year"),
         "component_name": item.get("component_name"),
         "movement_amount": item.get("movement_amount"),
         "closing_balance": item.get("closing_balance"),

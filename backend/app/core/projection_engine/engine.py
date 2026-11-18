@@ -246,8 +246,6 @@ class _PolicyCalculator:
         if kind == "input":
             column = source.get("column") or spec.name
             raw = self.policy.data.get(column)
-            if raw in (None, "") and spec.default_value is not None:
-                raw = spec.default_value
             return _Resolution(
                 value=self._coerce(spec, raw),
                 source_type="input",

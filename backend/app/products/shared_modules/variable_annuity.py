@@ -172,6 +172,20 @@ def va_guarantee_step(
         rider_claim = max(0.0, guaranteed - av_paid) if survival > 0.0 else 0.0
         gmwb_close = max(0.0, gmwb_remaining - guaranteed)
         benefit_base_close = max(0.0, benefit_base - guaranteed)
+        excess = max(0.0, withdrawal - monthly_allowance)
+        if excess > 0.0:
+            if withdrawal_mode == "dollar_for_dollar":
+                gmwb_close = max(0.0, gmwb_close - excess)
+                benefit_base_close = max(0.0, benefit_base_close - excess)
+            else:
+                av_before_excess = max(0.0, av_before - monthly_allowance)
+                factor = (
+                    max(0.0, 1.0 - excess / av_before_excess)
+                    if av_before_excess > 0.0
+                    else 0.0
+                )
+                gmwb_close *= factor
+                benefit_base_close *= factor
     elif rider_type == "GLWB":
         if withdrawal == 0.0:
             benefit_base_close *= (1.0 + rollup) ** (1.0 / 12.0)

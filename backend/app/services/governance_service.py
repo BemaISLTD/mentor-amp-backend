@@ -336,6 +336,8 @@ def update_versioned(db: Session, model: type, object_id: str, payload: dict[str
     _project_write(db, user, row.project_id)
     if row.status == "published":
         raise conflict(f"Published {label.lower()} versions are immutable; create a new version.")
+    if model is Report and (row.artifact_uri or row.artifact_fingerprint):
+        raise conflict("Generated report versions are immutable; create a new version.")
     before = _state(row)
     fields = ("name", "description", "report_type", "definition", "dataset_type", "source_run_ids",
               "schema", "storage_uri", "storage_backend", "file_format", "row_count", "fingerprint")

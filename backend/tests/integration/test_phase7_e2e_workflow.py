@@ -26,7 +26,10 @@ def test_phase7_isolated_end_to_end_workflow(tmp_path: Path):
     assert evidence["life_readiness"]["calculation_status"] == "MODEL_NOT_CONFIGURED"
     assert evidence["report"]["schema_version"] == "mentoramp.report/v1"
     assert evidence["report"]["is_production_approved"] is False
-    assert {"report.generated", "report.exported", "report.published"} <= set(
+    assert {
+        "report.created", "report.generated", "report.exported",
+        "report.published", "report.version_created",
+    } <= set(
         evidence["report"]["audit_actions"]
     )
     assert (tmp_path / "evidence" / "phase7-evidence.json").is_file()

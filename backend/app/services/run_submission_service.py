@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core import lifecycle
 from app.core.execution import run_state
+from app.db.models.inforce import InforceRecord
 from app.db.models.projection import ProjectionSet, RunSet
 from app.db.models.run import Run
 from app.db.models.run_package import RunPackage
@@ -104,9 +105,26 @@ def _run_name(projection_set: ProjectionSet, configuration: dict | None, scenari
     return f"{projection_set.name} · {scenario_name}"
 
 
+def _is_unconfigured_life_projection(db: Session, projection_set: ProjectionSet) -> bool:
+    """Identify LIFE readiness data without treating it as an executable model."""
+    if projection_set.model_version_id or not projection_set.inforce_file_ids:
+        return False
+    records = db.query(InforceRecord.data).filter(
+        InforceRecord.file_id.in_(projection_set.inforce_file_ids)
+    ).all()
+    return any(str((data or {}).get("product_type", "")).upper() == "LIFE" for (data,) in records)
+
+
 def submit_run_set(db: Session, payload: dict, user: Any) -> dict[str, Any]:
     project, plan = _plan(db, user, payload, write=True)
     for projection_set, scenario_ids, _source in plan:
+        if _is_unconfigured_life_projection(db, projection_set):
+            raise ServiceError(
+                422,
+                "MODEL_NOT_CONFIGURED",
+                "LIFE calculation execution is not configured or approved for Launch 1.0.",
+                {"projection_set_id": projection_set.id, "product_code": "LIFE"},
+            )
         if projection_set.status not in lifecycle.RUNNABLE_PROJECTION_SET_STATUSES:
             raise conflict(
                 f"Projection Set '{projection_set.name}' is not validated "
