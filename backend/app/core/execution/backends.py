@@ -13,10 +13,18 @@ import importlib.util
 import os
 import platform
 import shutil
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from app.config import settings
+from app.core.execution.spark_backend import (
+    SparkExecutionBackend,
+    SparkSecurityError,
+    _resolve_java_home,
+    inspect_spark_model_compatibility,
+    validate_spark_master,
+)
 from app.core.projection_engine.engine import PolicyResult, run_policy
 from app.core.projection_engine.run_data import PolicyRecord, RunData
 
@@ -113,6 +121,8 @@ class ExecutionPlanContext:
     policy_count: int = 0
     horizon_months: int = 0
     scenario_count: int = 1
+    formulas: Sequence[Any] | None = None
+    variables: Any = None
 
     @property
     def policy_months(self) -> int:
@@ -247,9 +257,8 @@ class CpuReferenceBackend:
 
 def probe_hardware_and_runtimes() -> dict[str, Any]:
     """Inspect real CPU, Java/PySpark, and physical CUDA GPU readiness cleanly."""
-    java_exe = shutil.which("java")
-    java_home = os.environ.get("JAVA_HOME")
-    java_detected = bool(java_exe or (java_home and os.path.isdir(java_home)))
+    java_home_resolved = _resolve_java_home()
+    java_detected = java_home_resolved is not None
 
     pyspark_spec = importlib.util.find_spec("pyspark")
     pyarrow_spec = importlib.util.find_spec("pyarrow")
@@ -282,8 +291,9 @@ def probe_hardware_and_runtimes() -> dict[str, Any]:
         "python_version": platform.python_version(),
         "platform": platform.platform(terse=True),
         "cpu_count": os.cpu_count() or 1,
+        "spark_enabled": bool(settings.spark_enabled),
         "java_detected": java_detected,
-        "java_home_set": bool(java_home),
+        "java_home_set": bool(os.environ.get("JAVA_HOME")),
         "pyspark_installed": pyspark_spec is not None,
         "pyarrow_installed": pyarrow_spec is not None,
         "numba_installed": numba_spec is not None,
@@ -368,17 +378,16 @@ def validate_execution_request(
     normalized: dict[str, Any] = {}
     if "spark_partitions" in raw_options and raw_options["spark_partitions"] is not None:
         normalized["spark_partitions"] = _validate_int_option(
-            "spark_partitions", raw_options["spark_partitions"], minimum=1, maximum=1024
+            "spark_partitions",
+            raw_options["spark_partitions"],
+            minimum=1,
+            maximum=settings.spark_max_partitions,
         )
     if "spark_master" in raw_options and raw_options["spark_master"] is not None:
-        master = raw_options["spark_master"]
-        if not isinstance(master, str) or not master.strip():
-            raise ExecutionPlanningError(
-                "INVALID_EXECUTION_OPTIONS",
-                "Execution option 'spark_master' must be a non-empty string.",
-                {"option": "spark_master", "value": master},
-            )
-        normalized["spark_master"] = master.strip()
+        try:
+            normalized["spark_master"] = validate_spark_master(raw_options["spark_master"])
+        except SparkSecurityError as err:
+            raise ExecutionPlanningError(err.code, err.message, err.details) from err
     if "gpu_device_id" in raw_options and raw_options["gpu_device_id"] is not None:
         normalized["gpu_device_id"] = _validate_int_option(
             "gpu_device_id", raw_options["gpu_device_id"], minimum=0, maximum=15
@@ -402,8 +411,9 @@ def validate_execution_request(
             )
         normalized["prefer_arrow"] = prefer_arrow
     if "batch_size" in raw_options and raw_options["batch_size"] is not None:
+        max_batch = settings.spark_max_batch_size if backend in {BACKEND_SPARK, BACKEND_SPARK_GPU} else 1_000_000
         normalized["batch_size"] = _validate_int_option(
-            "batch_size", raw_options["batch_size"], minimum=1, maximum=1_000_000
+            "batch_size", raw_options["batch_size"], minimum=1, maximum=max_batch
         )
 
     # Cross-validate backend-specific options so mismatched flags fail loudly.
@@ -454,7 +464,11 @@ class BackendCapabilityRegistry:
 
     @staticmethod
     def _build_default_capabilities(hw: dict[str, Any]) -> dict[str, BackendCapability]:
-        spark_env_ready = bool(hw.get("pyspark_installed") and hw.get("java_detected"))
+        spark_env_ready = bool(
+            hw.get("spark_enabled", settings.spark_enabled)
+            and hw.get("pyspark_installed")
+            and hw.get("java_detected")
+        )
         gpu_hw_ready = bool(hw.get("cuda_gpu_detected"))
         return {
             BACKEND_CPU: BackendCapability(
@@ -469,20 +483,21 @@ class BackendCapabilityRegistry:
             ),
             BACKEND_SPARK: BackendCapability(
                 name=BACKEND_SPARK,
-                description="Distributed Apache Spark Classic executor (scheduled for M6-02)",
-                implemented=False,
+                description="Distributed Apache Spark Classic executor (shared run_policy engine)",
+                implemented=True,
                 environment_available=spark_env_ready,
                 accelerated=True,
                 implementation_stage="M6-02",
-                supports_all_products=False,
+                supports_all_products=True,
                 supported_products=tuple(sorted(POLICY_PARALLEL_PRODUCTS)),
-                unavailable_reason=(
-                    "BACKEND_NOT_IMPLEMENTED" if spark_env_ready else "SPARK_RUNTIME_UNAVAILABLE"
-                ),
+                unavailable_reason=None if spark_env_ready else "SPARK_RUNTIME_UNAVAILABLE",
                 runtime_details={
+                    "spark_enabled": bool(hw.get("spark_enabled", settings.spark_enabled)),
                     "pyspark_installed": bool(hw.get("pyspark_installed")),
                     "java_detected": bool(hw.get("java_detected")),
                     "pyarrow_installed": bool(hw.get("pyarrow_installed")),
+                    "default_master": settings.spark_default_master,
+                    "max_partitions": settings.spark_max_partitions,
                 },
             ),
             BACKEND_GPU: BackendCapability(
@@ -535,20 +550,35 @@ class BackendCapabilityRegistry:
         return self._capabilities[name]
 
     def get_backend(
-        self, name: str, *, policy_runner: Callable[..., PolicyResult] | None = None
+        self,
+        name: str,
+        *,
+        policy_runner: Callable[..., PolicyResult] | None = None,
+        execution_options: Mapping[str, Any] | None = None,
     ) -> ExecutionBackend:
-        if name != BACKEND_CPU:
+        if name == BACKEND_CPU:
+            if policy_runner is not None:
+                return CpuReferenceBackend(policy_runner=policy_runner)
+            return self._cpu_backend
+        if name == BACKEND_SPARK:
             cap = self.get_capability(name)
-            raise ExecutionPlanningError(
-                cap.unavailable_reason or "BACKEND_NOT_IMPLEMENTED",
-                f"Backend '{name}' cannot execute runs yet (implemented={cap.implemented}, "
-                f"environment_available={cap.environment_available}).",
-                cap.as_dict(),
-                status_code=409,
-            )
-        if policy_runner is not None:
-            return CpuReferenceBackend(policy_runner=policy_runner)
-        return self._cpu_backend
+            if not cap.available:
+                raise ExecutionPlanningError(
+                    cap.unavailable_reason or "SPARK_RUNTIME_UNAVAILABLE",
+                    f"Backend 'spark' cannot execute runs on this worker "
+                    f"(implemented={cap.implemented}, environment_available={cap.environment_available}).",
+                    cap.as_dict(),
+                    status_code=409,
+                )
+            return SparkExecutionBackend(execution_options=execution_options)
+        cap = self.get_capability(name)
+        raise ExecutionPlanningError(
+            cap.unavailable_reason or "BACKEND_NOT_IMPLEMENTED",
+            f"Backend '{name}' cannot execute runs yet (implemented={cap.implemented}, "
+            f"environment_available={cap.environment_available}).",
+            cap.as_dict(),
+            status_code=409,
+        )
 
     def discovery_payload(self) -> dict[str, Any]:
         return {
@@ -603,33 +633,42 @@ class ExecutionPlanner:
 
         if request.requested_backend == BACKEND_AUTO:
             # Check accelerated backends in preference order ONLY if fully implemented,
-            # physically available on the host, AND explicitly supporting this product.
+            # physically available on the host, AND explicitly supporting this model's dependency graph.
             for candidate in (BACKEND_SPARK_GPU, BACKEND_SPARK, BACKEND_GPU):
                 cap = self.registry.get_capability(candidate)
-                if (
-                    cap.available
-                    and cap.supports_product(context.product_code)
-                    and (candidate != BACKEND_SPARK or context.policy_months >= DEFAULT_SPARK_MIN_POLICY_MONTHS)
-                ):
-                    return ExecutionPlan(
-                        requested_backend=BACKEND_AUTO,
-                        planned_backend=candidate,
-                        actual_backend=candidate,
-                        fallback_policy=request.fallback_policy,
-                        fallback_used=False,
-                        fallback_reason=None,
-                        fallback_message=None,
-                        accelerated=cap.accelerated,
-                        runnable=True,
-                        planner_reason=f"AUTO_SELECTED_{candidate.upper()}",
-                        reasons=(f"AUTO_SELECTED_{candidate.upper()}",),
-                        execution_options=dict(request.execution_options),
-                        hardware=hardware,
+                if not cap.available:
+                    continue
+                if candidate == BACKEND_SPARK:
+                    graph_ok, _issues = inspect_spark_model_compatibility(
+                        context.formulas, context.variables
                     )
+                    if not (
+                        graph_ok
+                        and cap.supports_product(context.product_code)
+                        and context.policy_months >= settings.spark_min_policy_months
+                    ):
+                        continue
+                elif not cap.supports_product(context.product_code):
+                    continue
+                return ExecutionPlan(
+                    requested_backend=BACKEND_AUTO,
+                    planned_backend=candidate,
+                    actual_backend=candidate,
+                    fallback_policy=request.fallback_policy,
+                    fallback_used=False,
+                    fallback_reason=None,
+                    fallback_message=None,
+                    accelerated=cap.accelerated,
+                    runnable=True,
+                    planner_reason=f"AUTO_SELECTED_{candidate.upper()}",
+                    reasons=(f"AUTO_SELECTED_{candidate.upper()}",),
+                    execution_options=dict(request.execution_options),
+                    hardware=hardware,
+                )
 
             auto_reason = (
                 "AUTO_BELOW_SPARK_THRESHOLD"
-                if context.policy_months and context.policy_months < DEFAULT_SPARK_MIN_POLICY_MONTHS
+                if context.policy_months and context.policy_months < settings.spark_min_policy_months
                 else "AUTO_CPU_REFERENCE_DEFAULT"
             )
             return ExecutionPlan(
@@ -651,6 +690,12 @@ class ExecutionPlanner:
         # Explicit accelerated backend selection: spark, gpu, spark_gpu
         cap = self.registry.get_capability(request.requested_backend)
         product_supported = cap.supports_product(context.product_code)
+        graph_issues: list[str] = []
+        if request.requested_backend == BACKEND_SPARK and product_supported:
+            graph_ok, graph_issues = inspect_spark_model_compatibility(
+                context.formulas, context.variables
+            )
+            product_supported = graph_ok
         reasons: list[str] = []
         if not cap.environment_available:
             reasons.append(
@@ -665,7 +710,7 @@ class ExecutionPlanner:
             reasons.append(
                 "MODEL_NOT_GPU_SUPPORTED"
                 if request.requested_backend in {BACKEND_GPU, BACKEND_SPARK_GPU}
-                else "MODEL_NOT_BACKEND_SUPPORTED"
+                else "MODEL_NOT_SPARK_COMPATIBLE"
             )
         if not cap.implemented:
             reasons.append("BACKEND_NOT_IMPLEMENTED")

@@ -68,6 +68,22 @@ class Settings(BaseSettings):
     run_artifact_target_rows: int = 100_000
     run_heartbeat_every_policies: int = 5
 
+    # Distributed Spark execution controls & security allowlist (Phase 6 M6-02).
+    # Only masters matching spark_allowed_masters may ever be used (comma-separated rules).
+    spark_enabled: bool = True
+    spark_default_master: str = "local[2]"
+    spark_allowed_masters: str = "local,local[*],local[1..16]"
+    spark_default_partitions: int = 2
+    spark_max_partitions: int = 64
+    spark_default_batch_size: int = 250
+    spark_max_batch_size: int = 5000
+    # Provisional threshold (~50k policy-months) validated by empirical benchmarks.
+    spark_min_policy_months: int = 50_000
+    spark_driver_memory: str = "1g"
+    spark_executor_memory: str = "512m"
+    spark_network_timeout_seconds: int = 120
+    spark_task_timeout_seconds: int = 300
+
     @model_validator(mode="after")
     def reject_unsafe_configuration(self):
         if not self.debug and self.jwt_secret_key == DEVELOPMENT_JWT_SECRET:

@@ -116,3 +116,6 @@ jobs:
 
       - name: Run local PySpark partition smoke test
         run: python scripts/smoke_spark_m6_00.py
+
+      - name: Run PySpark backend unit, planner, and distributed execution tests
+        run: python -m pytest -q tests/unit/test_m6_spark_backend.py tests/integration/test_m6_execution_planner_api.py tests/spark

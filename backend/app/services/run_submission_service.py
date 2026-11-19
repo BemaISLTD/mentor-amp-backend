@@ -69,11 +69,14 @@ def _plan_context_from_configuration(
     cfg = configuration or {}
     inforce_items = (cfg.get("datasets") or {}).get("inforce") or []
     policy_count = sum(int(item.get("record_count") or 0) for item in inforce_items)
+    formulas = cfg.get("formulas")
     return ExecutionPlanContext(
         product_code=(cfg.get("model") or {}).get("product_code"),
         policy_count=policy_count,
         horizon_months=int(cfg.get("horizon_months") or 0),
         scenario_count=max(scenario_count, 1),
+        formulas=formulas if formulas else None,
+        variables=cfg.get("variables"),
     )
 
 

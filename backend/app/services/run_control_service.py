@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.audit import record_audit
 from app.core.execution import run_state
 from app.core.execution.run_package import RunPackageError
+from app.core.execution.spark_backend import cancel_spark_run
 from app.core.project_lifecycle import require_active_project
 from app.db.models.projection import RunEvent, RunSet
 from app.db.models.run import Run
@@ -81,6 +82,8 @@ def cancel_run(db: Session, run_id: str, user: Any) -> dict[str, Any]:
         after_state={"status": run.status, "cancel_requested_at": iso(run.cancel_requested_at)},
     )
     db.commit()
+    if run.status == run_state.RUNNING and run.cancel_requested_at is not None:
+        cancel_spark_run(run.id)
     db.refresh(run)
     return run_query_service.run_view(db, run)
 

@@ -148,7 +148,20 @@ def test_unknown_backend_and_invalid_options_fail_closed(env: Env):
         assert sub.status_code == 422, sub.text
 
 
-def test_strict_unavailable_gpu_and_spark_rejected_at_preflight_and_submit(env: Env):
+def test_strict_unavailable_gpu_and_spark_rejected_at_preflight_and_submit(env: Env, monkeypatch):
+    unavailable_reg = BackendCapabilityRegistry(
+        hardware={
+            "python_version": "3.14.2",
+            "cpu_count": 4,
+            "pyspark_installed": False,
+            "java_detected": False,
+            "cuda_gpu_detected": False,
+            "cuda_device_count": 0,
+        }
+    )
+    monkeypatch.setattr(exec_backends, "current_capability_registry", lambda: unavailable_reg)
+    monkeypatch.setattr(run_submission_service, "current_capability_registry", lambda: unavailable_reg)
+
     for backend, expected_code in (("gpu", "GPU_HARDWARE_UNAVAILABLE"),):
         payload = _base_payload(env, execution_backend=backend, fallback_policy="strict_fail")
         pre = env.client.post("/v1/run-sets/preflight", headers=env.admin_headers(), json=payload)
@@ -221,8 +234,16 @@ def test_worker_time_strict_failure_and_retry_lineage(env: Env, monkeypatch):
         )
     run_id = submitted["runs"][0]["id"]
 
-    # Now worker executes using real M6-01 registry where Spark is NOT yet implemented -> fails cleanly!
-    real_reg = BackendCapabilityRegistry()
+    # Now worker executes using a registry where Spark/GPU runtimes are absent -> fails cleanly!
+    real_reg = BackendCapabilityRegistry(
+        hardware={
+            "python_version": "3.14.2",
+            "cpu_count": 4,
+            "java_detected": False,
+            "pyspark_installed": False,
+            "cuda_gpu_detected": False,
+        }
+    )
     monkeypatch.setattr(run_execution_service, "current_capability_registry", lambda: real_reg)
     status_out = None
     with env.Session() as db:

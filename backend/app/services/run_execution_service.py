@@ -33,12 +33,20 @@ from sqlalchemy.orm import Session
 
 from app.core.execution import run_package, run_state
 from app.core.execution.backends import (
+    CpuReferenceBackend,
     ExecutionPlanContext,
     ExecutionPlanner,
     ExecutionPlanningError,
     ExecutionRequest,
+    FALLBACK_ALLOW_CPU,
     current_capability_registry,
     validate_execution_request,
+)
+from app.core.execution.spark_backend import (
+    SparkCancelledError,
+    SparkExecutionBackend,
+    SparkSessionStartupError,
+    SparkWaveExecutionError,
 )
 from app.core.artifacts import IDENTITY_NEUTRAL_SCHEMA, get_artifact_store
 from app.config import settings
@@ -395,6 +403,8 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                 policy_count=len(data.policies),
                 horizon_months=data.horizon_months,
                 scenario_count=1,
+                formulas=configuration.get("formulas") or data.formulas,
+                variables=data.variables,
             ),
         )
     except ExecutionPlanningError as error:
@@ -440,7 +450,9 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
 
     try:
         backend = planner.registry.get_backend(
-            exec_plan.planned_backend, policy_runner=run_policy
+            exec_plan.planned_backend,
+            policy_runner=run_policy,
+            execution_options=exec_plan.execution_options,
         )
     except ExecutionPlanningError as error:
         governance_service.update_run_step(
@@ -552,76 +564,243 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
         timing["commit"] += perf_counter() - began
         flushing = False
 
-    try:
-        for index, policy in enumerate(data.policies, start=1):
-            db.refresh(run, attribute_names=["cancel_requested_at"])
-            if run.cancel_requested_at is not None:
-                cancelled = True
-                break
-            began = perf_counter()
-            _, result = next(iter(backend.execute_policies(data, [policy], functions)))
-            timing["calc"] += perf_counter() - began
-            if result.error is not None:
-                failed_policies += 1
-                message = (f"Policy {policy.policy_id} failed at month {result.error.month}: "
-                           f"{result.error.message}")
-                errors.append(message)
-                add_event(db, run.id, "policy", message, level="error",
-                          data={"policy_id": policy.policy_id, **result.error.as_dict()})
-            else:
-                created_at = now_utc()
-                for month, variable, value in result.outputs:
-                    if variable == "reserve" and month == 0:
-                        value = _canonical_long_horizon_value(
-                            "reserve_0", value, data.horizon_months
-                        )
-                    output_rows.append({
-                        "run_id": run.id,
-                        "attempt_number": attempt_number,
-                        "policy_id": policy.policy_id,
-                        "scenario_id": scenario_id,
-                        "projection_month": month,
-                        "variable_name": variable,
-                        "value": {"value": value},
-                        "product": product_code,
-                        "created_at": created_at,
-                        **_row_dimensions(data.variables.get(variable), policy),
-                    })
-                for name, value in result.sums.items():
+    def _record_policy_outcome(policy: Any, result: Any) -> None:
+        nonlocal failed_policies
+        if result.error is not None:
+            failed_policies += 1
+            message = (
+                f"Policy {policy.policy_id} failed at month {result.error.month}: "
+                f"{result.error.message}"
+            )
+            errors.append(message)
+            add_event(
+                db, run.id, "policy", message, level="error",
+                data={"policy_id": policy.policy_id, **result.error.as_dict()},
+            )
+        else:
+            created_at = now_utc()
+            for month, variable, value in result.outputs:
+                if variable == "reserve" and month == 0:
                     value = _canonical_long_horizon_value(
-                        name, value, data.horizon_months
+                        "reserve_0", value, data.horizon_months
                     )
-                    total_values.setdefault(name, []).append(value)
-                add_event(db, run.id, "policy",
-                          f"Policy {policy.policy_id} complete ({result.months_computed} months).",
-                          data={"policy_id": policy.policy_id})
-            for warning in result.warnings:
-                warnings.append(f"{policy.policy_id}: {warning}")
-                add_event(db, run.id, "policy", f"{policy.policy_id}: {warning}", level="warning",
-                          data={"policy_id": policy.policy_id})
-            for row in result.trace_rows:
-                trace_rows.append({
-                    **row,
+                output_rows.append({
                     "run_id": run.id,
                     "attempt_number": attempt_number,
+                    "policy_id": policy.policy_id,
                     "scenario_id": scenario_id,
-                    "created_at": now_utc(),
-                    **_row_dimensions(data.variables.get(row["variable_name"]), policy),
+                    "projection_month": month,
+                    "variable_name": variable,
+                    "value": {"value": value},
+                    "product": product_code,
+                    "created_at": created_at,
+                    **_row_dimensions(data.variables.get(variable), policy),
                 })
-            run.progress_done = index
-            governance_service.update_run_step(
-                db, run_id, "calculate", "running",
-                progress_total=len(data.policies), progress_done=index,
+            for name, value in result.sums.items():
+                value = _canonical_long_horizon_value(
+                    name, value, data.horizon_months
+                )
+                total_values.setdefault(name, []).append(value)
+            add_event(
+                db, run.id, "policy",
+                f"Policy {policy.policy_id} complete ({result.months_computed} months).",
+                data={"policy_id": policy.policy_id},
             )
-            buffered_rows = len(output_rows) + len(trace_rows)
-            if (
-                buffered_rows >= settings.run_artifact_target_rows
-                or index == len(data.policies)
-            ):
-                flush()
-            elif index % settings.run_heartbeat_every_policies == 0:
-                attempt.heartbeat_at = now_utc()
-                db.commit()
+        for warning in result.warnings:
+            warnings.append(f"{policy.policy_id}: {warning}")
+            add_event(
+                db, run.id, "policy", f"{policy.policy_id}: {warning}", level="warning",
+                data={"policy_id": policy.policy_id},
+            )
+        for row in result.trace_rows:
+            trace_rows.append({
+                **row,
+                "run_id": run.id,
+                "attempt_number": attempt_number,
+                "scenario_id": scenario_id,
+                "created_at": now_utc(),
+                **_row_dimensions(data.variables.get(row["variable_name"]), policy),
+            })
+
+    execution_error_code = "EXECUTION_ERROR"
+    try:
+        if isinstance(backend, SparkExecutionBackend):
+            spark_telemetry: dict[str, Any] = {
+                "waves_completed": 0,
+                "partitions_used": set(),
+                "worker_os_pids": set(),
+                "worker_hostnames": set(),
+                "broadcast_seconds": 0.0,
+                "partition_exec_seconds": 0.0,
+                "collect_seconds": 0.0,
+                "shuffle_agg_seconds": 0.0,
+                "shuffle_rows": 0,
+                "executor_infos": [],
+                "worker_executor_infos": [],
+                "worker_executor_ids": [],
+                "cancelled": False,
+            }
+            wave_started_count = 0
+            bind_engine = db.get_bind()
+            cancel_poll_lock = threading.Lock()
+
+            def _check_cancel_fresh() -> bool:
+                with cancel_poll_lock:
+                    try:
+                        if bind_engine.dialect.name == "sqlite":
+                            db.refresh(run, attribute_names=["cancel_requested_at"])
+                            return run.cancel_requested_at is not None
+                        with Session(bind=bind_engine) as check_db:
+                            return (
+                                check_db.scalar(
+                                    select(Run.cancel_requested_at).where(Run.id == run_id)
+                                )
+                                is not None
+                            )
+                    except Exception:  # noqa: BLE001
+                        return False
+
+            def _on_session_ready(info: dict[str, Any]) -> None:
+                spark_telemetry.update(info)
+
+            try:
+                if _check_cancel_fresh():
+                    cancelled = True
+                else:
+                    index = 0
+                    wave_iter = iter(
+                        backend.execute_waves(
+                            data,
+                            data.policies,
+                            on_session_ready=_on_session_ready,
+                            run_id=run_id,
+                            attempt_number=attempt_number,
+                            should_cancel=_check_cancel_fresh,
+                            watch_poll_seconds=0.0 if bind_engine.dialect.name == "sqlite" else 1.0,
+                        )
+                    )
+                    try:
+                        while True:
+                            try:
+                                wave = next(wave_iter)
+                            except StopIteration:
+                                break
+                            wave_started_count += 1
+                            spark_telemetry["waves_completed"] += 1
+                            spark_telemetry["partitions_used"].update(wave.partitions_seen)
+                            spark_telemetry["worker_os_pids"].update(wave.worker_os_pids)
+                            spark_telemetry["worker_hostnames"].update(wave.worker_hostnames)
+                            spark_telemetry["broadcast_seconds"] += wave.broadcast_seconds
+                            spark_telemetry["partition_exec_seconds"] += wave.partition_exec_seconds
+                            spark_telemetry["collect_seconds"] += wave.collect_seconds
+                            spark_telemetry["shuffle_agg_seconds"] += wave.shuffle_agg_seconds
+                            spark_telemetry["shuffle_rows"] += wave.shuffle_row_count
+                            if wave.executor_infos:
+                                spark_telemetry["executor_infos"] = wave.executor_infos
+                                worker_execs = [
+                                    e for e in wave.executor_infos if e.get("is_driver") is False
+                                ]
+                                spark_telemetry["worker_executor_infos"] = worker_execs
+                                spark_telemetry["worker_executor_ids"] = [
+                                    str(e.get("executor_id")) for e in worker_execs
+                                ]
+                            timing["calc"] += wave.partition_exec_seconds
+
+                            for policy, result in wave.outcomes:
+                                index += 1
+                                _record_policy_outcome(policy, result)
+                            run.progress_done = index
+                            governance_service.update_run_step(
+                                db, run_id, "calculate", "running",
+                                progress_total=len(data.policies), progress_done=index,
+                            )
+                            if (
+                                (len(output_rows) + len(trace_rows)) >= settings.run_artifact_target_rows
+                                or index == len(data.policies)
+                                or wave.wave_index >= 0
+                            ):
+                                flush()
+                            else:
+                                attempt.heartbeat_at = now_utc()
+                                db.commit()
+                            if _check_cancel_fresh():
+                                cancelled = True
+                                spark_telemetry["cancelled"] = True
+                                break
+                    finally:
+                        if hasattr(wave_iter, "close"):
+                            wave_iter.close()
+            except SparkCancelledError:
+                cancelled = True
+                spark_telemetry["cancelled"] = True
+            except SparkSessionStartupError as startup_err:
+                if (
+                    wave_started_count == 0
+                    and exec_request.fallback_policy == FALLBACK_ALLOW_CPU
+                ):
+                    execution_provenance.update({
+                        "planned_backend": "cpu",
+                        "actual_backend": "cpu",
+                        "fallback_used": True,
+                        "fallback_reason": "SPARK_SESSION_INIT_FAILED",
+                        "fallback_message": str(startup_err),
+                        "accelerated": False,
+                        "backend_description": "Local CPU reference path",
+                    })
+                    attempt.metrics = {"execution": execution_provenance}
+                    add_event(
+                        db, run.id, "execution_fallback",
+                        f"Spark initialization failed before execution; falling back to CPU: {startup_err}",
+                        level="warning",
+                        data=execution_provenance,
+                    )
+                    db.commit()
+                    backend = CpuReferenceBackend(policy_runner=run_policy)
+                else:
+                    execution_error_code = "SPARK_SESSION_INIT_FAILED"
+                    raise
+            except SparkWaveExecutionError as wave_err:
+                # Never silently fall back to CPU after Spark execution has started.
+                execution_error_code = wave_err.code
+                raise
+
+            if isinstance(backend, SparkExecutionBackend):
+                execution_provenance["spark"] = {
+                    **spark_telemetry,
+                    "partitions_used": sorted(spark_telemetry["partitions_used"]),
+                    "worker_os_pids": sorted(spark_telemetry["worker_os_pids"]),
+                    "worker_hostnames": sorted(spark_telemetry["worker_hostnames"]),
+                    "broadcast_seconds": round(spark_telemetry["broadcast_seconds"], 4),
+                    "partition_exec_seconds": round(spark_telemetry["partition_exec_seconds"], 4),
+                    "collect_seconds": round(spark_telemetry["collect_seconds"], 4),
+                    "shuffle_agg_seconds": round(spark_telemetry["shuffle_agg_seconds"], 4),
+                }
+                attempt.metrics = {"execution": execution_provenance}
+
+        if not isinstance(backend, SparkExecutionBackend):
+            for index, policy in enumerate(data.policies, start=1):
+                db.refresh(run, attribute_names=["cancel_requested_at"])
+                if run.cancel_requested_at is not None:
+                    cancelled = True
+                    break
+                began = perf_counter()
+                _, result = next(iter(backend.execute_policies(data, [policy], functions)))
+                timing["calc"] += perf_counter() - began
+                _record_policy_outcome(policy, result)
+                run.progress_done = index
+                governance_service.update_run_step(
+                    db, run_id, "calculate", "running",
+                    progress_total=len(data.policies), progress_done=index,
+                )
+                buffered_rows = len(output_rows) + len(trace_rows)
+                if (
+                    buffered_rows >= settings.run_artifact_target_rows
+                    or index == len(data.policies)
+                ):
+                    flush()
+                elif index % settings.run_heartbeat_every_policies == 0:
+                    attempt.heartbeat_at = now_utc()
+                    db.commit()
         if not cancelled:
             db.refresh(run, attribute_names=["cancel_requested_at"])
             cancelled = run.cancel_requested_at is not None
@@ -642,13 +821,13 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                 db.rollback()
                 output_rows, trace_rows = [], []
         governance_service.update_run_step(
-            db, run_id, "calculate", "failed", error_code="EXECUTION_ERROR",
+            db, run_id, "calculate", "failed", error_code=execution_error_code,
             error_message=str(error), progress_total=len(data.policies),
             progress_done=run.progress_done,
         )
         governance_service.update_run_step(db, run_id, "finalize", "running")
         db.commit()
-        result = _fail(db, run_id, attempt_id, attempt_number, "EXECUTION_ERROR",
+        result = _fail(db, run_id, attempt_id, attempt_number, execution_error_code,
                        f"Run failed during execution: {error}", {}, rows_written=True,
                        metrics=metrics, prior_errors=errors, warnings=warnings,
                        execution_provenance=execution_provenance)
