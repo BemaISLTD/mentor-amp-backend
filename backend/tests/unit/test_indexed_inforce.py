@@ -19,8 +19,9 @@ def test_indexed_block_schema_and_conservation(code):
 
 
 def test_registration_is_idempotent():
-    assert register_all_products() == ["SPIA", "MYGA", "FIA", "RILA"]
-    assert register_all_products() == ["SPIA", "MYGA", "FIA", "RILA"]
+    expected = ["SPIA", "MYGA", "FIA", "RILA", "PROSPECTIVE_RESERVE_DISCOUNTING"]
+    assert register_all_products() == expected
+    assert register_all_products() == expected
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf")])

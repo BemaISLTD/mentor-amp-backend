@@ -18,6 +18,11 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from app.config import settings
+from app.core.execution.gpu_backend import (
+    GPUExecutionBackend,
+    inspect_gpu_model_compatibility,
+    probe_cuda_hardware,
+)
 from app.core.execution.spark_backend import (
     SparkExecutionBackend,
     SparkSecurityError,
@@ -262,46 +267,28 @@ def probe_hardware_and_runtimes() -> dict[str, Any]:
 
     pyspark_spec = importlib.util.find_spec("pyspark")
     pyarrow_spec = importlib.util.find_spec("pyarrow")
-    numba_spec = importlib.util.find_spec("numba")
-    numba_cuda_spec = importlib.util.find_spec("numba_cuda")
-
-    cudasim_enabled = os.environ.get("NUMBA_ENABLE_CUDASIM") == "1"
-    cuda_gpu_detected = False
-    cuda_device_count = 0
-    cuda_device_names: list[str] = []
-    if not cudasim_enabled and numba_cuda_spec is not None:
-        try:
-            from numba import cuda  # type: ignore[import-not-found]
-
-            if bool(cuda.is_available()):
-                gpus = list(cuda.gpus)
-                cuda_device_count = len(gpus)
-                cuda_gpu_detected = cuda_device_count > 0
-                cuda_device_names = [
-                    getattr(gpu, "name", b"").decode("utf-8", errors="replace")
-                    if isinstance(getattr(gpu, "name", None), (bytes, bytearray))
-                    else str(getattr(gpu, "name", "CUDA GPU"))
-                    for gpu in gpus
-                ]
-        except Exception:  # noqa: BLE001 - absent CUDA drivers/libraries must never crash capability probe
-            cuda_gpu_detected = False
-            cuda_device_count = 0
+    cuda_hw = probe_cuda_hardware()
 
     return {
         "python_version": platform.python_version(),
         "platform": platform.platform(terse=True),
         "cpu_count": os.cpu_count() or 1,
         "spark_enabled": bool(settings.spark_enabled),
+        "gpu_enabled": bool(settings.gpu_enabled),
         "java_detected": java_detected,
         "java_home_set": bool(os.environ.get("JAVA_HOME")),
         "pyspark_installed": pyspark_spec is not None,
         "pyarrow_installed": pyarrow_spec is not None,
-        "numba_installed": numba_spec is not None,
-        "numba_cuda_installed": numba_cuda_spec is not None,
-        "cuda_simulator_env": cudasim_enabled,
-        "cuda_gpu_detected": cuda_gpu_detected,
-        "cuda_device_count": cuda_device_count,
-        "cuda_device_names": cuda_device_names,
+        "numba_installed": bool(cuda_hw.get("numba_installed")),
+        "numba_cuda_installed": bool(cuda_hw.get("numba_cuda_installed")),
+        "cuda_simulator_env": bool(cuda_hw.get("cuda_simulator_env")),
+        "cuda_gpu_detected": bool(cuda_hw.get("cuda_gpu_detected")),
+        "cuda_device_count": int(cuda_hw.get("cuda_device_count") or 0),
+        "cuda_device_names": list(cuda_hw.get("cuda_device_names") or ()),
+        "cuda_devices": list(cuda_hw.get("cuda_devices") or ()),
+        "cuda_driver_version": cuda_hw.get("cuda_driver_version"),
+        "cuda_runtime_version": cuda_hw.get("cuda_runtime_version"),
+        "gpu_probe_error": cuda_hw.get("probe_error"),
     }
 
 
@@ -469,7 +456,9 @@ class BackendCapabilityRegistry:
             and hw.get("pyspark_installed")
             and hw.get("java_detected")
         )
-        gpu_hw_ready = bool(hw.get("cuda_gpu_detected"))
+        gpu_hw_ready = bool(hw.get("cuda_gpu_detected")) and bool(
+            hw.get("gpu_enabled", settings.gpu_enabled)
+        )
         return {
             BACKEND_CPU: BackendCapability(
                 name=BACKEND_CPU,
@@ -502,19 +491,22 @@ class BackendCapabilityRegistry:
             ),
             BACKEND_GPU: BackendCapability(
                 name=BACKEND_GPU,
-                description="NVIDIA CUDA GPU kernel accelerator (scheduled for M6-03)",
-                implemented=False,
+                description="NVIDIA CUDA GPU float64 prospective-reserve kernel",
+                implemented=True,
                 environment_available=gpu_hw_ready,
                 accelerated=True,
                 implementation_stage="M6-03",
                 supports_all_products=False,
                 supported_products=tuple(sorted(GPU_ELIGIBLE_PRODUCTS)),
-                unavailable_reason=(
-                    "BACKEND_NOT_IMPLEMENTED" if gpu_hw_ready else "GPU_HARDWARE_UNAVAILABLE"
-                ),
+                unavailable_reason=None if gpu_hw_ready else "GPU_HARDWARE_UNAVAILABLE",
                 runtime_details={
+                    "gpu_enabled": bool(hw.get("gpu_enabled", settings.gpu_enabled)),
                     "cuda_gpu_detected": gpu_hw_ready,
                     "cuda_device_count": hw.get("cuda_device_count", 0),
+                    "cuda_device_names": list(hw.get("cuda_device_names") or ()),
+                    "cuda_devices": list(hw.get("cuda_devices") or ()),
+                    "cuda_driver_version": hw.get("cuda_driver_version"),
+                    "cuda_runtime_version": hw.get("cuda_runtime_version"),
                     "cuda_simulator_env": bool(hw.get("cuda_simulator_env")),
                     "simulator_never_counted_as_hardware": True,
                 },
@@ -571,6 +563,17 @@ class BackendCapabilityRegistry:
                     status_code=409,
                 )
             return SparkExecutionBackend(execution_options=execution_options)
+        if name == BACKEND_GPU:
+            cap = self.get_capability(name)
+            if not cap.available:
+                raise ExecutionPlanningError(
+                    cap.unavailable_reason or "GPU_HARDWARE_UNAVAILABLE",
+                    f"Backend 'gpu' cannot execute runs on this worker "
+                    f"(implemented={cap.implemented}, environment_available={cap.environment_available}).",
+                    cap.as_dict(),
+                    status_code=409,
+                )
+            return GPUExecutionBackend(execution_options=execution_options, hardware_probe=self.hardware)
         cap = self.get_capability(name)
         raise ExecutionPlanningError(
             cap.unavailable_reason or "BACKEND_NOT_IMPLEMENTED",
@@ -648,6 +651,15 @@ class ExecutionPlanner:
                         and context.policy_months >= settings.spark_min_policy_months
                     ):
                         continue
+                elif candidate == BACKEND_GPU:
+                    if not cap.supports_product(context.product_code):
+                        continue
+                    if context.formulas is not None or context.variables is not None:
+                        gpu_ok, _issues = inspect_gpu_model_compatibility(
+                            context.product_code, context.formulas, context.variables
+                        )
+                        if not gpu_ok:
+                            continue
                 elif not cap.supports_product(context.product_code):
                     continue
                 return ExecutionPlan(
@@ -696,6 +708,12 @@ class ExecutionPlanner:
                 context.formulas, context.variables
             )
             product_supported = graph_ok
+        elif request.requested_backend == BACKEND_GPU and product_supported:
+            if context.formulas is not None or context.variables is not None:
+                gpu_ok, graph_issues = inspect_gpu_model_compatibility(
+                    context.product_code, context.formulas, context.variables
+                )
+                product_supported = gpu_ok
         reasons: list[str] = []
         if not cap.environment_available:
             reasons.append(

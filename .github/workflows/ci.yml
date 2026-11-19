@@ -119,3 +119,29 @@ jobs:
 
       - name: Run PySpark backend unit, planner, and distributed execution tests
         run: python -m pytest -q tests/unit/test_m6_spark_backend.py tests/integration/test_m6_execution_planner_api.py tests/spark
+
+  gpu-simulator-smoke:
+    name: CUDA Simulator Parity & GPU Backend Checks (Non-Hardware)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install backend + CUDA simulator test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-gpu-sim.txt pytest
+
+      - name: Verify hardware probe rejects simulator as physical CUDA GPU
+        run: NUMBA_ENABLE_CUDASIM=1 python -m pytest -q tests/unit/test_m6_gpu_backend.py tests/unit/test_m6_execution_planner.py
+
+      - name: Run CUDA kernel parity, error isolation, cancel/retry, and provenance tests (Simulator Only)
+        run: NUMBA_ENABLE_CUDASIM=1 python -m pytest -q tests/gpu

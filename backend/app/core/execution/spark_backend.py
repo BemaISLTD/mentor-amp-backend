@@ -16,9 +16,11 @@ import re
 import shutil
 import socket
 import sys
+import tempfile
 import threading
 import time
 import uuid
+import zipfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -40,6 +42,70 @@ _LOCAL_RANGE_RULE_RE = re.compile(r"^local\[(\d+)\.\.(\d+)\]$")
 
 _ACTIVE_SPARK_JOBS_LOCK = threading.Lock()
 _ACTIVE_SPARK_JOBS: dict[str, tuple[Any, str]] = {}
+
+_SPARK_SESSION_LOCK = threading.Lock()
+_SPARK_ACTIVE_RUNS: int = 0
+_SPARK_ACTIVE_MASTER: str | None = None
+_SPARK_SHIPPED_APPS: set[str] = set()
+_SPARK_CACHED_APP_ZIP: str | None = None
+
+
+def _is_loopback_master(master: str) -> bool:
+    """Return True when Spark runs purely locally on this host."""
+    return (
+        master.startswith("local")
+        or master.startswith("spark://127.0.0.1")
+        or master.startswith("spark://localhost")
+    )
+
+
+def _resolve_spark_runtime_config(master: str) -> dict[str, Any]:
+    """Resolve driver host/bind, worker python, and code shipping without hardcoded 127.0.0.1 for remote masters."""
+    loopback = _is_loopback_master(master)
+    driver_host = settings.spark_driver_host or ("127.0.0.1" if loopback else None)
+    driver_bind = settings.spark_driver_bind_address or ("127.0.0.1" if loopback else None)
+    worker_python = settings.spark_worker_python or sys.executable
+    ship_app_zip = bool(settings.spark_ship_app_zip or (not loopback))
+    return {
+        "loopback_master": loopback,
+        "driver_host": driver_host,
+        "driver_bind_address": driver_bind,
+        "worker_python": worker_python,
+        "ship_app_zip": ship_app_zip,
+        "driver_max_result_size": settings.spark_driver_max_result_size,
+    }
+
+
+def _compute_wave_row_budget(
+    data: RunData, *, requested_batch_size: int
+) -> tuple[int, int, int]:
+    """Cap wave policy batch size so driver collect() buffers stay within ``spark_max_wave_result_rows``."""
+    trace_factor = 15 if data.traced_policy_ids else 0
+    est_rows_per_policy = max(
+        1,
+        int(data.horizon_months or 1) * max(1, len(data.output_variables) + trace_factor),
+    )
+    row_budget_batch_size = max(1, int(settings.spark_max_wave_result_rows) // est_rows_per_policy)
+    effective_batch_size = max(1, min(int(requested_batch_size), row_budget_batch_size))
+    return effective_batch_size, est_rows_per_policy, int(settings.spark_max_wave_result_rows)
+
+
+def _build_app_zip() -> str:
+    """Package backend/app Python modules once into a temp zip for remote Spark executors."""
+    global _SPARK_CACHED_APP_ZIP
+    if _SPARK_CACHED_APP_ZIP and os.path.isfile(_SPARK_CACHED_APP_ZIP):
+        return _SPARK_CACHED_APP_ZIP
+
+    app_dir = Path(BACKEND_ROOT) / "app"
+    zip_path = Path(tempfile.gettempdir()) / f"mentoramp_spark_app_{os.getpid()}.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for file_path in sorted(app_dir.rglob("*.py")):
+            if "__pycache__" in file_path.parts:
+                continue
+            rel = file_path.relative_to(Path(BACKEND_ROOT))
+            zf.write(file_path, arcname=str(rel))
+    _SPARK_CACHED_APP_ZIP = str(zip_path)
+    return _SPARK_CACHED_APP_ZIP
 
 
 def cancel_spark_run(run_id: str) -> bool:
@@ -292,7 +358,7 @@ def _run_partition_worker(
     backend_root: str,
 ) -> Iterable[dict[str, Any]]:
     """Pure Spark worker task executing Mentor AMP ``run_policy()`` per policy in a partition."""
-    if backend_root not in sys.path:
+    if backend_root and os.path.isdir(backend_root) and backend_root not in sys.path:
         sys.path.insert(0, backend_root)
 
     from pyspark import TaskContext  # type: ignore[import-not-found]
@@ -491,7 +557,11 @@ class SparkExecutionBackend:
                 f"batch_size must be between 1 and {settings.spark_max_batch_size}.",
                 {"batch_size": batch_size},
             )
+        effective_batch_size, est_rows_per_policy, wave_row_budget = _compute_wave_row_budget(
+            data, requested_batch_size=batch_size
+        )
         prefer_arrow = bool(self.execution_options.get("prefer_arrow", True))
+        runtime_cfg = _resolve_spark_runtime_config(master)
 
         java_home = _resolve_java_home()
         if java_home:
@@ -500,7 +570,8 @@ class SparkExecutionBackend:
             if java_bin not in os.environ.get("PATH", ""):
                 os.environ["PATH"] = f"{java_bin}{os.pathsep}{os.environ.get('PATH', '')}"
 
-        os.environ["PYSPARK_PYTHON"] = sys.executable
+        worker_python = str(runtime_cfg["worker_python"])
+        os.environ["PYSPARK_PYTHON"] = worker_python
         os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
         t_boot_start = perf_counter()
@@ -509,85 +580,120 @@ class SparkExecutionBackend:
             if run_id
             else f"mentoramp-adhoc-{uuid.uuid4().hex[:12]}"
         )
+        spark_session_acquired = False
+        app_zip_shipped = False
         try:
+            global _SPARK_ACTIVE_RUNS, _SPARK_ACTIVE_MASTER
+            with _SPARK_SESSION_LOCK:
+                if (
+                    _SPARK_ACTIVE_RUNS > 0
+                    and _SPARK_ACTIVE_MASTER is not None
+                    and _SPARK_ACTIVE_MASTER != master
+                ):
+                    raise RuntimeError(
+                        f"SPARK_MASTER_CONTENTION: cannot start master '{master}' while "
+                        f"{_SPARK_ACTIVE_RUNS} active Spark run(s) occupy '{_SPARK_ACTIVE_MASTER}'."
+                    )
+
             import pyspark  # type: ignore[import-not-found]
             from pyspark import SparkContext  # type: ignore[import-not-found]
             from pyspark.sql import SparkSession  # type: ignore[import-not-found]
-            from pyspark.sql import functions as F  # type: ignore[import-not-found]
 
             os.environ.setdefault("SPARK_HOME", str(Path(pyspark.__file__).parent))
             os.environ.setdefault("SPARK_SCALA_VERSION", "2.13")
 
-            # Stop any active session bound to a different master (e.g. local[2] -> spark://...)
-            existing_session = getattr(SparkSession, "_instantiatedSession", None)
-            existing_ctx = getattr(SparkContext, "_active_spark_context", None)
-            if existing_session is not None:
-                try:
-                    existing_master = str(existing_session.sparkContext.master)
-                except Exception:  # noqa: BLE001
-                    existing_master = ""
-                if existing_master != master:
-                    try:
-                        existing_session.stop()
-                    except Exception:  # noqa: BLE001
-                        pass
-            elif existing_ctx is not None:
-                try:
-                    existing_master = str(existing_ctx.master)
-                except Exception:  # noqa: BLE001
-                    existing_master = ""
-                if existing_master != master:
-                    try:
-                        existing_ctx.stop()
-                    except Exception:  # noqa: BLE001
-                        pass
+            with _SPARK_SESSION_LOCK:
+                if (
+                    _SPARK_ACTIVE_RUNS > 0
+                    and _SPARK_ACTIVE_MASTER is not None
+                    and _SPARK_ACTIVE_MASTER != master
+                ):
+                    raise RuntimeError(
+                        f"SPARK_MASTER_CONTENTION: cannot start master '{master}' while "
+                        f"{_SPARK_ACTIVE_RUNS} active Spark run(s) occupy '{_SPARK_ACTIVE_MASTER}'."
+                    )
 
-            worker_pythonpath = BACKEND_ROOT
-            if sys.platform == "win32":
-                worker_pythonpath = f"{WINDOWS_WORKER_BOOTSTRAP_DIR}{os.pathsep}{BACKEND_ROOT}"
+                # Stop any idle session bound to a different master only when zero runs are active.
+                if _SPARK_ACTIVE_RUNS == 0:
+                    existing_session = getattr(SparkSession, "_instantiatedSession", None)
+                    existing_ctx = getattr(SparkContext, "_active_spark_context", None)
+                    if existing_session is not None:
+                        try:
+                            existing_master = str(existing_session.sparkContext.master)
+                        except Exception:  # noqa: BLE001
+                            existing_master = ""
+                        if existing_master != master:
+                            try:
+                                existing_session.stop()
+                            except Exception:  # noqa: BLE001
+                                pass
+                    elif existing_ctx is not None:
+                        try:
+                            existing_master = str(existing_ctx.master)
+                        except Exception:  # noqa: BLE001
+                            existing_master = ""
+                        if existing_master != master:
+                            try:
+                                existing_ctx.stop()
+                            except Exception:  # noqa: BLE001
+                                pass
 
-            builder = (
-                SparkSession.builder.master(master)
-                .appName("mentoramp-m6-projection")
-                .config("spark.ui.enabled", "false")
-                .config("spark.driver.memory", settings.spark_driver_memory)
-                .config("spark.executor.memory", settings.spark_executor_memory)
-                .config("spark.network.timeout", f"{settings.spark_network_timeout_seconds}s")
-                .config("spark.python.authenticate.socketTimeout", "60s")
-                .config("spark.executorEnv.PYTHONPATH", worker_pythonpath)
-                .config("spark.pyspark.python", sys.executable)
-                .config("spark.pyspark.driver.python", sys.executable)
-                .config("spark.sql.execution.arrow.pyspark.enabled", "true" if prefer_arrow else "false")
-                .config("spark.python.worker.reuse", "true")
-                .config("spark.python.worker.faulthandler.enabled", "true")
-            )
-            if master.startswith("local"):
+                worker_pythonpath = BACKEND_ROOT
+                if sys.platform == "win32":
+                    worker_pythonpath = f"{WINDOWS_WORKER_BOOTSTRAP_DIR}{os.pathsep}{BACKEND_ROOT}"
+
                 builder = (
-                    builder.config("spark.driver.host", "127.0.0.1")
-                    .config("spark.driver.bindAddress", "127.0.0.1")
+                    SparkSession.builder.master(master)
+                    .appName("mentoramp-m6-projection")
+                    .config("spark.ui.enabled", "false")
+                    .config("spark.driver.memory", settings.spark_driver_memory)
+                    .config("spark.driver.maxResultSize", str(runtime_cfg["driver_max_result_size"]))
+                    .config("spark.executor.memory", settings.spark_executor_memory)
+                    .config("spark.network.timeout", f"{settings.spark_network_timeout_seconds}s")
+                    .config("spark.python.authenticate.socketTimeout", "60s")
+                    .config("spark.executorEnv.PYTHONPATH", worker_pythonpath)
+                    .config("spark.pyspark.python", worker_python)
+                    .config("spark.pyspark.driver.python", sys.executable)
+                    .config("spark.sql.execution.arrow.pyspark.enabled", "true" if prefer_arrow else "false")
+                    .config("spark.python.worker.reuse", "true")
+                    .config("spark.python.worker.faulthandler.enabled", "true")
                 )
-            else:
-                builder = (
-                    builder.config("spark.driver.host", "127.0.0.1")
-                    .config("spark.driver.bindAddress", "127.0.0.1")
-                    .config("spark.executor.cores", "1")
-                )
+                if runtime_cfg["driver_host"]:
+                    builder = builder.config("spark.driver.host", str(runtime_cfg["driver_host"]))
+                if runtime_cfg["driver_bind_address"]:
+                    builder = builder.config(
+                        "spark.driver.bindAddress", str(runtime_cfg["driver_bind_address"])
+                    )
+                if not master.startswith("local"):
+                    builder = builder.config("spark.executor.cores", "1")
 
-            spark = builder.getOrCreate()
-            sc = spark.sparkContext
-            if str(sc.master) != master:
-                raise RuntimeError(
-                    f"SparkSession master mismatch: expected '{master}', got '{sc.master}'."
-                )
+                spark = builder.getOrCreate()
+                sc = spark.sparkContext
+                if str(sc.master) != master:
+                    raise RuntimeError(
+                        f"SparkSession master mismatch: expected '{master}', got '{sc.master}'."
+                    )
 
-            # In Standalone/cluster mode, give worker JVMs a moment to register executors.
-            if not master.startswith("local"):
-                for _ in range(20):
-                    snaps = _executor_snapshots(sc)
-                    worker_snaps = [s for s in snaps if s.get("is_driver") is False]
-                    if len(worker_snaps) >= 2:
-                        break
-                    time.sleep(0.25)
+                if runtime_cfg["ship_app_zip"]:
+                    app_id = str(sc.applicationId)
+                    if app_id not in _SPARK_SHIPPED_APPS:
+                        zip_file = _build_app_zip()
+                        sc.addPyFile(zip_file)
+                        _SPARK_SHIPPED_APPS.add(app_id)
+                    app_zip_shipped = True
+
+                # In Standalone/cluster mode, give worker JVMs a moment to register executors.
+                if not master.startswith("local"):
+                    for _ in range(20):
+                        snaps = _executor_snapshots(sc)
+                        worker_snaps = [s for s in snaps if s.get("is_driver") is False]
+                        if len(worker_snaps) >= 2:
+                            break
+                        time.sleep(0.25)
+
+                _SPARK_ACTIVE_RUNS += 1
+                _SPARK_ACTIVE_MASTER = str(sc.master)
+                spark_session_acquired = True
 
             sc.setJobGroup(job_group, f"MentorAMP run {run_id or 'adhoc'}", interruptOnCancel=True)
             if run_id:
@@ -605,11 +711,23 @@ class SparkExecutionBackend:
                 "job_group": job_group,
                 "default_parallelism": int(sc.defaultParallelism),
                 "spark_session_boot_seconds": round(perf_counter() - t_boot_start, 4),
+                "requested_batch_size": batch_size,
+                "effective_batch_size": effective_batch_size,
+                "wave_row_budget": wave_row_budget,
+                "estimated_rows_per_policy": est_rows_per_policy,
+                "driver_max_result_size": str(runtime_cfg["driver_max_result_size"]),
+                "app_zip_shipped": app_zip_shipped,
+                "concurrent_session_runs": _SPARK_ACTIVE_RUNS,
                 "executor_snapshots": all_executors,
                 "worker_executor_infos": worker_executors,
                 "worker_executor_ids": [str(s.get("executor_id")) for s in worker_executors],
             }
         except Exception as exc:  # noqa: BLE001 - session init boundary
+            if spark_session_acquired:
+                with _SPARK_SESSION_LOCK:
+                    _SPARK_ACTIVE_RUNS = max(0, _SPARK_ACTIVE_RUNS - 1)
+                    if _SPARK_ACTIVE_RUNS == 0:
+                        _SPARK_ACTIVE_MASTER = None
             raise SparkSessionStartupError(f"Unable to initialize SparkSession on '{master}': {exc}") from exc
 
         broadcast_template = None
@@ -645,14 +763,14 @@ class SparkExecutionBackend:
             broadcast_seconds = perf_counter() - t_bcast_start
 
             total = len(policies)
-            for wave_idx, start in enumerate(range(0, total, batch_size)):
+            for wave_idx, start in enumerate(range(0, total, effective_batch_size)):
                 if should_cancel is not None and should_cancel():
                     sc.cancelJobGroup(job_group)
                     raise SparkCancelledError(
                         f"Run cancelled before Spark wave {wave_idx} (job_group={job_group})."
                     )
 
-                end = min(start + batch_size, total)
+                end = min(start + effective_batch_size, total)
                 indexed_wave = [(idx, policies[idx]) for idx in range(start, end)]
                 num_slices = max(1, min(requested_partitions, len(indexed_wave)))
 
@@ -686,6 +804,11 @@ class SparkExecutionBackend:
                     watcher_thread.start()
 
                 try:
+                    sc.setJobGroup(
+                        job_group,
+                        f"MentorAMP run {run_id or 'adhoc'} wave {wave_idx}",
+                        interruptOnCancel=True,
+                    )
                     backend_root = BACKEND_ROOT
                     tmpl_ref = worker_template_arg
                     rdd = sc.parallelize(indexed_wave, numSlices=num_slices)
@@ -776,7 +899,13 @@ class SparkExecutionBackend:
                     broadcast_template.unpersist(blocking=False)
                 except Exception:  # noqa: BLE001
                     pass
-            try:
-                spark.stop()
-            except Exception:  # noqa: BLE001
-                pass
+            with _SPARK_SESSION_LOCK:
+                if spark_session_acquired:
+                    _SPARK_ACTIVE_RUNS = max(0, _SPARK_ACTIVE_RUNS - 1)
+                if _SPARK_ACTIVE_RUNS == 0:
+                    _SPARK_ACTIVE_MASTER = None
+                    _SPARK_SHIPPED_APPS.clear()
+                    try:
+                        spark.stop()
+                    except Exception:  # noqa: BLE001
+                        pass

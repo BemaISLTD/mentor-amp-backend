@@ -83,6 +83,22 @@ class Settings(BaseSettings):
     spark_executor_memory: str = "512m"
     spark_network_timeout_seconds: int = 120
     spark_task_timeout_seconds: int = 300
+    # Phase 6 Spark operational hardening controls (Section 7):
+    spark_driver_host: str | None = None
+    spark_driver_bind_address: str | None = None
+    spark_worker_python: str | None = None
+    spark_ship_app_zip: bool = False
+    spark_max_wave_result_rows: int = 250_000
+    spark_driver_max_result_size: str = "1g"
+
+    # M6-03 GPU execution controls:
+    gpu_enabled: bool = True
+    gpu_default_precision: str = "float64"
+    gpu_min_compute_capability_major: int = 5
+    gpu_min_compute_capability_minor: int = 0
+    gpu_memory_utilization_limit: float = 0.80
+    gpu_max_batch_bytes: int = 512 * 1024 * 1024
+    gpu_threads_per_block: int = 128
 
     @model_validator(mode="after")
     def reject_unsafe_configuration(self):

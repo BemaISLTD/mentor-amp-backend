@@ -42,6 +42,12 @@ from app.core.execution.backends import (
     current_capability_registry,
     validate_execution_request,
 )
+from app.core.execution.gpu_backend import (
+    GPUCancelledError,
+    GPUExecutionBackend,
+    GPUKernelExecutionError,
+    GPUSessionStartupError,
+)
 from app.core.execution.spark_backend import (
     SparkCancelledError,
     SparkExecutionBackend,
@@ -622,6 +628,28 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                 **_row_dimensions(data.variables.get(row["variable_name"]), policy),
             })
 
+    def _make_cancel_checker():
+        bind_engine = db.get_bind()
+        cancel_poll_lock = threading.Lock()
+
+        def _check_cancel_fresh() -> bool:
+            with cancel_poll_lock:
+                try:
+                    if bind_engine.dialect.name == "sqlite":
+                        db.refresh(run, attribute_names=["cancel_requested_at"])
+                        return run.cancel_requested_at is not None
+                    with Session(bind=bind_engine) as check_db:
+                        return (
+                            check_db.scalar(
+                                select(Run.cancel_requested_at).where(Run.id == run_id)
+                            )
+                            is not None
+                        )
+                except Exception:  # noqa: BLE001
+                    return False
+
+        return bind_engine, _check_cancel_fresh
+
     execution_error_code = "EXECUTION_ERROR"
     try:
         if isinstance(backend, SparkExecutionBackend):
@@ -641,24 +669,7 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                 "cancelled": False,
             }
             wave_started_count = 0
-            bind_engine = db.get_bind()
-            cancel_poll_lock = threading.Lock()
-
-            def _check_cancel_fresh() -> bool:
-                with cancel_poll_lock:
-                    try:
-                        if bind_engine.dialect.name == "sqlite":
-                            db.refresh(run, attribute_names=["cancel_requested_at"])
-                            return run.cancel_requested_at is not None
-                        with Session(bind=bind_engine) as check_db:
-                            return (
-                                check_db.scalar(
-                                    select(Run.cancel_requested_at).where(Run.id == run_id)
-                                )
-                                is not None
-                            )
-                    except Exception:  # noqa: BLE001
-                        return False
+            bind_engine, _check_cancel_fresh = _make_cancel_checker()
 
             def _on_session_ready(info: dict[str, Any]) -> None:
                 spark_telemetry.update(info)
@@ -777,7 +788,90 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                 }
                 attempt.metrics = {"execution": execution_provenance}
 
-        if not isinstance(backend, SparkExecutionBackend):
+        if isinstance(backend, GPUExecutionBackend):
+            _bind_engine, _check_gpu_cancel = _make_cancel_checker()
+            gpu_batches_started = 0
+            try:
+                if _check_gpu_cancel():
+                    cancelled = True
+                else:
+                    gpu_index = 0
+                    for batch_outcomes in backend.execute_batches(
+                        data,
+                        data.policies,
+                        should_cancel=_check_gpu_cancel,
+                    ):
+                        gpu_batches_started += 1
+                        batch_telemetry = dict(backend.last_execution_telemetry or {})
+                        for policy, result in batch_outcomes:
+                            gpu_index += 1
+                            _record_policy_outcome(policy, result)
+                        timing["calc"] = float(batch_telemetry.get("total_gpu_seconds") or 0.0)
+                        run.progress_done = gpu_index
+                        governance_service.update_run_step(
+                            db,
+                            run_id,
+                            "calculate",
+                            "running",
+                            progress_total=len(data.policies),
+                            progress_done=gpu_index,
+                        )
+                        if (
+                            (len(output_rows) + len(trace_rows)) >= settings.run_artifact_target_rows
+                            or gpu_index == len(data.policies)
+                            or gpu_batches_started >= 1
+                        ):
+                            flush()
+                        else:
+                            attempt.heartbeat_at = now_utc()
+                            db.commit()
+                        if _check_gpu_cancel():
+                            cancelled = True
+                            break
+            except GPUCancelledError:
+                cancelled = True
+            except GPUSessionStartupError as gpu_startup_err:
+                if gpu_batches_started == 0 and exec_request.fallback_policy == FALLBACK_ALLOW_CPU:
+                    execution_provenance.update({
+                        "planned_backend": "cpu",
+                        "actual_backend": "cpu",
+                        "fallback_used": True,
+                        "fallback_reason": gpu_startup_err.code,
+                        "fallback_message": str(gpu_startup_err),
+                        "accelerated": False,
+                        "backend_description": "Local CPU reference path",
+                    })
+                    attempt.metrics = {"execution": execution_provenance}
+                    add_event(
+                        db,
+                        run.id,
+                        "execution_fallback",
+                        f"GPU initialization failed before execution; falling back to CPU: {gpu_startup_err}",
+                        level="warning",
+                        data=execution_provenance,
+                    )
+                    db.commit()
+                    backend = CpuReferenceBackend(policy_runner=run_policy)
+                else:
+                    execution_error_code = gpu_startup_err.code
+                    raise
+            except GPUKernelExecutionError as gpu_kernel_err:
+                # Never silently fall back to CPU after GPU calculation has started.
+                execution_error_code = gpu_kernel_err.code
+                if backend.last_execution_telemetry:
+                    execution_provenance["gpu"] = dict(backend.last_execution_telemetry)
+                    attempt.metrics = {"execution": execution_provenance}
+                raise
+
+            if isinstance(backend, GPUExecutionBackend) and backend.last_execution_telemetry is not None:
+                telemetry_copy = dict(backend.last_execution_telemetry)
+                timing["calc"] = float(telemetry_copy.get("total_gpu_seconds") or timing["calc"])
+                if cancelled:
+                    telemetry_copy["cancelled"] = True
+                execution_provenance["gpu"] = telemetry_copy
+                attempt.metrics = {"execution": execution_provenance}
+
+        if not isinstance(backend, (SparkExecutionBackend, GPUExecutionBackend)):
             for index, policy in enumerate(data.policies, start=1):
                 db.refresh(run, attribute_names=["cancel_requested_at"])
                 if run.cancel_requested_at is not None:
