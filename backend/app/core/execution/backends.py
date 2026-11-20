@@ -128,6 +128,8 @@ class ExecutionPlanContext:
     scenario_count: int = 1
     formulas: Sequence[Any] | None = None
     variables: Any = None
+    output_variables: Sequence[str] | None = None
+    scenario_overrides: Sequence[Mapping[str, Any]] | None = None
 
     @property
     def policy_months(self) -> int:
@@ -654,9 +656,18 @@ class ExecutionPlanner:
                 elif candidate == BACKEND_GPU:
                     if not cap.supports_product(context.product_code):
                         continue
-                    if context.formulas is not None or context.variables is not None:
+                    if (
+                        context.formulas is not None
+                        or context.variables is not None
+                        or context.output_variables is not None
+                        or context.scenario_overrides is not None
+                    ):
                         gpu_ok, _issues = inspect_gpu_model_compatibility(
-                            context.product_code, context.formulas, context.variables
+                            context.product_code,
+                            context.formulas,
+                            context.variables,
+                            output_variables=context.output_variables,
+                            scenario_overrides=context.scenario_overrides,
                         )
                         if not gpu_ok:
                             continue
@@ -709,9 +720,18 @@ class ExecutionPlanner:
             )
             product_supported = graph_ok
         elif request.requested_backend == BACKEND_GPU and product_supported:
-            if context.formulas is not None or context.variables is not None:
+            if (
+                context.formulas is not None
+                or context.variables is not None
+                or context.output_variables is not None
+                or context.scenario_overrides is not None
+            ):
                 gpu_ok, graph_issues = inspect_gpu_model_compatibility(
-                    context.product_code, context.formulas, context.variables
+                    context.product_code,
+                    context.formulas,
+                    context.variables,
+                    output_variables=context.output_variables,
+                    scenario_overrides=context.scenario_overrides,
                 )
                 product_supported = gpu_ok
         reasons: list[str] = []

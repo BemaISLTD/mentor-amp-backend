@@ -11,7 +11,11 @@ from app.config import settings
 from app.core.execution.backends import current_capability_registry
 from app.core.projection_engine.engine import ENGINE_VERSION
 from app.db.database import get_db
-from app.products.registry import REGISTERED_PRODUCTS, registered_function_count
+from app.products.registry import (
+    REGISTERED_INTERNAL_REFERENCES,
+    REGISTERED_PRODUCTS,
+    registered_function_count,
+)
 from app.services.common import iso, now_utc
 from app.version import APP_VERSION
 
@@ -46,6 +50,7 @@ def system_status(db: Session = Depends(get_db)):
         "engine": {
             "registered_functions": functions,
             "products": list(REGISTERED_PRODUCTS),
+            "internal_numerical_references": list(REGISTERED_INTERNAL_REFERENCES),
             "execution_backend": "cpu",
             "available_execution_backends": [
                 name for name, item in discovery["backends"].items() if item["available"]

@@ -246,6 +246,56 @@ def _seed_prospective_reserve_fixture(
         }
 
 
+def _assert_json_semantically_equal(left: Any, right: Any, *, context: str) -> None:
+    """Recursively compare parsed JSON payloads using exact equality for metadata and 1e-9 for floats."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        assert left is right, f"Boolean mismatch at {context}: {left!r} vs {right!r}"
+        return
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        assert math.isclose(float(left), float(right), abs_tol=PROVISIONAL_ABS_TOL), (
+            f"Numeric mismatch at {context}: {left!r} vs {right!r}"
+        )
+        return
+    if isinstance(left, dict) and isinstance(right, dict):
+        assert set(left) == set(right), f"Dict keys mismatch at {context}: {set(left)} vs {set(right)}"
+        for key in left:
+            _assert_json_semantically_equal(left[key], right[key], context=f"{context}.{key}")
+        return
+    if isinstance(left, list) and isinstance(right, list):
+        assert len(left) == len(right), f"List length mismatch at {context}: {len(left)} vs {len(right)}"
+        for idx, (lv, rv) in enumerate(zip(left, right)):
+            _assert_json_semantically_equal(lv, rv, context=f"{context}[{idx}]")
+        return
+    assert left == right, f"Value mismatch at {context}: {left!r} vs {right!r}"
+
+
+def _assert_trace_tree_equal(cpu_node: dict[str, Any], gpu_node: dict[str, Any], *, path: str) -> None:
+    """Compare recursive /v1/runs/{id}/trace trees node-by-node against CPU reference."""
+    for field in ("variable", "month", "source_type", "source_table", "formula_id", "error"):
+        assert cpu_node.get(field) == gpu_node.get(field), (
+            f"Trace tree field '{field}' mismatch at {path}: {cpu_node.get(field)!r} vs {gpu_node.get(field)!r}"
+        )
+    _assert_json_semantically_equal(cpu_node.get("value"), gpu_node.get("value"), context=f"{path}.value")
+    _assert_json_semantically_equal(cpu_node.get("inputs"), gpu_node.get("inputs"), context=f"{path}.inputs")
+    cpu_children = sorted(
+        cpu_node.get("children") or [],
+        key=lambda c: (str(c.get("variable")), int(c.get("month") or 0)),
+    )
+    gpu_children = sorted(
+        gpu_node.get("children") or [],
+        key=lambda c: (str(c.get("variable")), int(c.get("month") or 0)),
+    )
+    assert len(cpu_children) == len(gpu_children), (
+        f"Trace tree children count mismatch at {path}: {len(cpu_children)} vs {len(gpu_children)}"
+    )
+    for c_child, g_child in zip(cpu_children, gpu_children):
+        _assert_trace_tree_equal(
+            c_child,
+            g_child,
+            path=f"{path}->{c_child.get('variable')}[m={c_child.get('month')}]",
+        )
+
+
 def test_gpu_vs_cpu_parity_traces_reconciliation_determinism_and_fingerprint(monkeypatch):
     _patch_gpu_test_environment(monkeypatch)
     env = Env()
@@ -315,8 +365,21 @@ def test_gpu_vs_cpu_parity_traces_reconciliation_determinism_and_fingerprint(mon
             gpu_meta = gpu_view["execution"]["gpu"]
             assert gpu_meta["hardware_verified"] is _REAL_CUDA_AVAILABLE
             assert gpu_meta["simulator_non_hardware"] is (not _REAL_CUDA_AVAILABLE)
+            assert gpu_meta["timing_source"] == (
+                "cuda_hardware_events" if _REAL_CUDA_AVAILABLE else "simulator_wall_clock"
+            )
             assert gpu_meta["precision"] == "float64"
             assert gpu_meta["batches_completed"] == 2
+            for timing_key in (
+                "h2d_transfer_seconds",
+                "kernel_launch_seconds",
+                "kernel_execution_seconds",
+                "kernel_sync_wait_seconds",
+                "d2h_transfer_seconds",
+                "end_to_end_batch_seconds",
+            ):
+                assert timing_key in gpu_meta and gpu_meta[timing_key] >= 0.0
+            assert "vram_free_after_bytes" in gpu_meta
 
             with env.Session() as db:
                 cpu_run = db.get(Run, cpu_run_id)
@@ -360,6 +423,47 @@ def test_gpu_vs_cpu_parity_traces_reconciliation_determinism_and_fingerprint(mon
                 g_trace = read_attempt_artifact_rows(db, gpu_run_1, "traces", gpu_run.accepted_attempt_number)
                 assert len(c_trace) == len(g_trace) > 0
 
+                # Deep semantic trace parity (formula_id, source metadata, scenario-adjusted inputs, outputs)
+                c_trace_map = {
+                    (r["policy_id"], int(r["projection_month"]), r["variable_name"]): r
+                    for r in c_trace
+                }
+                g_trace_map = {
+                    (r["policy_id"], int(r["projection_month"]), r["variable_name"]): r
+                    for r in g_trace
+                }
+                assert set(c_trace_map) == set(g_trace_map)
+                for tkey, crow in c_trace_map.items():
+                    grow = g_trace_map[tkey]
+                    assert crow["formula_id"] == grow["formula_id"], f"formula_id mismatch at {tkey}"
+                    assert crow["source_type"] == grow["source_type"], f"source_type mismatch at {tkey}"
+                    assert crow["source_table"] == grow["source_table"], f"source_table mismatch at {tkey}"
+                    assert crow["error_message"] == grow["error_message"], f"error_message mismatch at {tkey}"
+                    _assert_json_semantically_equal(
+                        json.loads(crow["lookup_keys_json"]),
+                        json.loads(grow["lookup_keys_json"]),
+                        context=f"trace{tkey}.lookup_keys",
+                    )
+                    _assert_json_semantically_equal(
+                        json.loads(crow["input_values_json"]),
+                        json.loads(grow["input_values_json"]),
+                        context=f"trace{tkey}.input_values",
+                    )
+                    _assert_json_semantically_equal(
+                        json.loads(crow["output_value_json"]),
+                        json.loads(grow["output_value_json"]),
+                        context=f"trace{tkey}.output_value",
+                    )
+
+                # Confirm scenario-adjusted discount rate (-0.01 in stress scenario idx==1) appears in traces
+                expected_rate = 0.045 if idx == 0 else -0.01
+                rate_row = g_trace_map[("POL_POS", 1, "discount_rate_annual")]
+                assert math.isclose(
+                    float(json.loads(rate_row["output_value_json"])["value"]),
+                    expected_rate,
+                    abs_tol=PROVISIONAL_ABS_TOL,
+                )
+
                 expected = reconciliation_service.create_expected_set(
                     db,
                     fix["project_id"],
@@ -397,19 +501,29 @@ def test_gpu_vs_cpu_parity_traces_reconciliation_determinism_and_fingerprint(mon
                 )
                 assert recon["status"] == "PASS"
 
-            trace_resp = env.get(
-                f"/runs/{gpu_run_1}/trace",
-                policy_id="POL_POS",
-                month=1,
-                variable="reserve",
-                depth=4,
-            )
-            assert trace_resp.status_code == 200, trace_resp.text
-            assert math.isclose(
-                trace_resp.json()["root"]["value"],
-                g_map1[("POL_POS", 1, "reserve")],
-                abs_tol=PROVISIONAL_ABS_TOL,
-            )
+            # Compare full recursive trace trees between CPU and GPU across reserve and PV cash flow
+            for var_name, month_num in (("reserve", 0), ("reserve", 1), ("pv_cash_flow", 1), ("pv_cash_flow", 24)):
+                cpu_tree_resp = env.get(
+                    f"/runs/{cpu_run_id}/trace",
+                    policy_id="POL_POS",
+                    month=month_num,
+                    variable=var_name,
+                    depth=6,
+                )
+                gpu_tree_resp = env.get(
+                    f"/runs/{gpu_run_1}/trace",
+                    policy_id="POL_POS",
+                    month=month_num,
+                    variable=var_name,
+                    depth=6,
+                )
+                assert cpu_tree_resp.status_code == 200, cpu_tree_resp.text
+                assert gpu_tree_resp.status_code == 200, gpu_tree_resp.text
+                _assert_trace_tree_equal(
+                    cpu_tree_resp.json()["root"],
+                    gpu_tree_resp.json()["root"],
+                    path=f"scenario[{idx}].{var_name}[m={month_num}]",
+                )
 
             manifest = env.get(f"/runs/{gpu_run_1}/manifest").json()["final_manifest"]["manifest"]
             assert manifest["runtime"]["execution"]["requested_backend"] == BACKEND_GPU

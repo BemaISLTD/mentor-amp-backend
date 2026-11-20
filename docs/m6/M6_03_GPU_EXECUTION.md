@@ -1,95 +1,123 @@
-# M6-03: Genuine CUDA GPU Execution Backend & Section 7 Spark Operational Hardening
+# M6-03: Genuine CUDA GPU Execution Backend & Final Review Hardening
 
-> **Branch:** `feat/m6-scale-execution-integration` (extends accepted M6-02 commit `25a9f3e18848fdca7a0f8bbf78b1506d4e98fa89`)  
-> **Hardware Status:** **PHYSICAL NVIDIA GPU HARDWARE VERIFICATION: NOT RUN** (local host has `Intel(R) HD Graphics 520` and no `nvidia-smi`; GitHub-hosted CI runs on CPU-only `ubuntu-latest` runners). All GPU kernel logic and API/provenance contracts below are verified via unit tests and explicit non-hardware `NUMBA_ENABLE_CUDASIM=1` execution in `venv-gpu-sim` and CI.  
-> **Provisional Tolerance Disclaimer:** Numerical parity comparisons use the M6 provisional engineering tolerance `abs_tol = 1e-9`. Formal CAS §17 numerical tolerance acceptance remains open pending Product Owner confirmation.
+> **Branch:** `feat/m6-scale-execution-integration` (extends accepted M6-02 commit `25a9f3e18848fdca7a0f8bbf78b1506d4e98fa89` and provisional M6-03 commit `8515fc8881c8b0001fe0daa2c8e7837706235cc8`)  
+> **Physical Hardware Gate:** **PHYSICAL GPU ACCEPTANCE = NOT RUN (OPEN)** — this local development host has `Intel(R) HD Graphics 520` (no NVIDIA driver / no `nvidia-smi`), and GitHub-hosted CI runs on CPU-only `ubuntu-latest` runners. Simulator runs (`NUMBA_ENABLE_CUDASIM=1`) verify kernel API, semantic trace parity, and negative/fallback behavior only and are **never** treated as physical NVIDIA GPU evidence.  
+> **Provisional Tolerance Disclaimer:** Numerical parity comparisons use the M6 provisional engineering tolerance `abs_tol = 1e-9`. Formal CAS §17 numerical tolerance acceptance remains **OPEN** pending Product Owner confirmation.
 
 ---
 
-## 1. Architecture Decision & Selected GPU Workload
+## 1. GPU Kernel Architecture & Strict Calculation-Graph Equivalence
 
-### Workload Selection
-- **Product:** `PROSPECTIVE_RESERVE_DISCOUNTING` (`backend/app/products/prospective_reserve_discounting/`)
-- **Equations (shared verbatim with CPU reference `engine.py` and `illustrative_reserve.py`):**
+### Selected Workload & Kernel
+- **Kernel:** `_prospective_reserve_kernel_impl` (`prospective_reserve_discounting_float64_v1`) in `backend/app/core/execution/gpu_backend.py`, compiled via `numba-cuda==0.30.4` (`@cuda.jit`, strict IEEE-754 `float64`).
+- **Equations (shared verbatim with CPU `engine.py` and `illustrative_reserve.py`):**
   - `cash_flow_t = monthly_cash_flow * (1 + cash_flow_growth_rate)^((t - 1) / 12)`
   - `discount_factor_t = (1 + discount_rate_annual)^(-t / 12)`
   - `pv_cash_flow_t = cash_flow_t * discount_factor_t`
   - `reserve_H = 0.0`, `reserve_t = (reserve_{t+1} + cash_flow_{t+1}) * (1 + valuation_rate)^(-1/12)` (`illustrative_prospective_reserve`)
-- **Why this workload:** Purely dense IEEE-754 `float64` per-policy computation with deterministic memory stride, zero cross-policy coupling, and zero lookup-table branching.
-- **No silent approximations or model misrouting:** `inspect_gpu_model_compatibility()` verifies both product code (`PROSPECTIVE_RESERVE_DISCOUNTING`) and every formula/variable/valuation definition. Other products (`SPIA_LITE`, `MYGA_LITE`, `FIA_LITE`, `RILA_LITE`) or unsupported formula/valuation refs never silently claim GPU execution (`MODEL_NOT_GPU_SUPPORTED`).
 
-### CUDA Stack
-- **Compiler & Runtime:** `numba==0.68.1`, `numba-cuda==0.30.4`, `nvidia-cuda-runtime==13.5.37` (`@cuda.jit`, strict `float64`).
-- **Kernel:** `_prospective_reserve_kernel_impl` compiled via `_compile_or_get_cuda_kernel()` in `backend/app/core/execution/gpu_backend.py` (`prospective_reserve_discounting_float64_v1`).
-- **Hardware vs Simulator Boundary:**
-  - `probe_cuda_hardware()` in `gpu_backend.py` ALWAYS sets `cuda_gpu_detected = False` whenever `NUMBA_ENABLE_CUDASIM=1` is present or no CUDA device is accessible.
-  - Production `GPUExecutionBackend(allow_simulator=False)` refuses simulator execution (`GPU_HARDWARE_UNAVAILABLE`).
-  - Only explicit isolated dev/CI simulator tests pass `allow_simulator=True`, and record `hardware_verified = False`, `execution_mode = "cuda_simulator"`, and `simulator_non_hardware = True` in `execution_provenance["gpu"]`.
-
----
-
-## 2. Backend Capability, Compatibility, and Lifecycle Integration
-
-### Key Files Updated / Created
-- `backend/app/config.py`: GPU settings (`gpu_enabled`, `gpu_default_precision="float64"`, `gpu_min_compute_capability_major=5`, `gpu_min_compute_capability_minor=0`, `gpu_memory_utilization_limit=0.80`, `gpu_max_batch_bytes=512*1024*1024`, `gpu_threads_per_block=128`) and Section 7 Spark settings (`spark_driver_host`, `spark_driver_bind_address`, `spark_worker_python`, `spark_ship_app_zip`, `spark_max_wave_result_rows=250_000`, `spark_driver_max_result_size="1g"`).
-- `backend/app/products/prospective_reserve_discounting/` (`__init__.py`, `config.py`) + `backend/app/products/registry.py`: Shared formula/inforce/valuation definitions registered cleanly alongside `SPIA`, `MYGA`, `FIA`, and `RILA`.
-- `backend/app/core/execution/gpu_backend.py`:
-  - `probe_cuda_hardware()` (device names, compute capability, free/total VRAM, driver/runtime versions)
-  - `inspect_gpu_model_compatibility()` (strict product, function ref, cross-policy, and valuation method validation)
-  - `GPUExecutionBackend.execute_batches()` / `execute_policies()`:
-    - Pre-execution checks: `GPU_DISABLED`, `UNSUPPORTED_GPU_PRECISION`, `GPU_HARDWARE_UNAVAILABLE`, `GPU_DEVICE_INVALID`, `GPU_COMPUTE_CAPABILITY_UNSUPPORTED`, `MODEL_NOT_GPU_SUPPORTED`, `GPU_INSUFFICIENT_MEMORY`
-    - Bounded per-batch VRAM allocation capped by `min(gpu_max_batch_bytes, free_vram * gpu_memory_utilization_limit)`
-    - Deterministic `finally` device array release
-    - Per-policy input error isolation (missing cash flow, non-finite inputs, `<= -100%` growth rate) matching CPU `EngineError` semantics and producing `partial_success` cleanly
-    - Full `m2-v1` Parquet output rows and trace rows (including leaf input/context/manual resolution traces and valuation traces)
-- `backend/app/core/execution/backends.py`: `BACKEND_GPU` marked `implemented=True` (`M6-03`), hardware discovery delegated to `probe_cuda_hardware()`, `get_backend()` constructs `GPUExecutionBackend`, `ExecutionPlanner.plan()` runs `inspect_gpu_model_compatibility()`.
-- `backend/app/services/run_execution_service.py`:
-  - Shared `_make_cancel_checker()` used by Spark and GPU batches.
-  - Pre-Batch-0 `GPUSessionStartupError` honors `allow_cpu_fallback` (logs `execution_fallback` warning event and updates provenance `actual_backend="cpu"`, `fallback_used=True`) or fails closed under `strict_fail`.
-  - Mid-execution `GPUKernelExecutionError` **NEVER** silently falls back to CPU (`execution_error_code` recorded on attempt and run fails cleanly).
-  - Cancellation between batches flushes retained partial artifacts (`results_available=False`, `status="cancelled"`), and `/runs/{id}/retry` runs cleanly without duplicate outputs.
+### Fail-Closed Compatibility Gate (`inspect_gpu_model_compatibility()`)
+Any model variation not actually implemented by `_prospective_reserve_kernel_impl` fails closed (`MODEL_NOT_GPU_SUPPORTED`) at planning time (`ExecutionPlanner.plan()`) and again at worker startup (`GPUExecutionBackend.execute_batches()`):
+1. **Product identity:** Must match `PROSPECTIVE_RESERVE_DISCOUNTING`.
+2. **Exact formula set & dependencies (`REQUIRED_GPU_FORMULAS`):**
+   - Exactly three formula outputs (`cash_flow`, `discount_factor`, `pv_cash_flow`): missing required formulas, duplicate outputs, or extra unsupported formula nodes are rejected.
+   - Exact `function_ref` per output variable (`prospective_reserve:cash_flow`, `prospective_reserve:discount_factor`, `prospective_reserve:pv_cash_flow`).
+   - Exact dependency set per formula (`cash_flow` -> `{monthly_cash_flow, cash_flow_growth_rate, projection_month}`, `discount_factor` -> `{discount_rate_annual, projection_month}`, `pv_cash_flow` -> `{cash_flow, discount_factor}`).
+3. **Immutable code fingerprints:** Verifies registered `FORMULA_REGISTRY` functions and frozen `RunPackage` `implementation.implementation_fingerprint` values match `_approved_gpu_formula_fingerprints()`.
+4. **Exact variable sources, defaults, and valuation wiring:**
+   - `projection_month` (`context`, field `projection_month`), `monthly_cash_flow` (`input`, column `monthly_cash_flow`), `cash_flow_growth_rate` (`input`, column `cash_flow_growth_rate`, finite default `> -1.0`), `discount_rate_annual` (`manual`, finite rate `> -1.0`), `cash_flow`/`discount_factor`/`pv_cash_flow` (`formula`).
+   - Exactly one valuation variable (`reserve`) with `method == "illustrative_prospective_reserve"`, `cash_flow == "cash_flow"`, `rate == "discount_rate_annual"`, `consistency_sum_of in (None, "pv_cash_flow")`.
+   - Rejects any cross-policy variable (`portfolio` / `cross_policy`) and any extra `formula` / `valuation` / `prior_output` variable.
+5. **Output variables & scenario overrides:**
+   - `output_variables` must be a subset of `{"cash_flow", "discount_factor", "pv_cash_flow", "reserve"}`.
+   - `scenario_overrides` may only target `"discount_rate_annual"` with supported operations (`set`, `add`, `subtract`, `multiply`, `percent_change`) and finite numeric values.
 
 ---
 
-## 3. Section 7: Phase 6 Spark Operational Hardening
+## 2. Product Status & Launch 1.0 Classification
 
-Implemented in `backend/app/core/execution/spark_backend.py` and `backend/app/config.py`:
+Mentor AMP's authoritative Launch 1.0 actuarial product scope consists of **7 product families**: `SPIA`, `MYGA`, `FIA`, `RILA`, `IDI`, `VA`, `PRT` (4 currently implemented: `SPIA`, `MYGA`, `FIA`, `RILA`).
 
-1. **7A — Concurrent Spark Run Safety:**
-   - Guarded `SparkSession` acquisition and teardown with `_SPARK_SESSION_LOCK`, `_SPARK_ACTIVE_RUNS`, and `_SPARK_ACTIVE_MASTER`.
-   - Simultaneous runs targeting the same master share the singleton JVM `SparkContext` without calling `spark.stop()` out from under an active peer (`spark.stop()` runs only when `_SPARK_ACTIVE_RUNS` decrements to `0`).
-   - Re-binds thread-local `sc.setJobGroup(job_group, ..., interruptOnCancel=True)` per wave so cancelling one run via `cancel_spark_run(run_id)` isolates cancellation to its own job group without disrupting healthy peer runs.
-   - Fails fast with `SPARK_MASTER_CONTENTION` (`SparkSessionStartupError`) if a run requests a different Spark master while another master is actively occupied (`_SPARK_ACTIVE_RUNS > 0`).
-2. **7B — Remote Multi-Machine Readiness (Config & Code Shipping):**
-   - `_is_loopback_master()` + `_resolve_spark_runtime_config()` remove hardcoded `127.0.0.1` `spark.driver.host` / `spark.driver.bindAddress` assumptions for remote cluster masters, honor `settings.spark_worker_python`, and ship `backend/app/*.py` once per `applicationId` via `_build_app_zip()` + `sc.addPyFile(...)` when `spark_ship_app_zip=True` or using a non-loopback cluster master.
-   - *Honesty boundary:* Multi-host physical cluster execution across separate network machines remains **NOT VERIFIED** locally (single-host standalone/local verification only).
-3. **7C — Driver-Memory Wave Scalability:**
-   - `_compute_wave_row_budget()` estimates output + trace rows per policy (`horizon_months * (len(output_variables) + (15 if traced else 0))`), caps `effective_batch_size` within `settings.spark_max_wave_result_rows`, sets `spark.driver.maxResultSize = settings.spark_driver_max_result_size`, and records wave row-budget telemetry in `execution_provenance["spark"]`.
+- **`PROSPECTIVE_RESERVE_DISCOUNTING` is NOT an eighth Launch 1.0 actuarial product.**
+- It is explicitly classified as an **illustrative internal GPU numerical reference** (`MODEL_CLASSIFICATION = "internal_gpu_numerical_reference"`, `IS_LAUNCH_PRODUCT = False`) in `backend/app/products/prospective_reserve_discounting/config.py`.
+- `register_all_products()` in `backend/app/products/registry.py` keeps `REGISTERED_PRODUCTS == ["SPIA", "MYGA", "FIA", "RILA"]` and exposes `PROSPECTIVE_RESERVE_DISCOUNTING` separately under `REGISTERED_INTERNAL_REFERENCES` (and `GET /v1/system/status -> engine.internal_numerical_references`).
+
+### Backend Support Matrix by Model / Product
+| Model / Product | Classification | CPU Reference | PySpark Distributed | CUDA GPU Kernel |
+|---|---|---|---|---|
+| `SPIA` (`SPIA_LITE`, `SPIA_REFERENCE`) | Launch 1.0 Product | Supported | Supported | Not supported (`MODEL_NOT_GPU_SUPPORTED`) |
+| `MYGA` (`MYGA_LITE`) | Launch 1.0 Product | Supported | Supported | Not supported (`MODEL_NOT_GPU_SUPPORTED`) |
+| `FIA` (`FIA_LITE`) | Launch 1.0 Product | Supported | Supported | Not supported (`MODEL_NOT_GPU_SUPPORTED`) |
+| `RILA` (`RILA_LITE`) | Launch 1.0 Product | Supported | Supported | Not supported (`MODEL_NOT_GPU_SUPPORTED`) |
+| `IDI`, `VA`, `PRT` | Launch 1.0 (Phase 7) | Planned | Planned | Not supported |
+| `PROSPECTIVE_RESERVE_DISCOUNTING` | Internal GPU Numerical Reference | Supported | Policy-parallel compatible | **Supported (`prospective_reserve_discounting_float64_v1`)** |
+
+### Reusability for Existing Actuarial Products
+The backward discounting loop (`reserve_t = (reserve_{t+1} + cash_flow_{t+1}) * (1 + r)^(-1/12)`) is mathematically identical to `app/core/valuation/illustrative_reserve.py` used by `SPIA`, `MYGA`, `FIA`, and `RILA`. In a future milestone, this kernel can be reused as an optional GPU valuation post-stage on already-projected cash-flow matrices without rewriting contract mechanics—provided profiling shows the valuation step is large enough to amortize H2D/D2H PCIe transfer overhead.
 
 ---
 
-## 4. Verification & Benchmark Evidence
+## 3. Semantic Trace Parity & Timing Telemetry
 
-### Test Suites Passed Locally
-| Environment | Command | Observed Result | Notes |
-|---|---|---|---|
-| `backend/.venv` (Pure CPU) | `python -m pytest -q tests/unit tests/golden_policy tests/integration` | **799 passed, 4 skipped** | Includes M1–M5 CPU/golden tests, M6 planner/API tests, `test_m6_gpu_backend.py`, and updated `register_all_products()` assertions |
-| `venv-spark` (Spark 4.1.1 + Java 17) | `python -m pytest -q tests/unit/test_m6_spark_backend.py tests/unit/test_m6_gpu_backend.py tests/integration/test_m6_execution_planner_api.py tests/spark` | **43 passed, 0 failed** | Includes `tests/spark/test_m6_spark_concurrency.py` verifying simultaneous 2-thread shared-context Spark execution (`_SPARK_ACTIVE_RUNS >= 2`) and isolated cancellation |
-| `venv-gpu-sim` (`NUMBA_ENABLE_CUDASIM=1`) | `NUMBA_ENABLE_CUDASIM=1 python -m pytest -q tests/unit/test_m6_gpu_backend.py tests/unit/test_m6_execution_planner.py tests/integration/test_m6_execution_planner_api.py tests/gpu` | **36 passed, 0 failed** | Simulator non-hardware parity (`abs_tol = 1e-9`), 1m & 480m horizons, trace parity (`772 == 772`), reconciliation `PASS`, error isolation (`partial_success`), cancellation & retry without duplicates |
+### Semantic Trace Verification (`tests/gpu/test_m6_gpu_execution.py`)
+Beyond matching output values (`abs_tol = 1e-9`) and trace row counts (`772 == 772`), GPU E2E tests compare every trace row semantically against CPU across both Base (`4.5%`) and Stress (`-1.0%` scenario override) runs:
+- Exact `(policy_id, projection_month, variable_name)` key set parity.
+- Exact `formula_id`, `source_type`, `source_table`, `lookup_keys_json`, and `error_message` parity.
+- Recursive semantic parity of `input_values_json` (including `scenario_override` metadata `{scenario, operation, value, base_value}` on scenario-adjusted `discount_rate_annual` rows) and `output_value_json`.
+- Node-by-node recursive parity of `GET /v1/runs/{id}/trace` trees (`depth=6`) for `reserve` (months 0 and 1) and `pv_cash_flow` (months 1 and 24).
 
-### CUDA Simulator Benchmark Check (`NUMBA_ENABLE_CUDASIM=1`, **Non-Hardware**)
-Ran `NUMBA_ENABLE_CUDASIM=1 python scripts/benchmark_m6_03_gpu.py --allow-simulator`:
-- `mode`: `"cuda_simulator_non_hardware"`, `hardware_verified`: `false`, `cuda_gpu_detected`: `false`
-- `25 policies x 120 months` (`3,000` policy-months): `cpu_seconds = 0.2734`, `max_reserve_0_abs_diff = 0.0`, `max_consistency_rel_err = 3.47e-15`, `peak_estimated_device_bytes = 97,000`
-- `100 policies x 360 months` (`36,000` policy-months): `cpu_seconds = 3.7231`, `max_reserve_0_abs_diff = 0.0`, `max_consistency_rel_err = 8.92e-15`, `peak_estimated_device_bytes = 1,156,000`
-- *(Simulator timing reflects CPU Python thread emulation only and MUST NOT be interpreted as physical GPU speedup.)*
+### Non-Double-Counted CUDA Timing & Mandatory Physical-GPU Acceptance Gate
+In `backend/app/core/execution/gpu_backend.py`:
+- On physical CUDA hardware (`hardware_verified == True`), kernel execution time (`kernel_execution_seconds`) is measured using **hardware CUDA events** (`cuda.event(timing=True)` + `cuda.event_elapsed_time`), cleanly separated from CPU dispatch (`kernel_launch_seconds`), host sync wait (`kernel_sync_wait_seconds`), `h2d_transfer_seconds`, `d2h_transfer_seconds`, and outer `end_to_end_batch_seconds` without double-counting synchronization. `vram_free_after_bytes` is recorded after device buffer cleanup.
+- On simulator (`hardware_verified == False`), `timing_source` is explicitly `"simulator_wall_clock"` with `kernel_launch_seconds = 0.0` and `kernel_sync_wait_seconds = 0.0`.
+
+In `backend/scripts/benchmark_m6_03_gpu.py`:
+- `--require-physical-gpu`: **Fails closed with exit code `2` and `acceptance_status = "FAIL"`** whenever no physical NVIDIA GPU is detected or `NUMBA_ENABLE_CUDASIM=1` / `--allow-simulator` is set. Cannot return `PASS` from a skip.
+- Optional dev mode (no flags, no GPU): exits `0` with `acceptance_status = "NOT_RUN"`, `physical_gpu_acceptance = "NOT_RUN"`.
+- Simulator parity check (`NUMBA_ENABLE_CUDASIM=1 ... --allow-simulator`): measures cold vs warm invocations, compares every policy/month/output point against CPU, and reports `acceptance_status = "SIMULATOR_ONLY_NOT_HARDWARE_ACCEPTED"`, `physical_gpu_acceptance = "NOT_RUN"`.
+
+---
+
+## 4. Spark Operational Hardening & Documented Limitations (Section 7)
+
+Retained in `backend/app/core/execution/spark_backend.py` and `backend/app/config.py`:
+- **Single-process concurrent Spark run safety:** `_SPARK_SESSION_LOCK`, `_SPARK_ACTIVE_RUNS`, `_SPARK_ACTIVE_MASTER`, per-wave `sc.setJobGroup(...)` isolation, and `SPARK_MASTER_CONTENTION` rejection for conflicting simultaneous masters.
+- **Remote configuration groundwork:** configurable `spark_driver_host`, `spark_driver_bind_address`, `spark_worker_python`, and `sc.addPyFile` zip packaging (`_build_app_zip()`).
+- **Driver-memory row-budget safeguards:** `_compute_wave_row_budget()` (`spark_max_wave_result_rows = 250_000`) and `spark.driver.maxResultSize = "1g"`.
+
+**Explicitly Documented Unverified Operational Limitations (OPEN for remaining Phase 6 acceptance):**
+- Multi-host remote Spark cluster deployment across separate network machines: **NOT VERIFIED**.
+- Multi-process distributed admission / scheduling across separate worker OS processes: **NOT VERIFIED**.
+- Production-scale driver/executor memory behavior at enterprise portfolio sizes: **NOT VERIFIED**.
+
+---
+
+## 5. Verification Evidence & Gate Status
+
+### Local Verification Results
+| Environment | Suite / Command | Observed Result |
+|---|---|---|
+| `backend/.venv` (Pure CPU) | `python -m pytest -q tests/unit tests/golden_policy tests/integration` | **801 passed, 4 skipped** |
+| `venv-spark` (Spark 4.1.1 + Java 17) | `python -m pytest -q tests/unit/test_m6_spark_backend.py tests/unit/test_m6_gpu_backend.py tests/integration/test_m6_execution_planner_api.py tests/spark` | **45 passed, 0 failed** |
+| `venv-gpu-sim` (`NUMBA_ENABLE_CUDASIM=1`) | `NUMBA_ENABLE_CUDASIM=1 python -m pytest -q tests/unit/test_m6_gpu_backend.py tests/unit/test_m6_execution_planner.py tests/integration/test_m6_execution_planner_api.py tests/gpu` | **38 passed, 0 failed** |
+| `venv-gpu-sim` (Physical GPU Gate Check) | `python scripts/benchmark_m6_03_gpu.py --require-physical-gpu` | **Exit code `2` (`acceptance_status = FAIL`, `PHYSICAL_GPU_UNAVAILABLE`)** |
+| `venv-gpu-sim` (Simulator Parity Benchmark) | `NUMBA_ENABLE_CUDASIM=1 python scripts/benchmark_m6_03_gpu.py --allow-simulator` | `25x120`: `12,025` points, `max_output_abs_diff = 0.0`; `100x360`: `144,100` points, `max_output_abs_diff = 0.0`; `physical_gpu_acceptance = NOT_RUN` |
 
 ### Running Physical NVIDIA CUDA Hardware Acceptance (On Authorized GPU Host)
-On a Linux/Windows host with an NVIDIA GPU (compute capability >= 5.0), NVIDIA driver, and CUDA Toolkit (`numba-cuda` installed without `NUMBA_ENABLE_CUDASIM`):
 ```bash
 cd backend
 unset NUMBA_ENABLE_CUDASIM
 python -m pytest -q tests/unit/test_m6_gpu_backend.py tests/gpu
-python scripts/benchmark_m6_03_gpu.py
+python scripts/benchmark_m6_03_gpu.py --require-physical-gpu
 ```
-Verify in the output that `cuda_gpu_detected` is `true`, `hardware_verified` is `true`, `device_name` matches the physical NVIDIA GPU, and both PTX kernel timings and H2D/D2H memory transfer metrics are recorded cleanly.
+
+### Gate Status Summary
+| Gate | Status | Notes |
+|---|---|---|
+| GPU Model Compatibility Equivalence Gate | **CLOSED** | Exact formula set, dependencies, code fingerprints, variable sources, valuation refs, outputs, and scenario overrides verified + 11 negative tests |
+| Launch 1.0 7-Product Catalog Integrity | **CLOSED** | `PROSPECTIVE_RESERVE_DISCOUNTING` separated into `internal_numerical_references`; `products` remains `["SPIA", "MYGA", "FIA", "RILA"]` |
+| Semantic Trace & Trace-Tree Parity (Simulator) | **CLOSED** | All 772 trace rows (incl. `scenario_override` provenance) and recursive `/trace` trees verified against CPU |
+| Non-Double-Counted CUDA Timing & `--require-physical-gpu` | **CLOSED** | CUDA hardware events implemented; `--require-physical-gpu` exits `2` (`FAIL`) without physical GPU or under simulator |
+| Physical NVIDIA GPU Hardware Execution & Benchmarks | **OPEN (NOT RUN)** | Requires authorized physical NVIDIA GPU VM or GPU runner |
+| CAS §17 Formal Numerical Tolerance Sign-Off | **OPEN** | Provisional `1e-9` tolerance used pending Product Owner confirmation |
+| Multi-Host / Multi-Process / Production-Scale Spark Ops | **OPEN** | Single-process local concurrency verified; remote/multi-process/prod-scale remain open |

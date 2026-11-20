@@ -19,9 +19,11 @@ def test_indexed_block_schema_and_conservation(code):
 
 
 def test_registration_is_idempotent():
-    expected = ["SPIA", "MYGA", "FIA", "RILA", "PROSPECTIVE_RESERVE_DISCOUNTING"]
-    assert register_all_products() == expected
-    assert register_all_products() == expected
+    from app.products.registry import registered_internal_references
+
+    assert register_all_products() == ["SPIA", "MYGA", "FIA", "RILA"]
+    assert register_all_products() == ["SPIA", "MYGA", "FIA", "RILA"]
+    assert registered_internal_references() == ["PROSPECTIVE_RESERVE_DISCOUNTING"]
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf")])

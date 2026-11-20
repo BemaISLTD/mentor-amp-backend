@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import date
+import json
 import zipfile
 from types import SimpleNamespace
 
@@ -49,22 +51,9 @@ from tests.integration.wp1_support import Env
 
 
 def _prospective_reserve_config() -> tuple[list[dict], list[dict]]:
-    formulas = [
-        {"output_variable": "cash_flow", "function_ref": "prospective_reserve:cash_flow", "dependencies": []},
-        {"output_variable": "discount_factor", "function_ref": "prospective_reserve:discount_factor", "dependencies": []},
-        {
-            "output_variable": "pv_cash_flow",
-            "function_ref": "prospective_reserve:pv_cash_flow",
-            "dependencies": ["cash_flow", "discount_factor"],
-        },
-    ]
-    variables = [
-        {"name": "cash_flow", "source": {"type": "formula"}},
-        {"name": "discount_factor", "source": {"type": "formula"}},
-        {"name": "pv_cash_flow", "source": {"type": "formula"}},
-        {"name": "reserve", "source": {"type": "valuation", "method": illustrative_reserve.METHOD}},
-    ]
-    return formulas, variables
+    from app.products.prospective_reserve_discounting import config as pr_cfg
+
+    return [deepcopy(item) for item in pr_cfg.FORMULAS], [deepcopy(item) for item in pr_cfg.VARIABLES]
 
 
 def _mock_gpu_registry() -> BackendCapabilityRegistry:
@@ -145,37 +134,193 @@ def test_gpu_capability_is_implemented_and_simulator_never_fakes_hardware(monkey
 
 def test_gpu_model_compatibility_checks():
     formulas, variables = _prospective_reserve_config()
-    ok, issues = inspect_gpu_model_compatibility(GPU_ELIGIBLE_PRODUCT_CODE, formulas, variables)
-    assert ok is True
+    outputs = ["cash_flow", "discount_factor", "pv_cash_flow", "reserve"]
+    valid_overrides = [
+        {
+            "target_variable": "discount_rate_annual",
+            "operation": "set",
+            "value": 0.03,
+            "applies_from_period": 1,
+            "applies_to_period": 120,
+        }
+    ]
+    ok, issues = inspect_gpu_model_compatibility(
+        GPU_ELIGIBLE_PRODUCT_CODE,
+        formulas,
+        variables,
+        output_variables=outputs,
+        scenario_overrides=valid_overrides,
+    )
+    assert ok is True, issues
     assert issues == []
 
-    # Wrong product fails cleanly
+    # 1. Wrong product fails closed
     ok2, issues2 = inspect_gpu_model_compatibility("SPIA_LITE", formulas, variables)
     assert ok2 is False
-    assert any("PRODUCT_NOT_GPU_ELIGIBLE" in i or "UNSUPPORTED_GPU_PRODUCT" in i for i in issues2)
+    assert any("UNSUPPORTED_GPU_PRODUCT" in i for i in issues2)
 
-    # Unsupported formula ref fails cleanly
-    bad_formulas = list(formulas) + [
+    # 2. Extra unsupported formula node fails closed
+    extra_formulas = deepcopy(formulas) + [
         {"output_variable": "other", "function_ref": "spia:benefit", "dependencies": []}
     ]
-    ok3, issues3 = inspect_gpu_model_compatibility(GPU_ELIGIBLE_PRODUCT_CODE, bad_formulas, variables)
+    ok3, issues3 = inspect_gpu_model_compatibility(GPU_ELIGIBLE_PRODUCT_CODE, extra_formulas, variables)
     assert ok3 is False
-    assert any("UNSUPPORTED_GPU_FUNCTION_REF" in i for i in issues3)
+    assert any("UNSUPPORTED_GPU_FORMULA_NODE" in i for i in issues3)
 
-    # Cross-policy or custom valuation method fails cleanly
-    cross_vars = list(variables) + [
+    # 3. Altered formula dependencies while keeping familiar function_ref fails closed
+    dep_mutated = deepcopy(formulas)
+    dep_mutated[0]["dependencies"] = ["monthly_cash_flow", "projection_month"]  # dropped cash_flow_growth_rate
+    ok_dep, issues_dep = inspect_gpu_model_compatibility(GPU_ELIGIBLE_PRODUCT_CODE, dep_mutated, variables)
+    assert ok_dep is False
+    assert any("FORMULA_DEPENDENCIES_MISMATCH:cash_flow" in i for i in issues_dep)
+
+    # 4. Familiar function_ref attached to swapped output variable fails closed
+    swapped_ref = deepcopy(formulas)
+    swapped_ref[1]["function_ref"] = "prospective_reserve:cash_flow"
+    ok_swap, issues_swap = inspect_gpu_model_compatibility(GPU_ELIGIBLE_PRODUCT_CODE, swapped_ref, variables)
+    assert ok_swap is False
+    assert any("UNSUPPORTED_GPU_FUNCTION_REF:discount_factor" in i for i in issues_swap)
+
+    # 5. Missing required formula node fails closed
+    missing_formula = deepcopy(formulas)[:-1]
+    ok_mf, issues_mf = inspect_gpu_model_compatibility(GPU_ELIGIBLE_PRODUCT_CODE, missing_formula, variables)
+    assert ok_mf is False
+    assert any("MISSING_REQUIRED_FORMULA:pv_cash_flow" in i for i in issues_mf)
+
+    # 6. Tampered formula implementation fingerprint fails closed
+    bad_fp = deepcopy(formulas)
+    bad_fp[0]["implementation"] = {"implementation_fingerprint": "0" * 64}
+    ok_fp, issues_fp = inspect_gpu_model_compatibility(GPU_ELIGIBLE_PRODUCT_CODE, bad_fp, variables)
+    assert ok_fp is False
+    assert any("FORMULA_IMPLEMENTATION_FINGERPRINT_MISMATCH:cash_flow" in i for i in issues_fp)
+
+    # 7. Altered valuation references (cash_flow / rate / consistency_sum_of / method) fail closed
+    bad_val_cf = deepcopy(variables)
+    bad_val_cf[-1]["source"]["cash_flow"] = "pv_cash_flow"
+    ok_vcf, issues_vcf = inspect_gpu_model_compatibility(GPU_ELIGIBLE_PRODUCT_CODE, formulas, bad_val_cf)
+    assert ok_vcf is False
+    assert any("UNSUPPORTED_VALUATION_CASH_FLOW_REF" in i for i in issues_vcf)
+
+    bad_val_rate = deepcopy(variables)
+    bad_val_rate[-1]["source"]["rate"] = "market_rate"
+    ok_vr, issues_vr = inspect_gpu_model_compatibility(GPU_ELIGIBLE_PRODUCT_CODE, formulas, bad_val_rate)
+    assert ok_vr is False
+    assert any("UNSUPPORTED_VALUATION_RATE_REF" in i for i in issues_vr)
+
+    bad_val_method = deepcopy(variables)
+    bad_val_method[-1]["source"]["method"] = "custom_stochastic"
+    ok_vm, issues_vm = inspect_gpu_model_compatibility(GPU_ELIGIBLE_PRODUCT_CODE, formulas, bad_val_method)
+    assert ok_vm is False
+    assert any("UNSUPPORTED_VALUATION_METHOD" in i for i in issues_vm)
+
+    # 8. Altered variable source types / column mappings fail closed
+    bad_rate_src = deepcopy(variables)
+    for v in bad_rate_src:
+        if v["name"] == "discount_rate_annual":
+            v["source"] = {"type": "assumption", "table": "yield_curve"}
+    ok_rs, issues_rs = inspect_gpu_model_compatibility(GPU_ELIGIBLE_PRODUCT_CODE, formulas, bad_rate_src)
+    assert ok_rs is False
+    assert any("INVALID_VARIABLE_SOURCE:discount_rate_annual" in i for i in issues_rs)
+
+    bad_cf_col = deepcopy(variables)
+    for v in bad_cf_col:
+        if v["name"] == "monthly_cash_flow":
+            v["source"] = {"type": "input", "column": "premium"}
+    ok_col, issues_col = inspect_gpu_model_compatibility(GPU_ELIGIBLE_PRODUCT_CODE, formulas, bad_cf_col)
+    assert ok_col is False
+    assert any("INVALID_VARIABLE_SOURCE:monthly_cash_flow" in i for i in issues_col)
+
+    # 9. Cross-policy variable fails closed
+    cross_vars = deepcopy(variables) + [
         {"name": "pool_agg", "scope": "cross_policy", "source": {"type": "formula"}}
     ]
     ok4, issues4 = inspect_gpu_model_compatibility(GPU_ELIGIBLE_PRODUCT_CODE, formulas, cross_vars)
     assert ok4 is False
     assert any("CROSS_POLICY_VARIABLE" in i for i in issues4)
 
-    bad_val_vars = variables[:-1] + [
-        {"name": "reserve", "source": {"type": "valuation", "method": "custom_stochastic"}}
-    ]
-    ok5, issues5 = inspect_gpu_model_compatibility(GPU_ELIGIBLE_PRODUCT_CODE, formulas, bad_val_vars)
-    assert ok5 is False
-    assert any("UNSUPPORTED_VALUATION_METHOD" in i for i in issues5)
+    # 10. Unsupported output variable fails closed
+    ok_out, issues_out = inspect_gpu_model_compatibility(
+        GPU_ELIGIBLE_PRODUCT_CODE,
+        formulas,
+        variables,
+        output_variables=["cash_flow", "account_value_close"],
+    )
+    assert ok_out is False
+    assert any("UNSUPPORTED_GPU_OUTPUT_VARIABLE:account_value_close" in i for i in issues_out)
+
+    # 11. Unsupported scenario override target fails closed
+    ok_ov, issues_ov = inspect_gpu_model_compatibility(
+        GPU_ELIGIBLE_PRODUCT_CODE,
+        formulas,
+        variables,
+        scenario_overrides=[
+            {"target_variable": "monthly_cash_flow", "operation": "multiply", "value": 1.1}
+        ],
+    )
+    assert ok_ov is False
+    assert any("UNSUPPORTED_GPU_SCENARIO_OVERRIDE:monthly_cash_flow" in i for i in issues_ov)
+
+
+def test_gpu_reference_model_is_not_counted_as_launch_actuarial_product():
+    from app.products.prospective_reserve_discounting import config as pr_cfg
+    from app.products.registry import (
+        REGISTERED_INTERNAL_REFERENCES,
+        REGISTERED_PRODUCTS,
+        register_all_products,
+    )
+
+    products = register_all_products()
+    assert products == ["SPIA", "MYGA", "FIA", "RILA"]
+    assert GPU_ELIGIBLE_PRODUCT_CODE not in REGISTERED_PRODUCTS
+    assert GPU_ELIGIBLE_PRODUCT_CODE in REGISTERED_INTERNAL_REFERENCES
+    assert pr_cfg.IS_LAUNCH_PRODUCT is False
+    assert pr_cfg.MODEL_CLASSIFICATION == "internal_gpu_numerical_reference"
+
+
+def test_gpu_benchmark_require_physical_gpu_fails_closed_without_hardware(monkeypatch, capsys):
+    from scripts import benchmark_m6_03_gpu
+
+    monkeypatch.setattr(
+        benchmark_m6_03_gpu,
+        "probe_cuda_hardware",
+        lambda: {
+            "numba_installed": True,
+            "numba_cuda_installed": True,
+            "cuda_simulator_env": False,
+            "cuda_gpu_detected": False,
+            "cuda_device_count": 0,
+            "cuda_device_names": [],
+            "cuda_devices": [],
+            "cuda_runtime_version": None,
+            "cuda_driver_version": None,
+            "probe_error": None,
+        },
+    )
+    monkeypatch.delenv("NUMBA_ENABLE_CUDASIM", raising=False)
+
+    # Mandatory physical GPU acceptance gate MUST fail non-zero when hardware is absent
+    rc_missing = benchmark_m6_03_gpu.main(["--require-physical-gpu"])
+    assert rc_missing == 2
+    payload_missing = json.loads(capsys.readouterr().out)
+    assert payload_missing["acceptance_status"] == "FAIL"
+    assert payload_missing["physical_gpu_acceptance"] == "FAIL"
+    assert payload_missing["failure_reason"] == "PHYSICAL_GPU_UNAVAILABLE"
+
+    # Mandatory physical GPU acceptance gate MUST fail non-zero under simulator env even if --allow-simulator passed
+    monkeypatch.setenv("NUMBA_ENABLE_CUDASIM", "1")
+    rc_sim = benchmark_m6_03_gpu.main(["--require-physical-gpu", "--allow-simulator"])
+    assert rc_sim == 2
+    payload_sim = json.loads(capsys.readouterr().out)
+    assert payload_sim["acceptance_status"] == "FAIL"
+    assert payload_sim["failure_reason"] == "SIMULATOR_FORBIDDEN_FOR_PHYSICAL_ACCEPTANCE"
+
+    # Optional dev check exits 0 with NOT_RUN (never PASS from a skip)
+    monkeypatch.delenv("NUMBA_ENABLE_CUDASIM", raising=False)
+    rc_dev = benchmark_m6_03_gpu.main([])
+    assert rc_dev == 0
+    payload_dev = json.loads(capsys.readouterr().out)
+    assert payload_dev["acceptance_status"] == "NOT_RUN"
+    assert payload_dev["physical_gpu_acceptance"] == "NOT_RUN"
 
 
 def test_planner_routes_eligible_gpu_model_and_rejects_spia_with_mock_gpu():
@@ -267,22 +412,24 @@ def test_gpu_runtime_validation_blocks_simulator_low_cc_invalid_device_and_vram(
         ],
     }
     b_vram = GPUExecutionBackend(hardware_probe=tiny_vram_probe)
+    from app.products.prospective_reserve_discounting import config as pr_cfg
+
     run_data = RunData(
         variables={
-            "cash_flow": VariableSpec("cash_flow", "output", "number", source={"type": "formula"}),
-            "discount_factor": VariableSpec("discount_factor", "output", "number", source={"type": "formula"}),
-            "pv_cash_flow": VariableSpec("pv_cash_flow", "output", "number", source={"type": "formula"}),
-            "reserve": VariableSpec(
-                "reserve",
-                "output",
-                "number",
-                source={"type": "valuation", "method": illustrative_reserve.METHOD},
-            ),
+            v["name"]: VariableSpec(
+                v["name"],
+                v["kind"],
+                v["data_type"],
+                source=dict(v["source"]),
+                default_value=v.get("default_value"),
+                required=bool(v.get("required", True)),
+                allow_scenario_override=bool(v.get("allow_scenario_override", False)),
+            )
+            for v in pr_cfg.VARIABLES
         },
         formulas=[
-            FormulaSpec("f1", "Cash Flow", "cash_flow", "prospective_reserve:cash_flow", ()),
-            FormulaSpec("f2", "Discount Factor", "discount_factor", "prospective_reserve:discount_factor", ()),
-            FormulaSpec("f3", "PV Cash Flow", "pv_cash_flow", "prospective_reserve:pv_cash_flow", ("cash_flow", "discount_factor")),
+            FormulaSpec(f"f{i}", f["name"], f["output_variable"], f["function_ref"], tuple(f["dependencies"]))
+            for i, f in enumerate(pr_cfg.FORMULAS, start=1)
         ],
         tables={},
         policies=[PolicyRecord("P1", {"policy_id": "P1", "monthly_cash_flow": 100.0})],

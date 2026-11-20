@@ -21,7 +21,9 @@ from app.products.inforce_registry import (
 )
 
 PRODUCT_CODE = "PROSPECTIVE_RESERVE_DISCOUNTING"
-PRODUCT_NAME = "Prospective Reserve Discounting"
+PRODUCT_NAME = "Prospective Reserve Discounting (Internal GPU Reference)"
+MODEL_CLASSIFICATION = "internal_gpu_numerical_reference"
+IS_LAUNCH_PRODUCT = False
 FUNCTION_PREFIX = "prospective_reserve"
 IMPLEMENTATION_VERSION = "prospective-reserve-v1"
 DEFAULT_DISCOUNT_RATE = 0.045
@@ -238,6 +240,8 @@ MODEL = {
         "illustrative": True,
         "configuration": {
             "reference_only": True,
+            "classification": MODEL_CLASSIFICATION,
+            "launch_1_0_product": IS_LAUNCH_PRODUCT,
             "default_outputs": ["cash_flow", "discount_factor", "pv_cash_flow", "reserve"],
         },
     },

@@ -15,11 +15,15 @@ from app.products.inforce_registry import (
     register_inforce_product,
 )
 
+# Authoritative implemented Launch 1.0 actuarial product families (7-product launch scope:
+# SPIA, MYGA, FIA, RILA, IDI, VA, PRT). Internal GPU/benchmark reference models are tracked
+# separately in REGISTERED_INTERNAL_REFERENCES so they are never counted as an eighth product.
 REGISTERED_PRODUCTS: list[str] = []
+REGISTERED_INTERNAL_REFERENCES: list[str] = []
 
 
 def register_all_products() -> list[str]:
-    """Register all product formula functions; return the product codes registered."""
+    """Register all actuarial product and internal reference formula functions; return Launch product codes."""
     from app.products.spia_lite import config as spia
     from app.products.spia_reference import config as spia_reference
     from app.products.myga_lite import config as myga
@@ -37,10 +41,17 @@ def register_all_products() -> list[str]:
         REGISTERED_PRODUCTS.append(spia.PRODUCT_CODE)
     if myga.PRODUCT_CODE not in REGISTERED_PRODUCTS:
         REGISTERED_PRODUCTS.append(myga.PRODUCT_CODE)
-    for product in (fia, rila, reserve_gpu):
+    for product in (fia, rila):
         if product.PRODUCT_CODE not in REGISTERED_PRODUCTS:
             REGISTERED_PRODUCTS.append(product.PRODUCT_CODE)
+    if reserve_gpu.PRODUCT_CODE not in REGISTERED_INTERNAL_REFERENCES:
+        REGISTERED_INTERNAL_REFERENCES.append(reserve_gpu.PRODUCT_CODE)
     return list(REGISTERED_PRODUCTS)
+
+
+def registered_internal_references() -> list[str]:
+    """Return registered illustrative internal numerical reference codes (non-launch products)."""
+    return list(REGISTERED_INTERNAL_REFERENCES)
 
 
 def registered_function_count() -> int:

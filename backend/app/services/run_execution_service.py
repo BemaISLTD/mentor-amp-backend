@@ -411,6 +411,8 @@ def execute_run(db: Session, run_id: str, worker_id: str | None = None) -> str |
                 scenario_count=1,
                 formulas=configuration.get("formulas") or data.formulas,
                 variables=data.variables,
+                output_variables=data.output_variables,
+                scenario_overrides=data.scenario.overrides,
             ),
         )
     except ExecutionPlanningError as error:

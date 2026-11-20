@@ -77,6 +77,8 @@ def _plan_context_from_configuration(
         scenario_count=max(scenario_count, 1),
         formulas=formulas if formulas else None,
         variables=cfg.get("variables"),
+        output_variables=(cfg.get("outputs") or {}).get("output_variables"),
+        scenario_overrides=(cfg.get("scenario") or {}).get("overrides"),
     )
 
 

@@ -32,11 +32,46 @@ from app.core.valuation import illustrative_reserve
 
 GPU_ELIGIBLE_PRODUCT_CODE = "PROSPECTIVE_RESERVE_DISCOUNTING"
 GPU_KERNEL_NAME = "prospective_reserve_discounting_float64_v1"
-SUPPORTED_GPU_FUNCTION_REFS = frozenset({
-    "prospective_reserve:cash_flow",
-    "prospective_reserve:discount_factor",
-    "prospective_reserve:pv_cash_flow",
+REQUIRED_GPU_FORMULAS: dict[str, tuple[str, frozenset[str]]] = {
+    "cash_flow": (
+        "prospective_reserve:cash_flow",
+        frozenset({"monthly_cash_flow", "cash_flow_growth_rate", "projection_month"}),
+    ),
+    "discount_factor": (
+        "prospective_reserve:discount_factor",
+        frozenset({"discount_rate_annual", "projection_month"}),
+    ),
+    "pv_cash_flow": (
+        "prospective_reserve:pv_cash_flow",
+        frozenset({"cash_flow", "discount_factor"}),
+    ),
+}
+SUPPORTED_GPU_FUNCTION_REFS = frozenset(ref for ref, _deps in REQUIRED_GPU_FORMULAS.values())
+SUPPORTED_GPU_OUTPUT_VARIABLES = frozenset({
+    "cash_flow",
+    "discount_factor",
+    "pv_cash_flow",
+    "reserve",
 })
+ALLOWED_GPU_OVERRIDE_VARIABLES = frozenset({"discount_rate_annual"})
+ALLOWED_GPU_OVERRIDE_OPERATIONS = frozenset({
+    "set",
+    "add",
+    "subtract",
+    "multiply",
+    "percent_change",
+})
+
+
+def _approved_gpu_formula_fingerprints() -> dict[str, str]:
+    """Return immutable code fingerprints for the exact reference functions implemented by the GPU kernel."""
+    from app.core.formula_engine.formulas import implementation_fingerprint
+    from app.products.prospective_reserve_discounting import config as pr_cfg
+
+    return {
+        f"{pr_cfg.FUNCTION_PREFIX}:{suffix}": implementation_fingerprint(fn)
+        for suffix, fn in pr_cfg.FORMULA_DEFS
+    }
 
 
 class GPUSessionStartupError(RuntimeError):
@@ -177,52 +212,234 @@ def inspect_gpu_model_compatibility(
     product_code: str | None,
     formulas: Sequence[Any] | None = None,
     variables: Sequence[Any] | Mapping[str, Any] | None = None,
+    output_variables: Sequence[str] | None = None,
+    scenario_overrides: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[bool, list[str]]:
-    """Verify a model uses ONLY supported dense float64 prospective-reserve/PV operations."""
+    """Fail-closed verification proving a model's exact calculation graph matches the GPU kernel."""
     issues: list[str] = []
     if product_code != GPU_ELIGIBLE_PRODUCT_CODE:
         issues.append(f"UNSUPPORTED_GPU_PRODUCT:{product_code}")
         return False, issues
 
+    approved_fps = _approved_gpu_formula_fingerprints()
+    from app.core.formula_engine.formulas import get_registration
+
     if formulas is not None:
         formula_list = list(formulas)
         if not formula_list:
             issues.append("NO_FORMULAS")
+        seen_outputs: set[str] = set()
         for item in formula_list:
-            func_ref = (
-                str(item.get("function_ref") or "")
-                if isinstance(item, Mapping)
-                else str(getattr(item, "function_ref", "") or "")
-            )
-            if func_ref not in SUPPORTED_GPU_FUNCTION_REFS:
-                issues.append(f"UNSUPPORTED_GPU_FUNCTION_REF:{func_ref}")
+            if isinstance(item, Mapping):
+                out_var = str(item.get("output_variable") or "")
+                func_ref = str(item.get("function_ref") or "")
+                raw_deps = item.get("dependencies")
+                impl = item.get("implementation")
+                pkg_fp = (
+                    impl.get("implementation_fingerprint")
+                    if isinstance(impl, Mapping)
+                    else None
+                )
+            else:
+                out_var = str(getattr(item, "output_variable", "") or "")
+                func_ref = str(getattr(item, "function_ref", "") or "")
+                raw_deps = getattr(item, "dependencies", None)
+                pkg_fp = None
 
-    var_items: Iterable[Any]
-    if isinstance(variables, Mapping):
-        var_items = variables.values()
-    elif variables is not None:
-        var_items = variables
-    else:
-        var_items = ()
+            if out_var in seen_outputs:
+                issues.append(f"DUPLICATE_FORMULA_OUTPUT:{out_var}")
+            seen_outputs.add(out_var)
 
-    has_valuation = False
-    for var in var_items:
-        source = var.get("source") if isinstance(var, Mapping) else getattr(var, "source", None)
-        var_scope = var.get("scope") if isinstance(var, Mapping) else getattr(var, "kind", None)
-        var_name = var.get("name") if isinstance(var, Mapping) else getattr(var, "name", "unknown")
-        if var_scope in {"portfolio", "cross_policy"}:
-            issues.append(f"CROSS_POLICY_VARIABLE:{var_name}")
-        if not isinstance(source, Mapping):
-            continue
-        stype = source.get("type")
-        if source.get("scope") in {"portfolio", "cross_policy"}:
-            issues.append(f"CROSS_POLICY_VARIABLE:{var_name}")
-        if stype == "valuation":
-            has_valuation = True
-            if source.get("method") != illustrative_reserve.METHOD:
-                issues.append(f"UNSUPPORTED_VALUATION_METHOD:{source.get('method')}")
-    if variables is not None and not has_valuation:
-        issues.append("NO_VALUATION_VARIABLE")
+            if out_var not in REQUIRED_GPU_FORMULAS:
+                issues.append(f"UNSUPPORTED_GPU_FORMULA_NODE:{out_var}")
+                continue
+
+            expected_ref, expected_deps = REQUIRED_GPU_FORMULAS[out_var]
+            if func_ref != expected_ref:
+                issues.append(f"UNSUPPORTED_GPU_FUNCTION_REF:{out_var}:{func_ref}")
+                continue
+
+            if raw_deps is None:
+                issues.append(f"MISSING_FORMULA_DEPENDENCIES:{out_var}")
+            else:
+                actual_deps = {str(d) for d in raw_deps}
+                if actual_deps != expected_deps:
+                    issues.append(
+                        f"FORMULA_DEPENDENCIES_MISMATCH:{out_var}:"
+                        f"expected={sorted(expected_deps)}:actual={sorted(actual_deps)}"
+                    )
+
+            expected_fp = approved_fps[expected_ref]
+            if pkg_fp is not None and str(pkg_fp) != expected_fp:
+                issues.append(f"FORMULA_IMPLEMENTATION_FINGERPRINT_MISMATCH:{out_var}")
+            reg = get_registration(expected_ref)
+            if reg is not None and reg.implementation_fingerprint != expected_fp:
+                issues.append(f"REGISTERED_FUNCTION_FINGERPRINT_MISMATCH:{expected_ref}")
+
+        for req_out in sorted(REQUIRED_GPU_FORMULAS):
+            if req_out not in seen_outputs:
+                issues.append(f"MISSING_REQUIRED_FORMULA:{req_out}")
+
+    if variables is not None:
+        var_items: Iterable[Any] = (
+            variables.values() if isinstance(variables, Mapping) else variables
+        )
+        vars_by_name: dict[str, dict[str, Any]] = {}
+        valuation_vars: list[str] = []
+
+        for var in var_items:
+            if isinstance(var, Mapping):
+                var_name = str(var.get("name") or "")
+                var_scope = var.get("scope") or var.get("kind")
+                source = var.get("source")
+                default_val = var.get("default_value")
+                allow_ov = bool(var.get("allow_scenario_override", False))
+            else:
+                var_name = str(getattr(var, "name", "") or "")
+                var_scope = getattr(var, "kind", None)
+                source = getattr(var, "source", None)
+                default_val = getattr(var, "default_value", None)
+                allow_ov = bool(getattr(var, "allow_scenario_override", False))
+
+            if var_scope in {"portfolio", "cross_policy"}:
+                issues.append(f"CROSS_POLICY_VARIABLE:{var_name}")
+            if not isinstance(source, Mapping):
+                issues.append(f"INVALID_VARIABLE_SOURCE:{var_name}")
+                continue
+            if source.get("scope") in {"portfolio", "cross_policy"}:
+                issues.append(f"CROSS_POLICY_VARIABLE:{var_name}")
+
+            stype = str(source.get("type") or "")
+            vars_by_name[var_name] = {
+                "source": source,
+                "source_type": stype,
+                "default_value": default_val,
+                "allow_scenario_override": allow_ov,
+            }
+            if stype == "valuation":
+                valuation_vars.append(var_name)
+
+        required_vars = {
+            "projection_month",
+            "monthly_cash_flow",
+            "cash_flow_growth_rate",
+            "discount_rate_annual",
+            "cash_flow",
+            "discount_factor",
+            "pv_cash_flow",
+            "reserve",
+        }
+        for req_var in sorted(required_vars):
+            if req_var not in vars_by_name:
+                issues.append(f"MISSING_REQUIRED_VARIABLE:{req_var}")
+
+        # Reject extra computed/valuation/prior_output variables not implemented by the kernel.
+        for extra_name, meta in sorted(vars_by_name.items()):
+            if extra_name not in required_vars and meta["source_type"] in {
+                "formula",
+                "valuation",
+                "prior_output",
+            }:
+                issues.append(f"UNSUPPORTED_EXTRA_VARIABLE:{extra_name}:{meta['source_type']}")
+
+        # Validate exact variable sources, columns, defaults, and override permissions.
+        if "projection_month" in vars_by_name:
+            pm = vars_by_name["projection_month"]
+            if pm["source_type"] != "context" or (pm["source"].get("field") or "projection_month") != "projection_month":
+                issues.append("INVALID_VARIABLE_SOURCE:projection_month")
+            if pm["allow_scenario_override"]:
+                issues.append("UNSUPPORTED_OVERRIDE_CAPABILITY:projection_month")
+
+        if "monthly_cash_flow" in vars_by_name:
+            mcf = vars_by_name["monthly_cash_flow"]
+            if mcf["source_type"] != "input" or (mcf["source"].get("column") or "monthly_cash_flow") != "monthly_cash_flow":
+                issues.append("INVALID_VARIABLE_SOURCE:monthly_cash_flow")
+            if mcf["allow_scenario_override"]:
+                issues.append("UNSUPPORTED_OVERRIDE_CAPABILITY:monthly_cash_flow")
+
+        if "cash_flow_growth_rate" in vars_by_name:
+            cfg = vars_by_name["cash_flow_growth_rate"]
+            if cfg["source_type"] != "input" or (cfg["source"].get("column") or "cash_flow_growth_rate") != "cash_flow_growth_rate":
+                issues.append("INVALID_VARIABLE_SOURCE:cash_flow_growth_rate")
+            if cfg["allow_scenario_override"]:
+                issues.append("UNSUPPORTED_OVERRIDE_CAPABILITY:cash_flow_growth_rate")
+            if cfg["default_value"] is not None:
+                try:
+                    g_def = float(cfg["default_value"])
+                    if not math.isfinite(g_def) or g_def <= -1.0:
+                        issues.append("INVALID_DEFAULT_VALUE:cash_flow_growth_rate")
+                except (TypeError, ValueError):
+                    issues.append("INVALID_DEFAULT_VALUE:cash_flow_growth_rate")
+
+        if "discount_rate_annual" in vars_by_name:
+            dr = vars_by_name["discount_rate_annual"]
+            if dr["source_type"] != "manual":
+                issues.append(f"INVALID_VARIABLE_SOURCE:discount_rate_annual:{dr['source_type']}")
+            raw_rate = dr["source"].get("value", dr["default_value"])
+            if raw_rate is None:
+                issues.append("MISSING_DISCOUNT_RATE_DEFAULT")
+            else:
+                try:
+                    r_val = float(raw_rate)
+                    if not math.isfinite(r_val) or r_val <= -1.0:
+                        issues.append("INVALID_DEFAULT_VALUE:discount_rate_annual")
+                except (TypeError, ValueError):
+                    issues.append("INVALID_DEFAULT_VALUE:discount_rate_annual")
+
+        for fvar in ("cash_flow", "discount_factor", "pv_cash_flow"):
+            if fvar in vars_by_name:
+                fv = vars_by_name[fvar]
+                if fv["source_type"] != "formula":
+                    issues.append(f"INVALID_VARIABLE_SOURCE:{fvar}:{fv['source_type']}")
+                if fv["allow_scenario_override"]:
+                    issues.append(f"UNSUPPORTED_OVERRIDE_CAPABILITY:{fvar}")
+
+        if not valuation_vars:
+            issues.append("NO_VALUATION_VARIABLE")
+        elif valuation_vars != ["reserve"]:
+            issues.append(f"UNSUPPORTED_VALUATION_VARIABLES:{sorted(valuation_vars)}")
+
+        if "reserve" in vars_by_name:
+            rv = vars_by_name["reserve"]
+            rsrc = rv["source"]
+            if rv["source_type"] != "valuation":
+                issues.append(f"INVALID_VARIABLE_SOURCE:reserve:{rv['source_type']}")
+            else:
+                if rsrc.get("method") != illustrative_reserve.METHOD:
+                    issues.append(f"UNSUPPORTED_VALUATION_METHOD:{rsrc.get('method')}")
+                if rsrc.get("cash_flow") != "cash_flow":
+                    issues.append(f"UNSUPPORTED_VALUATION_CASH_FLOW_REF:{rsrc.get('cash_flow')}")
+                if rsrc.get("rate") != "discount_rate_annual":
+                    issues.append(f"UNSUPPORTED_VALUATION_RATE_REF:{rsrc.get('rate')}")
+                if rsrc.get("consistency_sum_of") not in (None, "pv_cash_flow"):
+                    issues.append(
+                        f"UNSUPPORTED_VALUATION_CONSISTENCY_REF:{rsrc.get('consistency_sum_of')}"
+                    )
+            if rv["allow_scenario_override"]:
+                issues.append("UNSUPPORTED_OVERRIDE_CAPABILITY:reserve")
+
+    if output_variables is not None:
+        for out_name in output_variables:
+            if out_name not in SUPPORTED_GPU_OUTPUT_VARIABLES:
+                issues.append(f"UNSUPPORTED_GPU_OUTPUT_VARIABLE:{out_name}")
+
+    if scenario_overrides is not None:
+        for ov in scenario_overrides:
+            if not isinstance(ov, Mapping):
+                issues.append("INVALID_GPU_SCENARIO_OVERRIDE")
+                continue
+            target = str(ov.get("target_variable") or "")
+            op = str(ov.get("operation", "set"))
+            if target not in ALLOWED_GPU_OVERRIDE_VARIABLES:
+                issues.append(f"UNSUPPORTED_GPU_SCENARIO_OVERRIDE:{target}")
+            if op not in ALLOWED_GPU_OVERRIDE_OPERATIONS:
+                issues.append(f"UNSUPPORTED_GPU_OVERRIDE_OPERATION:{op}")
+            try:
+                val = float(ov.get("value"))
+                if not math.isfinite(val):
+                    issues.append(f"INVALID_GPU_OVERRIDE_VALUE:{target}")
+            except (TypeError, ValueError):
+                issues.append(f"INVALID_GPU_OVERRIDE_VALUE:{target}")
 
     return len(issues) == 0, issues
 
@@ -250,12 +467,15 @@ def _resolve_monthly_series(
     overrides: Sequence[Mapping[str, Any]],
     *,
     allow_override: bool,
-) -> list[float]:
+    scenario_name: str = "",
+) -> tuple[list[float], list[dict[str, Any] | None]]:
     series = [float(base_value)] * horizon
+    override_details: list[dict[str, Any] | None] = [None] * horizon
     if not allow_override:
-        return series
+        return series, override_details
     for month in range(1, horizon + 1):
         val = float(base_value)
+        last_ov: dict[str, Any] | None = None
         for ov in overrides:
             if ov.get("target_variable") != var_name:
                 continue
@@ -265,9 +485,19 @@ def _resolve_monthly_series(
                 continue
             if end not in (None, "") and month > int(end):
                 continue
-            val = _apply_override(val, ov)
+            base_before = val
+            op = str(ov.get("operation", "set"))
+            operand = float(ov.get("value"))
+            val = _apply_override(base_before, ov)
+            last_ov = {
+                "scenario": scenario_name,
+                "operation": op,
+                "value": operand,
+                "base_value": base_before,
+            }
         series[month - 1] = val
-    return series
+        override_details[month - 1] = last_ov
+    return series, override_details
 
 
 cuda: Any = None
@@ -456,7 +686,13 @@ class GPUExecutionBackend:
             )
             else first_func
         )
-        ok, issues = inspect_gpu_model_compatibility(product_guess, data.formulas, data.variables)
+        ok, issues = inspect_gpu_model_compatibility(
+            product_guess,
+            data.formulas,
+            data.variables,
+            output_variables=data.output_variables,
+            scenario_overrides=data.scenario.overrides,
+        )
         if not ok:
             raise GPUSessionStartupError(
                 "MODEL_NOT_GPU_SUPPORTED",
@@ -489,15 +725,20 @@ class GPUExecutionBackend:
         effective_batch_size = max(1, min(requested_batch, max_policies_vram))
 
         # Resolve shared scenario-level discount rate vector ONCE on host cleanly.
+        # Matches engine.py: validated scenario overrides are applied unconditionally during execution.
         disc_var = data.variables.get("discount_rate_annual")
         if disc_var is not None:
             raw_disc = disc_var.source.get("value", disc_var.default_value)
             base_disc = float(0.045 if raw_disc is None else raw_disc)
         else:
             base_disc = 0.045
-        disc_allow_ov = bool(disc_var.allow_scenario_override) if disc_var else True
-        scenario_disc_series = _resolve_monthly_series(
-            base_disc, "discount_rate_annual", horizon, data.scenario.overrides, allow_override=disc_allow_ov
+        scenario_disc_series, scenario_disc_override_details = _resolve_monthly_series(
+            base_disc,
+            "discount_rate_annual",
+            horizon,
+            data.scenario.overrides,
+            allow_override=True,
+            scenario_name=str(data.scenario.name),
         )
         if any((not math.isfinite(r)) or (r <= -1.0) for r in scenario_disc_series):
             # Per-policy isolated error matches CPU semantics cleanly on invalid scenario rate.
@@ -533,11 +774,13 @@ class GPUExecutionBackend:
             "hardware_verified": hardware_verified,
             "execution_mode": "cuda_hardware" if hardware_verified else "cuda_simulator",
             "simulator_non_hardware": not hardware_verified,
+            "timing_source": "cuda_hardware_events" if hardware_verified else "simulator_wall_clock",
             "device_id": int(dev_info["device_id"]),
             "device_name": str(dev_info["name"]),
             "compute_capability": list(dev_info.get("compute_capability") or (0, 0)),
             "vram_total_bytes": dev_info.get("total_memory_bytes"),
             "vram_free_before_bytes": free_vram,
+            "vram_free_after_bytes": free_vram,
             "vram_budget_bytes": int(vram_cap),
             "effective_batch_size": int(effective_batch_size),
             "cuda_driver_version": hw_probe.get("cuda_driver_version"),
@@ -545,9 +788,14 @@ class GPUExecutionBackend:
             "kernel_init_seconds": round(kernel_init_seconds, 6),
             "batches_completed": 0,
             "h2d_transfer_seconds": 0.0,
+            "kernel_launch_seconds": 0.0,
+            "kernel_execution_seconds": 0.0,
+            "kernel_sync_wait_seconds": 0.0,
+            "d2h_transfer_seconds": 0.0,
+            "end_to_end_batch_seconds": 0.0,
+            # Legacy compatibility aliases (never summed together; see non-overlapping fields above)
             "kernel_seconds": 0.0,
             "sync_seconds": 0.0,
-            "d2h_transfer_seconds": 0.0,
             "total_gpu_seconds": 0.0,
             "max_consistency_rel_err": 0.0,
             "peak_estimated_device_bytes": 0,
@@ -627,10 +875,11 @@ class GPUExecutionBackend:
                         "projection_month": err.month or 1,
                         "variable_name": err.variable or "",
                         "formula_id": None,
-                        "input_values_json": "{}",
-                        "output_value_json": '{"value": null}',
+                        "input_values": {},
+                        "output_value": {"value": None},
                         "source_type": "error",
                         "source_table": None,
+                        "lookup_keys": None,
                         "error_message": f"{err.error_type}: {err.message}",
                     })
                 batch_outcomes[bad_idx] = PolicyResult(
@@ -669,23 +918,49 @@ class GPUExecutionBackend:
                     d_res_out = cuda.device_array((n_valid, horizon + 1), dtype=np.float64)
                     h2d_s = perf_counter() - t_h2d0
 
-                    t_kern0 = perf_counter()
-                    kernel[blocks, threads_per_block](
-                        d_base_cf,
-                        d_growth,
-                        d_disc,
-                        d_val_rate,
-                        horizon,
-                        d_cf_out,
-                        d_df_out,
-                        d_pv_out,
-                        d_res_out,
-                    )
-                    t_sync0 = perf_counter()
                     if hardware_verified:
-                        cuda.synchronize()
-                    sync_s = perf_counter() - t_sync0
-                    kernel_s = perf_counter() - t_kern0
+                        ev_start = cuda.event(timing=True)
+                        ev_end = cuda.event(timing=True)
+                        t_launch0 = perf_counter()
+                        ev_start.record()
+                        kernel[blocks, threads_per_block](
+                            d_base_cf,
+                            d_growth,
+                            d_disc,
+                            d_val_rate,
+                            horizon,
+                            d_cf_out,
+                            d_df_out,
+                            d_pv_out,
+                            d_res_out,
+                        )
+                        ev_end.record()
+                        t_launch1 = perf_counter()
+                        ev_end.synchronize()
+                        t_sync1 = perf_counter()
+                        launch_s = t_launch1 - t_launch0
+                        sync_wait_s = t_sync1 - t_launch1
+                        # Hardware CUDA events isolate true device-side kernel runtime without
+                        # double-counting CPU launch or host synchronization overhead.
+                        kernel_exec_s = float(cuda.event_elapsed_time(ev_start, ev_end)) / 1000.0
+                    else:
+                        # Simulator runs synchronously in Python threads (no async GPU stream).
+                        t_sim0 = perf_counter()
+                        kernel[blocks, threads_per_block](
+                            d_base_cf,
+                            d_growth,
+                            d_disc,
+                            d_val_rate,
+                            horizon,
+                            d_cf_out,
+                            d_df_out,
+                            d_pv_out,
+                            d_res_out,
+                        )
+                        t_sim1 = perf_counter()
+                        launch_s = 0.0
+                        sync_wait_s = 0.0
+                        kernel_exec_s = t_sim1 - t_sim0
 
                     t_d2h0 = perf_counter()
                     h_cf = d_cf_out.copy_to_host()
@@ -705,13 +980,30 @@ class GPUExecutionBackend:
                         if buf is not None:
                             del buf
 
+                if hardware_verified:
+                    try:
+                        free_after, _total_after = cuda.current_context().get_memory_info()
+                        telemetry["vram_free_after_bytes"] = int(free_after)
+                    except Exception:  # noqa: BLE001
+                        pass
+
                 total_batch_s = perf_counter() - t_batch0
                 telemetry["batches_completed"] += 1
                 telemetry["h2d_transfer_seconds"] = round(telemetry["h2d_transfer_seconds"] + h2d_s, 6)
-                telemetry["kernel_seconds"] = round(telemetry["kernel_seconds"] + kernel_s, 6)
-                telemetry["sync_seconds"] = round(telemetry["sync_seconds"] + sync_s, 6)
+                telemetry["kernel_launch_seconds"] = round(telemetry["kernel_launch_seconds"] + launch_s, 6)
+                telemetry["kernel_execution_seconds"] = round(
+                    telemetry["kernel_execution_seconds"] + kernel_exec_s, 6
+                )
+                telemetry["kernel_sync_wait_seconds"] = round(
+                    telemetry["kernel_sync_wait_seconds"] + sync_wait_s, 6
+                )
                 telemetry["d2h_transfer_seconds"] = round(telemetry["d2h_transfer_seconds"] + d2h_s, 6)
-                telemetry["total_gpu_seconds"] = round(telemetry["total_gpu_seconds"] + total_batch_s, 6)
+                telemetry["end_to_end_batch_seconds"] = round(
+                    telemetry["end_to_end_batch_seconds"] + total_batch_s, 6
+                )
+                telemetry["kernel_seconds"] = telemetry["kernel_execution_seconds"]
+                telemetry["sync_seconds"] = telemetry["kernel_sync_wait_seconds"]
+                telemetry["total_gpu_seconds"] = telemetry["end_to_end_batch_seconds"]
                 telemetry["threads_per_block"] = threads_per_block
                 telemetry["blocks_per_grid"] = blocks
 
@@ -787,6 +1079,14 @@ class GPUExecutionBackend:
                         for m_idx in range(horizon):
                             m = m_idx + 1
                             disc_m = float(scenario_disc_series[m_idx])
+                            disc_inputs: dict[str, Any] = {
+                                "note": "Variable default",
+                                "was_defaulted": False,
+                            }
+                            if scenario_disc_override_details[m_idx] is not None:
+                                disc_inputs["scenario_override"] = dict(
+                                    scenario_disc_override_details[m_idx]
+                                )
                             trace_rows.extend([
                                 {
                                     "policy_id": pol.policy_id,
@@ -837,7 +1137,7 @@ class GPUExecutionBackend:
                                     "projection_month": m,
                                     "variable_name": "discount_rate_annual",
                                     "formula_id": None,
-                                    "input_values": {"note": "Variable default", "was_defaulted": False},
+                                    "input_values": disc_inputs,
                                     "output_value": {"value": disc_m},
                                     "source_type": "manual",
                                     "source_table": "manual",
