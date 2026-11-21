@@ -650,7 +650,7 @@ class SparkExecutionBackend:
                     .config("spark.driver.maxResultSize", str(runtime_cfg["driver_max_result_size"]))
                     .config("spark.executor.memory", settings.spark_executor_memory)
                     .config("spark.network.timeout", f"{settings.spark_network_timeout_seconds}s")
-                    .config("spark.python.authenticate.socketTimeout", "60s")
+                    .config("spark.python.authenticate.socketTimeout", "120s")
                     .config("spark.executorEnv.PYTHONPATH", worker_pythonpath)
                     .config("spark.pyspark.python", worker_python)
                     .config("spark.pyspark.driver.python", sys.executable)
