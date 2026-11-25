@@ -1,8 +1,13 @@
 # M6-04: Numerical Parity, Performance Benchmarking & Recovery Conformance
 
-> **Branch:** `feat/m6-scale-execution-integration` (extends M6-03 commit `95caefe989caa7a52cfc12fd524a37fe6a87fff9`)  
-> **Physical GPU Gate:** **PHYSICAL_GPU_ACCEPTANCE = NOT_RUN (OPEN)** — awaiting Product Owner (Eko) approval for physical NVIDIA GPU infrastructure/budget. Simulator comparisons below are explicitly labeled **Non-Hardware**.  
-> **CAS §17 Tolerance Governance:** Numerical parity uses CPU as the engineering reference with provisional engineering tolerance `abs_tol = 1e-9` / `rel_tol = 1e-9`. Formal CAS §17 benchmark dimensions and tolerances remain **OPEN** pending Product Owner sign-off. Independent actuarial golden-case approvals remain separate from cross-backend parity.
+> **Branch:** `feat/m6-scale-execution-integration`  
+> **Reviewed M6-04 Commit:** `ce1b8610d8102ef15fba32a7c206b0bb7a4bcb6b` (extending M6-03 commit `95caefe989caa7a52cfc12fd524a37fe6a87fff9`)  
+> **Acceptance Record:**
+> - **M6-04 execution conformance:** **ACCEPTED FOR PROGRESSION** (to M6-05)
+> - **Physical GPU hardware acceptance:** **OPEN / NOT RUN** (awaiting Product Owner Eko approval for physical NVIDIA GPU infrastructure/budget; simulator results below are **Non-Hardware** only)
+> - **Formal CAS §17 performance and numerical tolerance approval:** **OPEN** (provisional engineering tolerance `abs_tol = 1e-9` / `rel_tol = 1e-9` only; independent actuarial golden approvals remain separate from cross-backend parity)
+> - **M6-05 frontend integration:** **OPEN**
+> - **Production-scale remote Spark deployment:** **NOT VERIFIED**
 
 ---
 
@@ -36,6 +41,10 @@ Verified in `backend/tests/spark/test_m6_04_conformance_and_recovery.py`, `backe
 
 Measured on Windows 11, Python `3.14.2`, `4` logical CPUs, Apache Spark `4.1.1` + Java `17`, running `backend/scripts/benchmark_m6_04_conformance.py` (`SPIA_REFERENCE`, 5 output variables: `survival_probability`, `payment_factor_life`, `annuity_payment`, `pv_liability_cash_flow`, `reserve`). Raw JSON saved in `.m4-review/m6_04_benchmark_results.json`.
 
+> **Benchmark Provenance:** `.m4-review/m6_04_benchmark_results.json` records `source_commit = 95caefe989caa7a52cfc12fd524a37fe6a87fff9` because the script executed on the local `feat/m6-scale-execution-integration` working tree (HEAD `95caefe989caa7a52cfc12fd524a37fe6a87fff9` plus the uncommitted M6-04 changes: `benchmark_m6_04_conformance.py`, the 64-bit Windows `_peak_rss_mb()` handle fix in `benchmark_m6_02_spark_parity.py`, the `spark.python.authenticate.socketTimeout = 120s` setting in `spark_backend.py`, and the M6-04 conformance test suite) immediately prior to committing that exact working tree verbatim as `ce1b8610d8102ef15fba32a7c206b0bb7a4bcb6b`. No calculation-path code changed between the benchmark run and commit `ce1b8610d8102ef15fba32a7c206b0bb7a4bcb6b`; the raw JSON `source_commit` value is preserved unaltered for provenance accuracy.
+>
+> **Measurement Scope:** `benchmark_m6_04_conformance.py` measures the **actuarial calculation and `m2-v1` Parquet serialization paths only** (CPU runner vs PySpark backend). It does **not** measure the full UI, HTTP API, relational database persistence, trace query, reconciliation, or CSV export lifecycle.
+
 | Workload | Policy-Months | Spark Master / Partitions | Worker PIDs | CPU (s) | Spark E2E (s) | Boot (s) | Broadcast (s) | Partition Exec (s) | Collect (s) | Shuffle (s) | CPU Thru (pm/s) | Spark Thru (pm/s) | Speed Ratio (CPU/Spark) | Output Rows | Parquet Size (bytes) | Peak Driver RSS (MB) | Parity (`max_abs_diff`) |
 |---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | `small_25p_24m_2sc_cold` | 1,200 | `local[2]` / 2 | 4 | 1.3545 | 44.1119 | 26.8908 | 0.6733 | 0.0876 | 12.5530 | 2.6951 | 885.9 | 27.2 | 0.031x | 6,050 | 50,068 | 183.09 | `0.0` (6,050/6,050 exact) |
@@ -47,9 +56,9 @@ Measured on Windows 11, Python `3.14.2`, `4` logical CPUs, Apache Spark `4.1.1` 
 
 ### Honest Empirical Interpretation (No Invented Speedups)
 - **Cold startup dominates tiny runs:** Booting the Spark JVM cold took `26.89s` (plus Python worker spawn & `collect()` overhead `12.55s`), making Spark `~32x` slower than CPU (`1.35s`) on `1,200` policy-months. Warm session reuse cut boot time from `26.89s` down to `0.46s`, but Python worker serialization + `collect()` (`13.47s`) still dominated small portfolios.
-- **Crossover behavior on this 4-thread laptop:** Spark stayed slower than CPU up through `24,000` (`0.586x`) and `48,000` (`0.894x`) policy-months, and crossed ahead of CPU at `96,000` policy-months (`1.213x` on `local[2]`, `1.024x` on `local[4]`) — validating why the planner's `50,000` policy-month `auto` threshold keeps small workloads on CPU!
+- **Provisional, hardware-specific `auto` threshold (`50,000` policy-months):** On this single 4-logical-CPU Windows laptop, Spark stayed slower than CPU at `24,000` (`0.586x`) and `48,000` (`0.894x`) policy-months and was slightly faster at `96,000` policy-months (`1.213x` on `local[2]`, `1.024x` on `local[4]`). The planner's current `spark_min_policy_months = 50,000` setting is retained as a **provisional, hardware-specific heuristic** to avoid routing small local runs into Spark JVM overhead — it is **not** an approved production crossover threshold, and these small single-laptop benchmarks do **not** promise or establish production Spark speedup.
 - **Over-partitioning on a small host:** Going from `local[2]` (8 worker PIDs) to `local[4]` (16 worker PIDs across 4 waves) on a 4-logical-CPU laptop increased driver RSS (`739.8 MB -> 763.9 MB`) and CPU/OS process contention without linear speedup.
-- *No production performance thresholds are claimed without Product Owner (Eko) sign-off.*
+- **Scope & governance boundary:** These numbers reflect isolated calculation + Parquet write paths on one local developer workstation only. Production performance thresholds, cluster sizing, and full UI/API/database/export lifecycle latency remain **OPEN** pending remote cluster verification and Product Owner (Eko) sign-off.
 
 ---
 
@@ -77,7 +86,7 @@ Verified in `backend/tests/spark/test_m6_04_conformance_and_recovery.py`, `backe
 | `backend/.venv` (Pure CPU + Alembic + Golden + Integration) | **801 passed, 4 skipped** |
 | `venv-spark` (Spark unit, GPU unit, planner API, Spark E2E, concurrency, M6-04 conformance & recovery) | **49 passed, 0 failed** |
 | `venv-gpu-sim` (`NUMBA_ENABLE_CUDASIM=1`, non-hardware GPU unit + planner + semantic trace parity) | **38 passed, 0 failed** |
-| Hosted GitHub Actions CI (`Mentor AMP Backend CI`, 4 jobs incl. Disposable PostgreSQL & Alembic single-head) | Verified on final M6-04 commit (see delivery summary) |
+| Hosted GitHub Actions CI (`Mentor AMP Backend CI`, 4 jobs incl. Disposable PostgreSQL & Alembic single-head) | **PASS** on `ce1b8610d8102ef15fba32a7c206b0bb7a4bcb6b` (run `44896433352`) |
 
 ---
 
@@ -85,7 +94,8 @@ Verified in `backend/tests/spark/test_m6_04_conformance_and_recovery.py`, `backe
 
 | Gate / Decision | Status | Owner / Next Step |
 |---|---|---|
-| **M6-03 Physical NVIDIA GPU Verification** | **OPEN (`NOT_RUN`)** | Pending Eko approval for authorized NVIDIA GPU VM / runner (`benchmark_m6_03_gpu.py --require-physical-gpu`) |
-| **CAS §17 Formal Numerical Tolerances & Benchmark Dimensions** | **OPEN** | Pending Eko Product Owner sign-off (provisional `1e-9` engineering tolerance currently in use) |
-| **M6-05 Live Frontend-to-Backend E2E Integration** | **OPEN (Handoff Ready)** | Updated handoff delivered in `docs/m6/M6_05_SAM_YUNG_FRONTEND_HANDOFF.md` for Sam Yung live demo |
-| **Production-Scale Spark Ops (Multi-Host / Multi-Process / Large-Scale Memory)** | **OPEN** | Single-process local concurrency and local 2-worker standalone verified; multi-host cloud cluster remains unverified |
+| **M6-04 CPU/Spark Engineering Conformance** | **ACCEPTED FOR PROGRESSION** | Progressing to M6-05 frontend-to-backend integration |
+| **M6-03 Physical NVIDIA GPU Verification** | **OPEN / NOT RUN** | Pending Eko approval for authorized NVIDIA GPU VM / runner (`benchmark_m6_03_gpu.py --require-physical-gpu`) |
+| **CAS §17 Formal Performance & Numerical Tolerance Approval** | **OPEN** | Pending Eko Product Owner sign-off (provisional `1e-9` engineering tolerance currently in use; independent actuarial golden approvals remain separate from cross-backend parity) |
+| **M6-05 Live Frontend-to-Backend E2E Integration** | **OPEN** | Active next priority with Sam Yung (`docs/m6/M6_05_SAM_YUNG_FRONTEND_HANDOFF.md`) |
+| **Production-Scale Remote Spark Deployment** | **NOT VERIFIED** | Single-process local concurrency and local 2-worker standalone verified; multi-host cloud cluster remains unverified |
