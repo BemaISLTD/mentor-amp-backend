@@ -30,6 +30,9 @@ def register_all_products() -> list[str]:
     from app.products.fia_lite import config as fia
     from app.products.rila_lite import config as rila
     from app.products.prospective_reserve_discounting import config as reserve_gpu
+    from app.products.idi_lite import config as idi
+    from app.products.va_lite import config as va
+    from app.products.prt_lite import config as prt
 
     spia.register_functions()
     spia_reference.register_functions()
@@ -37,11 +40,14 @@ def register_all_products() -> list[str]:
     fia.register_functions()
     rila.register_functions()
     reserve_gpu.register_functions()
+    idi.register_functions()
+    va.register_functions()
+    prt.register_functions()
     if spia.PRODUCT_CODE not in REGISTERED_PRODUCTS:
         REGISTERED_PRODUCTS.append(spia.PRODUCT_CODE)
     if myga.PRODUCT_CODE not in REGISTERED_PRODUCTS:
         REGISTERED_PRODUCTS.append(myga.PRODUCT_CODE)
-    for product in (fia, rila):
+    for product in (fia, rila, idi, va, prt):
         if product.PRODUCT_CODE not in REGISTERED_PRODUCTS:
             REGISTERED_PRODUCTS.append(product.PRODUCT_CODE)
     if reserve_gpu.PRODUCT_CODE not in REGISTERED_INTERNAL_REFERENCES:

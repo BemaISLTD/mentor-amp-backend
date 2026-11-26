@@ -1,5 +1,6 @@
 """Governed metadata is scoped, versioned, audited, and softly archived."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,8 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.api.dependencies import get_current_user
+from app.config import settings
+from app.core.artifacts import get_artifact_store
 from app.db.database import Base, get_db
 from app.db.models.audit_log import AuditLog
 from app.db.models.formula import FormulaRegistry
@@ -22,7 +25,8 @@ from app.main import app
 
 
 @pytest.fixture()
-def governed_client():
+def governed_client(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "artifact_storage_path", tmp_path / "artifacts")
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, expire_on_commit=False)
@@ -136,7 +140,38 @@ def test_rollforward_report_and_dataset_lifecycles(governed_client):
     })
     assert report.status_code == 201, report.text
     report_id = report.json()["id"]
+    # Ungenerated reports cannot be published.
+    ungenerated_pub = client.post(f"/internal/experimental/reports/{report_id}/publish")
+    assert ungenerated_pub.status_code == 409
+    assert ungenerated_pub.json()["error"]["code"] == "REPORT_NOT_GENERATED"
+    # Materialize verified physical JSON and CSV artifacts before publishing.
+    store = get_artifact_store()
+    json_payload = {
+        "schema_version": "mentoramp.report/v1",
+        "metadata": {"report_id": report_id, "report_version": 1, "is_synthetic": True},
+    }
+    stored_json = store.write_bytes(
+        report_id, "reports", "report-v1.json",
+        json.dumps(json_payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+    )
+    stored_csv = store.write_bytes(
+        report_id, "reports", "report-v1.csv", b"section,line_item,value,status\n",
+    )
+    stored_report = db.get(Report, report_id)
+    stored_report.artifact_uri = stored_json.uri
+    stored_report.artifact_fingerprint = stored_json.checksum_sha256
+    stored_report.definition = {
+        **(stored_report.definition or {}),
+        "generated": {
+            "report_id": report_id,
+            "report_version": 1,
+            "csv_artifact_uri": stored_csv.uri,
+            "csv_artifact_fingerprint": stored_csv.checksum_sha256,
+        },
+    }
+    db.commit()
     assert client.post(f"/internal/experimental/reports/{report_id}/publish").status_code == 200
+    assert client.post(f"/internal/experimental/reports/{report_id}/publish").status_code == 409
     assert client.patch(f"/internal/experimental/reports/{report_id}", json={"description": "late"}).status_code == 409
 
     dataset = client.post(f"/internal/experimental/projects/{project.id}/derived-datasets", json={

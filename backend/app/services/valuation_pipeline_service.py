@@ -136,6 +136,12 @@ def _normalize_product_family(code: str | None) -> str:
         return "FIA"
     if "rila" in low:
         return "RILA"
+    if "idi" in low:
+        return "IDI"
+    if low == "va" or "variable annuity" in low or low.startswith("va_") or low.startswith("va-"):
+        return "VA"
+    if "prt" in low or "pension risk transfer" in low:
+        return "PRT"
     return "UNKNOWN"
 
 

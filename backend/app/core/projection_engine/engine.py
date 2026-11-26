@@ -261,6 +261,19 @@ class _PolicyCalculator:
                     "missing_variable", f"Unknown context field '{name}'.", spec.name, self.month
                 )
             value = self.context.get(name)
+            age_column = source.get("age_column")
+            if name == "attained_age" and age_column:
+                base_age = _to_int(self.policy.data.get(age_column))
+                if base_age is None:
+                    base_age = _to_int(spec.default_value)
+                if base_age is not None:
+                    # Negative values are explicit non-applicable sentinels and
+                    # must remain stable; real ages advance at policy anniversaries.
+                    value = (
+                        base_age
+                        if base_age < 0
+                        else base_age + (int(self.context["policy_month"]) - 1) // 12
+                    )
             if value is None:
                 raise EngineError(
                     "missing_value",

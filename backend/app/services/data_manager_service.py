@@ -556,10 +556,35 @@ def _validate_inforce(row: ImportSession, rows: list[dict[str, Any]],
     # Validate common identity fields first, then select the remaining contract fields from
     # each row's product type. Files may contain more than one supported product; fields that
     # belong to another product are ignored rather than treated as required.
+    schema_ver = (row.options or {}).get("schema_version") or (row.options or {}).get("input_schema_version")
+    # Product aliases that target common fields (for example LIFE ``sex -> gender``)
+    # must be canonicalized before the common required-field pass.  Conflict detection
+    # remains fail-closed and the alias is removed so persisted rows are canonical.
+    for number, item in enumerate(rows, start=1):
+        product_type = str(item.get("product_type") or "").strip().upper()
+        defn = get_product_inforce_definition(product_type, schema_ver)
+        if defn is None:
+            continue
+        for alias, canonical in defn.aliases.items():
+            if alias in item and canonical in item:
+                alias_val = item[alias]
+                canon_val = item[canonical]
+                try:
+                    disagrees = not math.isclose(float(alias_val), float(canon_val), abs_tol=1e-9)
+                except (ValueError, TypeError):
+                    disagrees = str(alias_val).strip() != str(canon_val).strip()
+                if disagrees:
+                    issues.append(_issue(
+                        "error", "ALIAS_CONFLICT",
+                        f"Field '{canonical}' ({canon_val}) and alias '{alias}' ({alias_val}) have conflicting values.",
+                        number, canonical, canon_val,
+                    ))
+                del item[alias]
+            elif alias in item:
+                item[canonical] = item.pop(alias)
     _required_and_types(rows, COMMON_INFORCE_FIELDS, issues)
     columns = set(rows[0]) if rows else set()
     products_present: set[str] = set()
-    schema_ver = (row.options or {}).get("schema_version") or (row.options or {}).get("input_schema_version")
     for number, item in enumerate(rows, start=1):
         product_type = str(item.get("product_type") or "").strip().upper()
         item["product_type"] = product_type
@@ -581,7 +606,7 @@ def _validate_inforce(row: ImportSession, rows: list[dict[str, Any]],
             continue
         products_present.add(product_type)
 
-        # Apply and canonicalize column aliases before validation and fingerprinting
+        # Defensive second pass for callers that mutate a row during validation.
         for alias, canonical in defn.aliases.items():
             if alias in item and canonical in item:
                 alias_val = item[alias]

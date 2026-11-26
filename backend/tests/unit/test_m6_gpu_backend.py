@@ -270,7 +270,7 @@ def test_gpu_reference_model_is_not_counted_as_launch_actuarial_product():
     )
 
     products = register_all_products()
-    assert products == ["SPIA", "MYGA", "FIA", "RILA"]
+    assert products == ["SPIA", "MYGA", "FIA", "RILA", "IDI", "VA", "PRT"]
     assert GPU_ELIGIBLE_PRODUCT_CODE not in REGISTERED_PRODUCTS
     assert GPU_ELIGIBLE_PRODUCT_CODE in REGISTERED_INTERNAL_REFERENCES
     assert pr_cfg.IS_LAUNCH_PRODUCT is False
