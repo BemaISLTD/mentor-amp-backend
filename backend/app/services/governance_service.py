@@ -425,20 +425,9 @@ def publish_versioned(db: Session, model: type, object_id: str, user: Any):
             f"{label} version is already published and immutable.",
         )
     if model is Report:
-        generated = (row.definition or {}).get("generated") or {}
-        if (
-            not row.artifact_uri
-            or not row.artifact_fingerprint
-            or not generated.get("csv_artifact_uri")
-            or not generated.get("csv_artifact_fingerprint")
-            or generated.get("report_id") != row.id
-            or generated.get("report_version") != row.version_number
-        ):
-            raise ServiceError(
-                409,
-                "REPORT_NOT_GENERATED",
-                "An ungenerated report cannot be published; generate this report version first.",
-            )
+        from app.services import reporting_service
+
+        reporting_service.verify_generated_artifacts(row)
     before = _state(row)
     row.status = "published"
     row.published_by = user.id

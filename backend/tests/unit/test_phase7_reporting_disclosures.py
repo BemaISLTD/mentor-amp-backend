@@ -536,3 +536,84 @@ def test_unapproved_reconciliation_and_tampered_parquet_fail_closed(reporting_db
     with pytest.raises(ServiceError) as pq_err:
         reporting_service.generate(db, project.id, rep_pq["id"], actor)
     assert pq_err.value.code == "ARTIFACT_CHECKSUM_MISMATCH"
+
+
+def test_report_publication_verifies_physical_json_and_csv_artifacts_without_export_audit(reporting_db):
+    """Exact A-I regression test required by Phase 7 Conditional Technical Pass Section 1."""
+    db, user, project, _unused_run, _unused_report = reporting_db
+    actor = SimpleNamespace(id=user.id)
+    run, _ = _materialize_governed_run(
+        db, project_id=project.id, user_id=user.id, run_id="run-pub-safeguard", reserve_value=15_000.0
+    )
+
+    # A. Generate a valid report
+    created = governance_service.create_report(
+        db,
+        project.id,
+        {
+            "name": "Publication Safeguard Report",
+            "report_type": "disclosure_supporting",
+            "definition": {"source_run_id": run.id},
+        },
+        actor,
+    )
+    report_id = created["id"]
+    reporting_service.generate(db, project.id, report_id, actor)
+    record = db.get(Report, report_id)
+    store = get_artifact_store()
+    json_path = store.path_for_uri(record.artifact_uri)
+    csv_path = store.path_for_uri(record.definition["generated"]["csv_artifact_uri"])
+    original_json = json_path.read_bytes()
+    original_csv = csv_path.read_bytes()
+
+    # B, C, D. Tamper with CSV bytes -> publication fails with 409; status stays draft; no export/publish audit
+    csv_path.write_bytes(b"tampered-csv-content\n")
+    with pytest.raises(ServiceError) as csv_pub_err:
+        governance_service.publish_versioned(db, Report, report_id, actor)
+    assert csv_pub_err.value.status_code == 409
+    assert csv_pub_err.value.code == "ARTIFACT_CHECKSUM_MISMATCH"
+    db.expire_all()
+    assert db.get(Report, report_id).status == "draft"
+    assert db.get(Report, report_id).published_at is None
+    assert db.query(AuditLog).filter(AuditLog.entity_id == report_id, AuditLog.action.in_(("report.exported", "report.published"))).count() == 0
+
+    # E, F. Restore CSV; tamper with JSON bytes -> publication fails with 409; status stays draft; no export/publish audit
+    csv_path.write_bytes(original_csv)
+    json_path.write_bytes(b"x" + original_json)
+    with pytest.raises(ServiceError) as json_pub_err:
+        governance_service.publish_versioned(db, Report, report_id, actor)
+    assert json_pub_err.value.status_code == 409
+    assert json_pub_err.value.code == "ARTIFACT_CHECKSUM_MISMATCH"
+    db.expire_all()
+    assert db.get(Report, report_id).status == "draft"
+    assert db.get(Report, report_id).published_at is None
+    assert db.query(AuditLog).filter(AuditLog.entity_id == report_id, AuditLog.action.in_(("report.exported", "report.published"))).count() == 0
+
+    # Extra safeguard check: missing physical artifact file fails closed with 409 ARTIFACT_MISSING
+    json_path.write_bytes(original_json)
+    csv_path.unlink()
+    with pytest.raises(ServiceError) as missing_err:
+        governance_service.publish_versioned(db, Report, report_id, actor)
+    assert missing_err.value.status_code == 409
+    assert missing_err.value.code == "ARTIFACT_MISSING"
+    db.expire_all()
+    assert db.get(Report, report_id).status == "draft"
+
+    # G, H. Restore original artifacts -> publish succeeds exactly once with ZERO report.exported audit events
+    csv_path.write_bytes(original_csv)
+    published = governance_service.publish_versioned(db, Report, report_id, actor)
+    assert published["status"] == "published"
+    published_at = db.get(Report, report_id).published_at
+    assert published_at is not None
+    assert db.query(AuditLog).filter(AuditLog.entity_id == report_id, AuditLog.action == "report.published").count() == 1
+    assert db.query(AuditLog).filter(AuditLog.entity_id == report_id, AuditLog.action == "report.exported").count() == 0
+
+    # I. Reject repeated publication without mutating published report or adding duplicate publish audits
+    with pytest.raises(ServiceError) as repeat_err:
+        governance_service.publish_versioned(db, Report, report_id, actor)
+    assert repeat_err.value.status_code == 409
+    assert repeat_err.value.code == "ALREADY_PUBLISHED"
+    db.expire_all()
+    assert db.get(Report, report_id).published_at == published_at
+    assert db.query(AuditLog).filter(AuditLog.entity_id == report_id, AuditLog.action == "report.published").count() == 1
+    assert db.query(AuditLog).filter(AuditLog.entity_id == report_id, AuditLog.action == "report.exported").count() == 0

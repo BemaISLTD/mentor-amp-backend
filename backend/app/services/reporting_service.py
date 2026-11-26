@@ -419,8 +419,7 @@ def _verify_generated_binding(report: Report) -> dict[str, Any]:
     return generated if isinstance(generated, dict) else {}
 
 
-def payload(db: Session, report_id: str) -> dict[str, Any]:
-    report = _report(db, report_id)
+def _verified_json_payload(report: Report) -> dict[str, Any]:
     _verify_generated_binding(report)
     content = verified_artifact_bytes(
         get_artifact_store(), report.artifact_uri, report.artifact_fingerprint
@@ -439,8 +438,12 @@ def payload(db: Session, report_id: str) -> dict[str, Any]:
     return value
 
 
-def export_csv(db: Session, report_id: str, user: Any) -> tuple[bytes, Report]:
-    report = _report(db, report_id)
+def verify_generated_artifacts(report: Report) -> tuple[dict[str, Any], bytes]:
+    """Verify physical JSON and CSV artifacts, checksums, and report/version binding.
+
+    Pure validation helper reused by publication and export paths; never emits
+    an export audit event.
+    """
     generated = _verify_generated_binding(report)
     uri = generated.get("csv_artifact_uri")
     checksum = generated.get("csv_artifact_fingerprint")
@@ -452,9 +455,22 @@ def export_csv(db: Session, report_id: str, user: Any) -> tuple[bytes, Report]:
             "REPORT_ARTIFACT_IDENTITY_MISMATCH",
             "CSV export metadata does not match this report identity and version.",
         )
-    # Also verify primary JSON payload integrity & identity before serving derived CSV.
-    payload(db, report_id)
-    content = verified_artifact_bytes(get_artifact_store(), uri, checksum)
+    json_payload = _verified_json_payload(report)
+    csv_content = verified_artifact_bytes(get_artifact_store(), uri, checksum)
+    return json_payload, csv_content
+
+
+def payload(db: Session, report_id: str) -> dict[str, Any]:
+    report = _report(db, report_id)
+    return _verified_json_payload(report)
+
+
+def export_csv(db: Session, report_id: str, user: Any) -> tuple[bytes, Report]:
+    report = _report(db, report_id)
+    _json_payload, content = verify_generated_artifacts(report)
+    generated = (report.definition or {}).get("generated") or {}
+    uri = generated["csv_artifact_uri"]
+    checksum = generated["csv_artifact_fingerprint"]
     record_audit(
         db, actor_user_id=user.id, action="report.exported", entity_type="report",
         entity_id=report.id, after_state={
