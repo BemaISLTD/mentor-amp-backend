@@ -1,4 +1,23 @@
-"""Illustrative VA vertical executed exclusively by the shared projection engine."""
+"""Illustrative VA vertical executed exclusively by the shared projection engine.
+
+Selected Illustrative Cash-Flow & Exposure Timing Convention (Pending
+ACT-P7-DEC-03, ACT-P7-DEC-04, ACT-DEC-01, ACT-DEC-02):
+- Conditional per-surviving-policy account quantities (``eq_av_*``,
+  ``bond_av_*``, ``fixed_av_*``, ``account_value_*``, ``total_fee_due``,
+  ``total_fees_collected``, ``av_paid_withdrawal``, ``benefit_base_*``,
+  ``gmwb_remaining_*``, ``gmdb_base_*``, ``rider_claim_payment``,
+  ``nar_death_claim``) represent values conditional on the policy being in force
+  at the start of month ``t``.
+- Expected insurer cash flows are consistently survival-weighted using
+  ``survival_open(t)`` (start-of-month in-force exposure, before EOM mortality
+  and lapse decrements produce ``survival_close(t)``):
+  * ``expected_fees_collected = total_fees_collected * survival_open``
+  * ``rider_claims_incurred = rider_claim_payment * survival_open``
+  * ``death_claims_incurred = nar_death_claim * survival_open * q_mort_m``
+  * ``net_cash_flow = rider_claims_incurred + death_claims_incurred - expected_fees_collected``
+- Consequently, after complete policy extinction (``survival_open == 0``),
+  expected fee income and all expected insurer cash flows are identically ``0.0``.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +33,7 @@ from app.products.shared_modules.variable_annuity import (
 PRODUCT_CODE = "VA"
 PRODUCT_NAME = "Variable Annuity (Illustrative)"
 FUNCTION_PREFIX = "va_illustrative"
-IMPLEMENTATION_VERSION = "va-illustrative-m7-v1"
+IMPLEMENTATION_VERSION = "va-illustrative-m7-v2"
 FUND_RETURN_TABLE = "VA_FUND_RETURN_PATHS"
 MORTALITY_TABLE = "VA_MORTALITY"
 LAPSE_TABLE = "VA_LAPSE"
@@ -220,12 +239,16 @@ def death_claims_incurred(nar_death_claim: float, survival_open: float, q_mort_m
     return float(nar_death_claim) * float(survival_open) * float(q_mort_m)
 
 
+def expected_fees_collected(total_fees_collected: float, survival_open: float) -> float:
+    return float(total_fees_collected) * float(survival_open)
+
+
 def net_cash_flow(
     rider_claims_incurred: float,
     death_claims_incurred: float,
-    total_fees_collected: float,
+    expected_fees_collected: float,
 ) -> float:
-    return float(rider_claims_incurred) + float(death_claims_incurred) - float(total_fees_collected)
+    return float(rider_claims_incurred) + float(death_claims_incurred) - float(expected_fees_collected)
 
 
 def discount_factor(discount_rate: float, projection_month: float) -> float:
@@ -246,6 +269,7 @@ _FUNCTIONS = {
         "gmwb_remaining_open", "gmdb_base_open", "survival_open", "fixed_monthly_return",
         "eq_av_after_growth", "bond_av_after_growth", "fixed_av_after_growth",
         "account_value_after_growth", "total_fee_due", "total_fees_collected",
+        "expected_fees_collected",
         "account_value_after_fees", "av_paid_withdrawal", "account_value_close",
         "eq_av_close", "bond_av_close", "fixed_av_close", "benefit_base_close",
         "gmwb_remaining_close", "gmdb_base_close", "rider_claim_payment", "q_mort_m",
@@ -355,36 +379,48 @@ _FORMULAS = [
     )],
     ("q_mort_m", ["q_mort_annual"]), ("q_lapse_m", ["q_lapse_annual"]),
     ("survival_close", ["survival_open", "q_mort_m", "q_lapse_m"]),
+    ("expected_fees_collected", ["total_fees_collected", "survival_open"]),
     ("rider_claims_incurred", ["rider_claim_payment", "survival_open"]),
     ("nar_death_claim", ["account_value_close", "gmdb_base_close", "rider_type"]),
     ("death_claims_incurred", ["nar_death_claim", "survival_open", "q_mort_m"]),
-    ("net_cash_flow", ["rider_claims_incurred", "death_claims_incurred", "total_fees_collected"]),
+    ("net_cash_flow", ["rider_claims_incurred", "death_claims_incurred", "expected_fees_collected"]),
     ("discount_factor", ["discount_rate", "projection_month"]),
     ("pv_net_cash_flow", ["net_cash_flow", "discount_factor"]),
 ]
 
 for name, _dependencies in _FORMULAS:
-    VARIABLES.append(_variable(name, "formula", source={"type": "formula"}))
+    unit = "probability" if name in {"survival_open", "survival_close", "q_mort_m", "q_lapse_m"} else "factor" if name == "discount_factor" else "USD"
+    VARIABLES.append(_variable(name, "formula", unit=unit, source={"type": "formula"}))
 VARIABLES.append(_variable("reserve", "valuation", source={
     "type": "valuation", "method": "illustrative_prospective_reserve",
     "cash_flow": "net_cash_flow", "rate": "discount_rate", "consistency_sum_of": "pv_net_cash_flow",
 }))
 FORMULAS = [{
     "name": name, "output_variable": name, "function_ref": f"{FUNCTION_PREFIX}.{name}",
-    "dependencies": dependencies, "unit": "USD",
+    "dependencies": dependencies,
+    "unit": next(v["unit"] for v in VARIABLES if v["name"] == name) or "USD",
 } for name, dependencies in _FORMULAS]
 
 _OUTPUTS = [
+    "survival_open", "survival_close",
     "eq_av_close", "bond_av_close", "fixed_av_close", "account_value_close",
     "benefit_base_close", "gmwb_remaining_close", "gmdb_base_close",
-    "total_fees_collected", "rider_claims_incurred", "death_claims_incurred",
+    "total_fees_collected", "expected_fees_collected",
+    "rider_claims_incurred", "death_claims_incurred",
     "net_cash_flow", "pv_net_cash_flow", "reserve",
 ]
 PUBLISHED_OUTPUTS = [{
-    "variable_name": name, "display_name": name.replace("_", " ").title(), "unit": "USD",
+    "variable_name": name, "display_name": name.replace("_", " ").title(),
+    "unit": "probability" if name in {"survival_open", "survival_close"} else "USD",
     "dimension": "policy_month",
-    "aggregation": "sum" if name in {"total_fees_collected", "rider_claims_incurred", "death_claims_incurred", "net_cash_flow", "pv_net_cash_flow"} else "end_of_period",
-    "description": "Synthetic illustrative VA output; owner confirmation pending.",
+    "aggregation": "sum" if name in {"total_fees_collected", "expected_fees_collected", "rider_claims_incurred", "death_claims_incurred", "net_cash_flow", "pv_net_cash_flow"} else "end_of_period",
+    "description": (
+        "Conditional per-surviving-policy account fee; not survival-weighted."
+        if name == "total_fees_collected"
+        else "Survival-weighted expected insurer fee income (total_fees_collected * survival_open)."
+        if name == "expected_fees_collected"
+        else "Synthetic illustrative VA output; owner confirmation pending."
+    ),
 } for name in _OUTPUTS]
 
 MODEL = {

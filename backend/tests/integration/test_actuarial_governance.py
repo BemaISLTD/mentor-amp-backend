@@ -136,7 +136,26 @@ def test_rollforward_report_and_dataset_lifecycles(governed_client):
     })
     assert report.status_code == 201, report.text
     report_id = report.json()["id"]
+    # Ungenerated reports cannot be published.
+    ungenerated_pub = client.post(f"/internal/experimental/reports/{report_id}/publish")
+    assert ungenerated_pub.status_code == 409
+    assert ungenerated_pub.json()["error"]["code"] == "REPORT_NOT_GENERATED"
+    # Materialize report artifact identity before publishing.
+    stored_report = db.get(Report, report_id)
+    stored_report.artifact_uri = "local://reports/report-v1.json"
+    stored_report.artifact_fingerprint = "a" * 64
+    stored_report.definition = {
+        **(stored_report.definition or {}),
+        "generated": {
+            "report_id": report_id,
+            "report_version": 1,
+            "csv_artifact_uri": "local://reports/report-v1.csv",
+            "csv_artifact_fingerprint": "b" * 64,
+        },
+    }
+    db.commit()
     assert client.post(f"/internal/experimental/reports/{report_id}/publish").status_code == 200
+    assert client.post(f"/internal/experimental/reports/{report_id}/publish").status_code == 409
     assert client.patch(f"/internal/experimental/reports/{report_id}", json={"description": "late"}).status_code == 409
 
     dataset = client.post(f"/internal/experimental/projects/{project.id}/derived-datasets", json={

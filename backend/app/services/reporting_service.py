@@ -147,7 +147,7 @@ def _reconciliation(db: Session, run_id: str) -> dict[str, Any]:
     }
 
 
-def _rollforward(db: Session, run_id: str) -> dict[str, Any]:
+def _rollforward(db: Session, run_id: str, *, run_complete: bool = True) -> dict[str, Any]:
     summary = results_service.rollforward_summary(db, run_id)
     if summary["count"] == 0:
         return {
@@ -157,21 +157,53 @@ def _rollforward(db: Session, run_id: str) -> dict[str, Any]:
             "recomputed_continuity_verified": None,
             "is_tampered_or_forged": False,
         }
-    return {"status": "AVAILABLE", **summary}
+    recomputed_ok = summary.get("recomputed_continuity_verified") is True
+    stored_ok = summary.get("stored_continuity_verified") is True
+    tampered = bool(summary.get("is_tampered_or_forged"))
+    if tampered or not recomputed_ok:
+        reason = (
+            "Persisted rollforward continuity failed independent arithmetic recomputation "
+            "and contradicts stored continuity flag."
+            if tampered
+            else "Persisted rollforward continuity failed independent arithmetic recomputation."
+        )
+        return {"status": "CONTINUITY_FAILED", "reason": reason, **summary}
+    if not stored_ok:
+        return {
+            "status": "NOT_VERIFIABLE",
+            "reason": "Persisted rollforward summary is not marked continuity-verified.",
+            **summary,
+        }
+    if not run_complete:
+        return {
+            "status": "PARTIAL_INCOMPLETE",
+            "reason": "Source run finished with partial_success; rollforward reflects an incomplete portfolio.",
+            **summary,
+        }
+    return {"status": "AVAILABLE", "reason": None, **summary}
 
 
 def _csv_bytes(payload: dict[str, Any]) -> bytes:
     buffer = io.StringIO(newline="")
     writer = csv.writer(buffer, lineterminator="\n")
     writer.writerow(("section", "line_item", "value", "status"))
+    meta = payload["metadata"]
+    writer.writerow(("metadata", "source_run_id", meta.get("source_run_id") or "", meta.get("completeness_status", "COMPLETE")))
+    writer.writerow(("metadata", "source_run_status", meta.get("source_run_status") or "", meta.get("completeness_status", "COMPLETE")))
+    writer.writerow(("metadata", "accepted_attempt_number", "" if meta.get("accepted_attempt_number") is None else meta.get("accepted_attempt_number"), meta.get("completeness_status", "COMPLETE")))
+    writer.writerow(("metadata", "policy_error_count", meta.get("policy_error_count", 0), meta.get("completeness_status", "COMPLETE")))
     for section_name in ("balance_sheet_components", "income_statement_components"):
         section = payload[section_name]
         for key, value in sorted(section.items()):
-            if key in {"status", "reason"}:
+            if key in {"status", "reason", "is_complete"}:
                 continue
             writer.writerow((section_name, key, "" if value is None else value, section.get("status", "AVAILABLE")))
-    for item in payload["rollforward_and_attribution"].get("items", []):
-        writer.writerow(("rollforward_and_attribution", item.get("component_name"), item.get("movement_amount"), payload["rollforward_and_attribution"]["status"]))
+    rf = payload["rollforward_and_attribution"]
+    if rf.get("status") in {"AVAILABLE", "PARTIAL_INCOMPLETE"}:
+        for item in rf.get("items", []):
+            writer.writerow(("rollforward_and_attribution", item.get("component_name"), item.get("movement_amount"), rf["status"]))
+    else:
+        writer.writerow(("rollforward_and_attribution", "status", "", rf.get("status", "UNAVAILABLE")))
     return buffer.getvalue().encode("utf-8")
 
 
@@ -179,19 +211,42 @@ def _payload(db: Session, report: Report, run, configuration: dict[str, Any],
              output_rows: list[dict[str, Any]], checksums: dict[str, str]) -> dict[str, Any]:
     totals, endings = _output_summaries(output_rows)
     valuation = db.get(ValuationRunDetail, run.id)
-    rollforward = _rollforward(db, run.id)
+    policy_error_count = int(getattr(run, "error_count", 0) or 0)
+    policy_warning_count = int(getattr(run, "warning_count", 0) or 0)
+    run_complete = (run.status == "success") and (policy_error_count == 0)
+    rollforward = _rollforward(db, run.id, run_complete=run_complete)
     reconciliation = _reconciliation(db, run.id)
     product_code = ((configuration.get("model") or {}).get("product_code"))
     scenario_id = (configuration.get("scenario") or {}).get("id")
     build = configuration.get("build") or {}
 
+    incomplete_reason = (
+        None
+        if run_complete
+        else (
+            f"Source run '{run.id}' finished with status '{run.status}' "
+            f"({policy_error_count} policy error(s)); this report reflects an incomplete "
+            "portfolio and must not be treated as an unqualified complete disclosure."
+        )
+    )
+
     ending_reserve = _first(endings, ("reserve", "statutory_reserve", "gaap_reserve"))
     ending_av = _first(endings, ("account_value_close", "total_account_value_close"))
     benefit_liability = _first(endings, ("benefit_base_close", "gmwb_remaining_close"))
     balance_available = any(value is not None for value in (ending_reserve, ending_av, benefit_liability))
+    balance_status = (
+        "UNAVAILABLE"
+        if not balance_available
+        else ("AVAILABLE" if run_complete else "PARTIAL_INCOMPLETE")
+    )
     balance_sheet = {
-        "status": "AVAILABLE" if balance_available else "UNAVAILABLE",
-        "reason": None if balance_available else "No applicable persisted balance outputs are available.",
+        "status": balance_status,
+        "is_complete": run_complete if balance_available else False,
+        "reason": (
+            "No applicable persisted balance outputs are available."
+            if not balance_available
+            else incomplete_reason
+        ),
         "opening_reserve": None,
         "ending_reserve": _number(ending_reserve),
         "ending_account_value": _number(ending_av),
@@ -201,7 +256,7 @@ def _payload(db: Session, report: Report, run, configuration: dict[str, Any],
     income_values = {
         "premiums": _number(_first(totals, ("expected_premium_inflow", "premium_cash_flow"))),
         "investment_or_credited_interest": _number(_first(totals, ("interest_credited",))),
-        "fees_and_charges": _number(_first(totals, ("total_fees_collected", "fee"))),
+        "fees_and_charges": _number(_first(totals, ("expected_fees_collected", "total_fees_collected", "fee"))),
         "benefits_claims_and_surrenders": _number(_first(totals, (
             "total_prt_outflow", "expected_claim_benefit_outgo", "liability_outgo",
             "rider_claims_incurred", "expected_payment",
@@ -210,11 +265,22 @@ def _payload(db: Session, report: Report, run, configuration: dict[str, Any],
         "reserve_delta": None,
     }
     income_available = any(value is not None for value in income_values.values())
+    income_status = (
+        "UNAVAILABLE"
+        if not income_available
+        else ("AVAILABLE" if run_complete else "PARTIAL_INCOMPLETE")
+    )
     income_statement = {
-        "status": "AVAILABLE" if income_available else "UNAVAILABLE",
-        "reason": None if income_available else "No applicable persisted income-statement outputs are available.",
+        "status": income_status,
+        "is_complete": run_complete if income_available else False,
+        "reason": (
+            "No applicable persisted income-statement outputs are available."
+            if not income_available
+            else incomplete_reason
+        ),
         **income_values,
     }
+    rollforward_usable = rollforward["status"] in {"AVAILABLE", "PARTIAL_INCOMPLETE"}
     disclosure_items = [{
         "basis": item.get("basis"), "methodology": item.get("methodology"),
         "product_code": product_code, "cohort_id": item.get("cohort_id"),
@@ -222,12 +288,31 @@ def _payload(db: Session, report: Report, run, configuration: dict[str, Any],
         "component_name": item.get("component_name"),
         "movement_amount": item.get("movement_amount"),
         "closing_balance": item.get("closing_balance"),
-    } for item in rollforward.get("items", [])]
+    } for item in rollforward.get("items", [])] if rollforward_usable else []
+    if rollforward["status"] == "AVAILABLE" and disclosure_items:
+        disclosure_status = "AVAILABLE"
+        disclosure_reason = None
+    elif rollforward["status"] == "PARTIAL_INCOMPLETE" and disclosure_items:
+        disclosure_status = "PARTIAL_INCOMPLETE"
+        disclosure_reason = incomplete_reason
+    elif rollforward["status"] in {"CONTINUITY_FAILED", "NOT_VERIFIABLE"}:
+        disclosure_status = "NOT_VERIFIABLE"
+        disclosure_reason = rollforward.get("reason")
+    else:
+        disclosure_status = "UNAVAILABLE"
+        disclosure_reason = rollforward.get("reason")
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
         "metadata": {
             "project_id": report.project_id, "report_id": report.id,
             "report_version": report.version_number, "source_run_id": run.id,
+            "source_run_status": run.status,
+            "accepted_attempt_number": run.accepted_attempt_number,
+            "policy_error_count": policy_error_count,
+            "policy_warning_count": policy_warning_count,
+            "is_complete": run_complete,
+            "completeness_status": "COMPLETE" if run_complete else "INCOMPLETE_PARTIAL_RUN",
+            "completeness_notice": incomplete_reason,
             "run_package_fingerprint": run.run_package_fingerprint,
             "artifact_checksums": checksums, "code_build_identity": build,
             "is_synthetic": bool(run.illustrative), "is_production_approved": False,
@@ -239,7 +324,9 @@ def _payload(db: Session, report: Report, run, configuration: dict[str, Any],
         "income_statement_components": income_statement,
         "rollforward_and_attribution": rollforward,
         "asu_2018_12_disclosure_supporting": {
-            "status": "AVAILABLE" if disclosure_items else "UNAVAILABLE",
+            "status": disclosure_status,
+            "is_complete": run_complete if disclosure_status == "AVAILABLE" else False,
+            "reason": disclosure_reason,
             "actuarial_review_status": "PENDING_ACT_DEC_09_AND_CAS_17",
             "items": disclosure_items,
         },
@@ -272,11 +359,18 @@ def generate(db: Session, project_id: str, report_id: str, user: Any) -> dict[st
     csv_artifact = store.write_bytes(report.id, "reports", f"report-v{report.version_number}.csv", csv_bytes)
     report.artifact_uri = json_artifact.uri
     report.artifact_fingerprint = json_artifact.checksum_sha256
+    base_definition = {k: v for k, v in (report.definition or {}).items() if k != "generated"}
     report.definition = {
-        **(report.definition or {}),
+        **base_definition,
         "generated": {
+            "report_id": report.id,
+            "report_version": report.version_number,
             "schema_version": REPORT_SCHEMA_VERSION,
             "source_run_id": run.id,
+            "source_run_status": run.status,
+            "accepted_attempt_number": run.accepted_attempt_number,
+            "policy_error_count": payload["metadata"]["policy_error_count"],
+            "is_complete": payload["metadata"]["is_complete"],
             "is_synthetic": payload["metadata"]["is_synthetic"],
             "csv_artifact_uri": csv_artifact.uri,
             "csv_artifact_fingerprint": csv_artifact.checksum_sha256,
@@ -287,9 +381,15 @@ def generate(db: Session, project_id: str, report_id: str, user: Any) -> dict[st
     record_audit(
         db, actor_user_id=user.id, action="report.generated", entity_type="report",
         entity_id=report.id, after_state={
+            "report_version": report.version_number,
             "artifact_uri": report.artifact_uri,
             "artifact_fingerprint": report.artifact_fingerprint,
+            "csv_artifact_uri": csv_artifact.uri,
+            "csv_artifact_fingerprint": csv_artifact.checksum_sha256,
             "source_run_id": run.id,
+            "source_run_status": run.status,
+            "accepted_attempt_number": run.accepted_attempt_number,
+            "is_complete": payload["metadata"]["is_complete"],
         },
         context={"is_production_approved": False, "classification": CLASSIFICATION},
     )
@@ -297,10 +397,31 @@ def generate(db: Session, project_id: str, report_id: str, user: Any) -> dict[st
     return payload
 
 
+def _verify_generated_binding(report: Report) -> dict[str, Any]:
+    generated = (report.definition or {}).get("generated")
+    if not report.artifact_uri or not report.artifact_fingerprint:
+        raise ServiceError(409, "REPORT_NOT_GENERATED", "The report version has no generated artifact.")
+    if isinstance(generated, dict):
+        gen_report_id = generated.get("report_id")
+        gen_version = generated.get("report_version")
+        if gen_report_id is not None and gen_report_id != report.id:
+            raise ServiceError(
+                409,
+                "REPORT_ARTIFACT_IDENTITY_MISMATCH",
+                "Generated report metadata belongs to a different report record.",
+            )
+        if gen_version is not None and gen_version != report.version_number:
+            raise ServiceError(
+                409,
+                "REPORT_ARTIFACT_IDENTITY_MISMATCH",
+                "Generated report metadata belongs to a different report version.",
+            )
+    return generated if isinstance(generated, dict) else {}
+
+
 def payload(db: Session, report_id: str) -> dict[str, Any]:
     report = _report(db, report_id)
-    if not report.artifact_uri or not report.artifact_fingerprint:
-        raise ServiceError(409, "REPORT_NOT_GENERATED", "The report has no generated payload.")
+    _verify_generated_binding(report)
     content = verified_artifact_bytes(
         get_artifact_store(), report.artifact_uri, report.artifact_fingerprint
     )
@@ -308,22 +429,39 @@ def payload(db: Session, report_id: str) -> dict[str, Any]:
         value = json.loads(content)
     except json.JSONDecodeError as error:
         raise ServiceError(409, "REPORT_ARTIFACT_INVALID", "The report artifact is not valid JSON.") from error
-    if (value.get("metadata") or {}).get("report_id") != report.id:
-        raise ServiceError(409, "REPORT_ARTIFACT_IDENTITY_MISMATCH", "Report artifact identity does not match its record.")
+    metadata = value.get("metadata") or {}
+    if metadata.get("report_id") != report.id or metadata.get("report_version") != report.version_number:
+        raise ServiceError(
+            409,
+            "REPORT_ARTIFACT_IDENTITY_MISMATCH",
+            "Report artifact identity or version does not match its record.",
+        )
     return value
 
 
 def export_csv(db: Session, report_id: str, user: Any) -> tuple[bytes, Report]:
     report = _report(db, report_id)
-    generated = (report.definition or {}).get("generated") or {}
+    generated = _verify_generated_binding(report)
     uri = generated.get("csv_artifact_uri")
     checksum = generated.get("csv_artifact_fingerprint")
     if not uri or not checksum:
         raise ServiceError(409, "REPORT_NOT_GENERATED", "The report has no generated CSV export.")
+    if generated.get("report_id") != report.id or generated.get("report_version") != report.version_number:
+        raise ServiceError(
+            409,
+            "REPORT_ARTIFACT_IDENTITY_MISMATCH",
+            "CSV export metadata does not match this report identity and version.",
+        )
+    # Also verify primary JSON payload integrity & identity before serving derived CSV.
+    payload(db, report_id)
     content = verified_artifact_bytes(get_artifact_store(), uri, checksum)
     record_audit(
         db, actor_user_id=user.id, action="report.exported", entity_type="report",
-        entity_id=report.id, after_state={"csv_artifact_fingerprint": checksum},
+        entity_id=report.id, after_state={
+            "report_version": report.version_number,
+            "csv_artifact_uri": uri,
+            "csv_artifact_fingerprint": checksum,
+        },
     )
     db.commit()
     return content, report

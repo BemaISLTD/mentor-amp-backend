@@ -60,20 +60,152 @@ def test_idi_markov_step_waives_premium_and_tracks_incurred_new_claims():
         monthly_premium=100.0,
         expense_per_policy_monthly=10.0,
         new_claim_dlr_factor=2.0,
+        new_claim_treatment="dlr_incurred",
     )
     waived = idi_markov_step(**common, waive_premium_on_disability=True)
     continued = idi_markov_step(**common, waive_premium_on_disability=False)
     assert waived["new_disabled"] == pytest.approx(0.024)
     assert waived["active_prob_close"] == pytest.approx(0.752)
     assert waived["disabled_surviving"] == pytest.approx(0.0912)
-    assert waived["disabled_prob_close"] == pytest.approx(0.1152)
+    # In DLR-incurred mode, newly incident claims are settled at incidence and
+    # NOT added to disabled_cohorts_close (preventing double counting).
+    assert waived["disabled_prob_close"] == pytest.approx(0.0912)
+    assert waived["disabled_cohorts_close"] == {4: pytest.approx(0.0912)}
     assert waived["expected_claim_benefit_outgo"] == pytest.approx(456.0)
     assert waived["expected_new_claim_incurred"] == pytest.approx(240.0)
     assert waived["expected_premium_inflow"] == pytest.approx(75.2)
-    assert continued["expected_premium_inflow"] == pytest.approx(86.72)
+    assert continued["expected_premium_inflow"] == pytest.approx(84.32)
     assert waived["net_liability_cash_flow"] == pytest.approx(
-        idi_net_liability_cash_flow(456.0, 8.672, 75.2, 240.0)
+        idi_net_liability_cash_flow(456.0, 8.432, 75.2, 240.0)
     )
+
+
+def test_idi_markov_step_rejects_double_counting_cohort_runoff_with_dlr():
+    with pytest.raises(ValueError, match="double-count"):
+        idi_markov_step(
+            p_active_open=1.0,
+            p_disabled_open=0.0,
+            q_mort_active_m=0.0,
+            q_lapse_m=0.0,
+            q_inc_m=0.1,
+            q_term_m=0.0,
+            q_mort_disabled_m=0.0,
+            elimination_months=0,
+            max_benefit_months=1,
+            monthly_benefit=1_000.0,
+            monthly_premium=0.0,
+            new_claim_dlr_factor=2.0,
+            new_claim_treatment="cohort_runoff",
+        )
+
+
+def test_idi_markov_step_tracks_multiple_incident_claim_cohorts_independently():
+    """Reproduces the reviewer's controlled 4-month cohort duration counterexample.
+
+    Controlled inputs: p_active_open=1.0, q_inc_m=0.1, zero other decrements,
+    elimination_months=0, max_benefit_months=1, monthly_benefit=1000, no expense/premium.
+    Hand-calculated benefits:
+      Month 1: 0.0   (0.10 enters cohort duration 0)
+      Month 2: 100.0 (cohort 0->1 pays 0.10*1000; 0.09 enters duration 0)
+      Month 3: 90.0  (cohort 0->1 pays 0.09*1000; cohort 1->2 past max=1 pays 0; 0.081 enters duration 0)
+      Month 4: 81.0  (cohort 0->1 pays 0.081*1000; older cohorts past max=1 pay 0)
+    """
+    active = 1.0
+    cohorts: dict[int, float] = {}
+    benefits = []
+    for _month in range(1, 5):
+        step = idi_markov_step(
+            p_active_open=active,
+            disabled_cohorts_open=cohorts,
+            q_mort_active_m=0.0,
+            q_lapse_m=0.0,
+            q_inc_m=0.1,
+            q_term_m=0.0,
+            q_mort_disabled_m=0.0,
+            elimination_months=0,
+            max_benefit_months=1,
+            monthly_benefit=1_000.0,
+            monthly_premium=0.0,
+            expense_per_policy_monthly=0.0,
+            new_claim_dlr_factor=0.0,
+            new_claim_treatment="cohort_runoff",
+        )
+        benefits.append(step["expected_claim_benefit_outgo"])
+        active = step["active_prob_close"]
+        cohorts = step["disabled_cohorts_close"]
+    assert benefits == pytest.approx([0.0, 100.0, 90.0, 81.0], abs=1e-9)
+    assert active == pytest.approx(0.9**4, abs=1e-12)
+    assert cohorts == {
+        0: pytest.approx(0.0729),
+        1: pytest.approx(0.081),
+        2: pytest.approx(0.09),
+        3: pytest.approx(0.10),
+    }
+
+
+def test_idi_cohort_runoff_elimination_max_benefit_recovery_mortality_and_waiver():
+    """Hand-calculated multi-month check with elimination=2, max_benefit=2, recovery=0.1, mort_d=0.05."""
+    retention = (1.0 - 0.1) * (1.0 - 0.05)  # 0.855
+    active = 1.0
+    cohorts: dict[int, float] = {}
+    benefits = []
+    waived_premiums = []
+    unwaived_premiums = []
+    for _month in range(1, 7):
+        step_w = idi_markov_step(
+            p_active_open=active,
+            disabled_cohorts_open=cohorts,
+            q_mort_active_m=0.0,
+            q_lapse_m=0.0,
+            q_inc_m=0.2,
+            q_term_m=0.1,
+            q_mort_disabled_m=0.05,
+            elimination_months=2,
+            max_benefit_months=2,
+            monthly_benefit=1_000.0,
+            monthly_premium=100.0,
+            waive_premium_on_disability=True,
+            new_claim_treatment="cohort_runoff",
+        )
+        step_u = idi_markov_step(
+            p_active_open=active,
+            disabled_cohorts_open=cohorts,
+            q_mort_active_m=0.0,
+            q_lapse_m=0.0,
+            q_inc_m=0.2,
+            q_term_m=0.1,
+            q_mort_disabled_m=0.05,
+            elimination_months=2,
+            max_benefit_months=2,
+            monthly_benefit=1_000.0,
+            monthly_premium=100.0,
+            waive_premium_on_disability=False,
+            new_claim_treatment="cohort_runoff",
+        )
+        benefits.append(step_w["expected_claim_benefit_outgo"])
+        waived_premiums.append(step_w["expected_premium_inflow"])
+        unwaived_premiums.append(step_u["expected_premium_inflow"])
+        active = step_w["active_prob_close"]
+        cohorts = step_w["disabled_cohorts_close"]
+
+    # New claims each month: c1=0.2, c2=0.16, c3=0.128, c4=0.1024, ...
+    # Elimination=2, max_benefit=2 -> pays at durations 3 and 4 only!
+    # Month 1: no surviving cohorts -> 0
+    # Month 2: c1 at dur 1 -> 0
+    # Month 3: c1 at dur 2, c2 at dur 1 -> 0
+    # Month 4: c1 at dur 3 (pays 0.2 * r^3 * 1000) -> 0.2 * 0.855^3 * 1000
+    # Month 5: c1 at dur 4 (0.2 * r^4) + c2 at dur 3 (0.16 * r^3)
+    # Month 6: c1 at dur 5 (expired=0) + c2 at dur 4 (0.16 * r^4) + c3 at dur 3 (0.128 * r^3)
+    expected_benefits = [
+        0.0,
+        0.0,
+        0.0,
+        0.2 * (retention**3) * 1_000.0,
+        (0.2 * (retention**4) + 0.16 * (retention**3)) * 1_000.0,
+        (0.16 * (retention**4) + 0.128 * (retention**3)) * 1_000.0,
+    ]
+    assert benefits == pytest.approx(expected_benefits, abs=1e-9)
+    assert all(u > w for u, w in zip(unwaived_premiums, waived_premiums))
 
 
 def test_idi_rejects_invalid_competing_decrements_and_nonfinite_values():

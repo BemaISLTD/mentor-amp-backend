@@ -1,5 +1,6 @@
 """Governed rollforward, report, derived-dataset, and run-step metadata."""
 
+from copy import deepcopy
 from typing import Any
 
 from sqlalchemy import func
@@ -282,6 +283,22 @@ def update_job(db: Session, job_id: str, payload: dict[str, Any], user: Any) -> 
     return job_detail(db, row.id)
 
 
+def _reusable_report_definition(definition: dict[str, Any] | None) -> dict[str, Any]:
+    """Copy reusable report configuration while stripping version-bound generated metadata."""
+    cleaned = deepcopy(definition or {})
+    cleaned.pop("generated", None)
+    return cleaned
+
+
+def _reject_reserved_report_definition(definition: dict[str, Any] | None) -> None:
+    if isinstance(definition, dict) and "generated" in definition:
+        raise ServiceError(
+            422,
+            "RESERVED_DEFINITION_KEY",
+            "Report definition key 'generated' is system-managed and cannot be supplied directly.",
+        )
+
+
 def _versioned_create(db: Session, model: type, project_id: str, payload: dict[str, Any], user: Any):
     _project_write(db, user, project_id)
     common = {
@@ -289,8 +306,10 @@ def _versioned_create(db: Session, model: type, project_id: str, payload: dict[s
         "created_by": user.id, "updated_by": user.id,
     }
     if model is Report:
+        definition = payload.get("definition") or {}
+        _reject_reserved_report_definition(definition)
         row = Report(**common, report_type=payload["report_type"],
-                     definition=payload.get("definition") or {})
+                     definition=_reusable_report_definition(definition))
     else:
         for run_id in payload.get("source_run_ids") or []:
             run = db.get(Run, run_id)
@@ -338,12 +357,15 @@ def update_versioned(db: Session, model: type, object_id: str, payload: dict[str
         raise conflict(f"Published {label.lower()} versions are immutable; create a new version.")
     if model is Report and (row.artifact_uri or row.artifact_fingerprint):
         raise conflict("Generated report versions are immutable; create a new version.")
+    if model is Report and "definition" in payload:
+        _reject_reserved_report_definition(payload["definition"])
     before = _state(row)
     fields = ("name", "description", "report_type", "definition", "dataset_type", "source_run_ids",
               "schema", "storage_uri", "storage_backend", "file_format", "row_count", "fingerprint")
     for field in fields:
         if field in payload and hasattr(row, field):
-            setattr(row, field, payload[field])
+            value = _reusable_report_definition(payload[field]) if (model is Report and field == "definition") else payload[field]
+            setattr(row, field, value)
     if model is DerivedDataset:
         for run_id in row.source_run_ids or []:
             run = db.get(Run, run_id)
@@ -369,7 +391,9 @@ def version_versioned(db: Session, model: type, object_id: str, user: Any):
         row = Report(
             project_id=source.project_id, name=source.name, report_type=source.report_type,
             description=source.description, version_number=number, parent_report_id=source.id,
-            definition=dict(source.definition or {}), created_by=user.id, updated_by=user.id,
+            definition=_reusable_report_definition(source.definition),
+            artifact_uri=None, artifact_fingerprint=None,
+            created_by=user.id, updated_by=user.id,
         )
     else:
         row = DerivedDataset(
@@ -394,6 +418,27 @@ def publish_versioned(db: Session, model: type, object_id: str, user: Any):
     label = "Report" if model is Report else "Derived dataset"
     row = _active(db, model, object_id, label)
     _project_write(db, user, row.project_id)
+    if row.status == "published":
+        raise ServiceError(
+            409,
+            "ALREADY_PUBLISHED",
+            f"{label} version is already published and immutable.",
+        )
+    if model is Report:
+        generated = (row.definition or {}).get("generated") or {}
+        if (
+            not row.artifact_uri
+            or not row.artifact_fingerprint
+            or not generated.get("csv_artifact_uri")
+            or not generated.get("csv_artifact_fingerprint")
+            or generated.get("report_id") != row.id
+            or generated.get("report_version") != row.version_number
+        ):
+            raise ServiceError(
+                409,
+                "REPORT_NOT_GENERATED",
+                "An ungenerated report cannot be published; generate this report version first.",
+            )
     before = _state(row)
     row.status = "published"
     row.published_by = user.id

@@ -225,13 +225,13 @@ def report_payload(report_id: str, user: ReportReader, db: Session = Depends(get
 @router.get("/reports/{report_id}/export.csv")
 def report_export(report_id: str, user: ReportReader, db: Session = Depends(get_db)):
     content, report = reporting_service.export_csv(db, report_id, user)
+    generated = (report.definition or {}).get("generated") or {}
     headers = {
         "Content-Disposition": f'attachment; filename="report-{report.id}-v{report.version_number}.csv"',
         "X-MentorAmp-Report-Id": report.id,
         "X-MentorAmp-Report-Version": str(report.version_number),
-        "X-MentorAmp-Synthetic": str(bool(
-            ((report.definition or {}).get("generated") or {}).get("is_synthetic")
-        )).lower(),
+        "X-MentorAmp-Synthetic": str(bool(generated.get("is_synthetic"))).lower(),
+        "X-MentorAmp-Complete": str(bool(generated.get("is_complete", False))).lower(),
     }
     return StreamingResponse(BytesIO(content), media_type="text/csv; charset=utf-8", headers=headers)
 

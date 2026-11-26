@@ -414,10 +414,71 @@ def _validate_life_row(number: int, item: dict[str, Any], issues: list[dict[str,
             if rider_premium is None or rider_premium < 0.0:
                 _product_error(issues, number, code, f"{slot}_premium", "Rider premium must be non-negative.", item)
 
-    for list_name in ("coverages", "riders"):
-        entries = item.get(list_name)
-        if entries is not None and not isinstance(entries, list):
-            _product_error(issues, number, code, list_name, f"{list_name} must be a structured list.", item)
+    seen_coverage_ids = {str(item.get("coverage_id") or "").strip()}
+    if coverage_2_id:
+        seen_coverage_ids.add(coverage_2_id)
+    coverages = item.get("coverages")
+    if coverages not in (None, ""):
+        if not isinstance(coverages, list):
+            _product_error(issues, number, code, "coverages", "coverages must be a structured list.", item)
+        else:
+            for idx, entry in enumerate(coverages):
+                col = f"coverages[{idx}]"
+                if not isinstance(entry, dict):
+                    issues.append(_issue("error", code, "Each coverage entry must be a mapping object.", number, col, entry))
+                    continue
+                cov_id = str(entry.get("coverage_id") or "").strip()
+                if not cov_id:
+                    issues.append(_issue("error", code, "Nested coverage requires non-empty coverage_id.", number, f"{col}.coverage_id", entry.get("coverage_id")))
+                elif cov_id in seen_coverage_ids:
+                    issues.append(_issue("error", code, "Nested coverage_id must be distinct from existing coverages.", number, f"{col}.coverage_id", cov_id))
+                else:
+                    seen_coverage_ids.add(cov_id)
+                cov_face = entry.get("face_amount")
+                if not _finite_number(cov_face) or cov_face <= 0.0:
+                    issues.append(_issue("error", code, "Nested coverage requires finite positive face_amount.", number, f"{col}.face_amount", cov_face))
+                cov_plan_raw = entry.get("life_plan_type", entry.get("plan_type"))
+                cov_plan = None
+                if cov_plan_raw not in (None, ""):
+                    cov_plan = str(cov_plan_raw).strip().upper()
+                    if cov_plan not in {"TERM", "WHOLE_LIFE", "UL", "IUL"}:
+                        issues.append(_issue("error", code, "Unsupported nested coverage plan_type.", number, f"{col}.plan_type", cov_plan_raw))
+                cov_term = entry.get("coverage_term_years", entry.get("term_years"))
+                if cov_term not in (None, ""):
+                    if not _finite_number(cov_term) or cov_term <= 0 or int(cov_term) != cov_term:
+                        issues.append(_issue("error", code, "Nested coverage term years must be a positive integer.", number, f"{col}.coverage_term_years", cov_term))
+                elif cov_plan == "TERM":
+                    issues.append(_issue("error", code, "Nested TERM coverage requires positive coverage_term_years.", number, f"{col}.coverage_term_years", cov_term))
+
+    seen_rider_codes = {
+        str(item.get(f"{slot}_code") or "").strip().upper()
+        for slot in ("rider_1", "rider_2")
+        if str(item.get(f"{slot}_code") or "").strip()
+    }
+    riders = item.get("riders")
+    if riders not in (None, ""):
+        if not isinstance(riders, list):
+            _product_error(issues, number, code, "riders", "riders must be a structured list.", item)
+        else:
+            for idx, entry in enumerate(riders):
+                col = f"riders[{idx}]"
+                if not isinstance(entry, dict):
+                    issues.append(_issue("error", code, "Each rider entry must be a mapping object.", number, col, entry))
+                    continue
+                r_code = str(entry.get("rider_code", entry.get("code")) or "").strip().upper()
+                if not r_code:
+                    issues.append(_issue("error", code, "Nested rider requires non-empty rider_code.", number, f"{col}.rider_code", entry.get("rider_code", entry.get("code"))))
+                elif r_code in seen_rider_codes:
+                    issues.append(_issue("error", code, "Nested rider_code must be distinct.", number, f"{col}.rider_code", r_code))
+                else:
+                    seen_rider_codes.add(r_code)
+                r_face = entry.get("face_amount", entry.get("benefit_limit"))
+                if not _finite_number(r_face) or r_face <= 0.0:
+                    issues.append(_issue("error", code, "Nested rider requires finite positive face_amount or benefit_limit.", number, f"{col}.face_amount", r_face))
+                if "premium" in entry and entry["premium"] not in (None, ""):
+                    r_prem = entry["premium"]
+                    if not _finite_number(r_prem) or r_prem < 0.0:
+                        issues.append(_issue("error", code, "Nested rider premium must be finite and non-negative.", number, f"{col}.premium", r_prem))
 
 
 def _register_builtin_products() -> None:

@@ -2,6 +2,22 @@
 
 Contract choices and synthetic tables remain pending Product Owner confirmation
 under ACT-P7-DEC-01 and ACT-P7-DEC-02.
+
+Selected Illustrative Claim-Duration Convention (Non-Double-Counting):
+- Existing disabled lives are tracked by exact claim duration in JSON state
+  ``disabled_cohorts_open`` / ``disabled_cohorts_surviving`` /
+  ``disabled_cohorts_close`` (mapping ``duration_months -> probability``).
+- Each month, surviving disabled cohorts advance by ``+1`` month and pay
+  ``monthly_benefit`` only while ``elimination_months < duration <= elimination_months + max_benefit_months``.
+- Newly incident claims from the active state never double-count:
+  * When ``new_claim_dlr_factor == 0.0`` (Option A — cohort runoff), newly
+    incident claims enter ``disabled_cohorts_close`` at duration ``0`` and pay
+    duration-gated monthly benefits in subsequent months (``expected_new_claim_incurred = 0.0``).
+  * When ``new_claim_dlr_factor > 0.0`` (Option B — DLR incurred cost), newly
+    incident claims are settled at incidence via
+    ``new_disabled * monthly_benefit * new_claim_dlr_factor`` and are NOT added
+    to ``disabled_cohorts_close``, while pre-existing disabled claims continue
+    their exact duration runoff.
 """
 
 from __future__ import annotations
@@ -10,16 +26,19 @@ import math
 
 from app.core.formula_engine.formulas import register_function
 from app.products.shared_modules.disability import (
-    idi_benefit_payable,
+    advance_disabled_cohorts,
+    idi_cohorts_benefit_payable,
     idi_net_liability_cash_flow,
     monthly_incidence_prob,
     monthly_termination_prob,
+    parse_disabled_cohorts,
+    serialize_disabled_cohorts,
 )
 
 PRODUCT_CODE = "IDI"
 PRODUCT_NAME = "Individual Disability Income (Illustrative)"
 FUNCTION_PREFIX = "idi_illustrative"
-IMPLEMENTATION_VERSION = "idi-illustrative-m7-v1"
+IMPLEMENTATION_VERSION = "idi-illustrative-m7-v2"
 
 ACTIVE_MORTALITY_TABLE = "IDI_ACTIVE_MORTALITY"
 INCIDENCE_TABLE = "IDI_INCIDENCE"
@@ -65,25 +84,21 @@ def active_probability_open(
     return float(active_prob_previous)
 
 
-def disabled_probability_open(
-    projection_month: float,
-    claim_status: str,
-    disabled_prob_previous: float,
-) -> float:
-    if int(projection_month) == 1:
-        return 1.0 if claim_status == "disabled" else 0.0
-    return float(disabled_prob_previous)
-
-
-def claim_elapsed_open(
+def disabled_cohorts_open(
     projection_month: float,
     claim_status: str,
     claim_months_elapsed: float,
-    claim_elapsed_previous: float,
-) -> float:
+    disabled_cohorts_previous: str,
+) -> str:
     if int(projection_month) == 1:
-        return float(claim_months_elapsed if claim_status == "disabled" else 0.0)
-    return float(claim_elapsed_previous)
+        if claim_status == "disabled":
+            return serialize_disabled_cohorts({int(claim_months_elapsed): 1.0})
+        return "{}"
+    return serialize_disabled_cohorts(parse_disabled_cohorts(disabled_cohorts_previous))
+
+
+def disabled_probability_open(disabled_cohorts_open: str) -> float:
+    return math.fsum(parse_disabled_cohorts(disabled_cohorts_open).values())
 
 
 def new_disabled(active_prob_open: float, q_inc_m: float) -> float:
@@ -102,20 +117,41 @@ def active_probability_close(
     return float(active_prob_open) * (1.0 - decrement)
 
 
-def disabled_surviving(
-    disabled_prob_open: float,
+def disabled_cohorts_surviving(
+    disabled_cohorts_open: str,
     q_term_m: float,
     q_mort_disabled_m: float,
-) -> float:
-    return float(disabled_prob_open) * (1.0 - float(q_term_m)) * (1.0 - float(q_mort_disabled_m))
+) -> str:
+    surviving = advance_disabled_cohorts(
+        parse_disabled_cohorts(disabled_cohorts_open),
+        q_term_m,
+        q_mort_disabled_m,
+    )
+    return serialize_disabled_cohorts(surviving)
 
 
-def disabled_probability_close(disabled_surviving: float, new_disabled: float) -> float:
-    return float(disabled_surviving) + float(new_disabled)
+def disabled_surviving(disabled_cohorts_surviving: str) -> float:
+    return math.fsum(parse_disabled_cohorts(disabled_cohorts_surviving).values())
 
 
-def claim_elapsed_close(claim_elapsed_open: float, disabled_prob_open: float) -> float:
-    return float(claim_elapsed_open) + 1.0 if float(disabled_prob_open) > 0.0 else 0.0
+def disabled_cohorts_close(
+    disabled_cohorts_surviving: str,
+    new_disabled: float,
+    new_claim_dlr_factor: float,
+) -> str:
+    cohorts = parse_disabled_cohorts(disabled_cohorts_surviving)
+    dlr = float(new_claim_dlr_factor)
+    if not math.isfinite(dlr) or dlr < 0.0:
+        raise ValueError("new_claim_dlr_factor must be finite and non-negative.")
+    # Prevent double counting: only track newly incident claims in cohort runoff
+    # when they are NOT settled at incidence via a positive DLR factor.
+    if dlr == 0.0 and float(new_disabled) > 0.0:
+        cohorts[0] = cohorts.get(0, 0.0) + float(new_disabled)
+    return serialize_disabled_cohorts(cohorts)
+
+
+def disabled_probability_close(disabled_cohorts_close: str) -> float:
+    return math.fsum(parse_disabled_cohorts(disabled_cohorts_close).values())
 
 
 def expected_premium_inflow(
@@ -132,18 +168,16 @@ def expected_premium_inflow(
 
 
 def expected_claim_benefit_outgo(
-    claim_elapsed_close: float,
+    disabled_cohorts_surviving: str,
     elimination_months: float,
     max_benefit_months: float,
     monthly_benefit: float,
-    disabled_surviving: float,
 ) -> float:
-    return idi_benefit_payable(
-        int(claim_elapsed_close),
+    return idi_cohorts_benefit_payable(
+        parse_disabled_cohorts(disabled_cohorts_surviving),
         int(elimination_months),
         int(max_benefit_months),
         monthly_benefit,
-        disabled_surviving,
     )
 
 
@@ -160,7 +194,10 @@ def expected_new_claim_incurred(
     monthly_benefit: float,
     new_claim_dlr_factor: float,
 ) -> float:
-    return float(new_disabled) * float(monthly_benefit) * float(new_claim_dlr_factor)
+    dlr = float(new_claim_dlr_factor)
+    if not math.isfinite(dlr) or dlr < 0.0:
+        raise ValueError("new_claim_dlr_factor must be finite and non-negative.")
+    return float(new_disabled) * float(monthly_benefit) * dlr
 
 
 def net_liability_cash_flow(
@@ -195,13 +232,14 @@ _FUNCTIONS = {
     "q_mort_disabled_monthly": q_mort_disabled_monthly,
     "incidence_probability": incidence_probability,
     "active_probability_open": active_probability_open,
+    "disabled_cohorts_open": disabled_cohorts_open,
     "disabled_probability_open": disabled_probability_open,
-    "claim_elapsed_open": claim_elapsed_open,
     "new_disabled": new_disabled,
     "active_probability_close": active_probability_close,
+    "disabled_cohorts_surviving": disabled_cohorts_surviving,
     "disabled_surviving": disabled_surviving,
+    "disabled_cohorts_close": disabled_cohorts_close,
     "disabled_probability_close": disabled_probability_close,
-    "claim_elapsed_close": claim_elapsed_close,
     "expected_premium_inflow": expected_premium_inflow,
     "expected_claim_benefit_outgo": expected_claim_benefit_outgo,
     "expected_expense_outgo": expected_expense_outgo,
@@ -290,11 +328,8 @@ VARIABLES = [
     _variable("active_prob_previous", "prior_output", unit="probability", source={
         "type": "prior_output", "variable": "active_prob_close", "offset": 1, "initial_value": 0.0,
     }),
-    _variable("disabled_prob_previous", "prior_output", unit="probability", source={
-        "type": "prior_output", "variable": "disabled_prob_close", "offset": 1, "initial_value": 0.0,
-    }),
-    _variable("claim_elapsed_previous", "prior_output", unit="month", source={
-        "type": "prior_output", "variable": "claim_elapsed_close", "offset": 1, "initial_value": 0.0,
+    _variable("disabled_cohorts_previous", "prior_output", data_type="string", source={
+        "type": "prior_output", "variable": "disabled_cohorts_close", "offset": 1, "initial_value": "{}",
     }),
 ]
 
@@ -305,15 +340,16 @@ _FORMULAS = [
     ("q_term_m", "q_term_monthly", ["q_term_annual"]),
     ("q_mort_disabled_m", "q_mort_disabled_monthly", ["q_mort_disabled_annual"]),
     ("active_prob_open", "active_probability_open", ["projection_month", "claim_status", "active_prob_previous"]),
-    ("disabled_prob_open", "disabled_probability_open", ["projection_month", "claim_status", "disabled_prob_previous"]),
-    ("claim_elapsed_open", "claim_elapsed_open", ["projection_month", "claim_status", "claim_months_elapsed", "claim_elapsed_previous"]),
+    ("disabled_cohorts_open", "disabled_cohorts_open", ["projection_month", "claim_status", "claim_months_elapsed", "disabled_cohorts_previous"]),
+    ("disabled_prob_open", "disabled_probability_open", ["disabled_cohorts_open"]),
     ("new_disabled", "new_disabled", ["active_prob_open", "q_inc_m"]),
     ("active_prob_close", "active_probability_close", ["active_prob_open", "q_mort_active_m", "q_lapse_m", "q_inc_m"]),
-    ("disabled_surviving", "disabled_surviving", ["disabled_prob_open", "q_term_m", "q_mort_disabled_m"]),
-    ("disabled_prob_close", "disabled_probability_close", ["disabled_surviving", "new_disabled"]),
-    ("claim_elapsed_close", "claim_elapsed_close", ["claim_elapsed_open", "disabled_prob_open"]),
+    ("disabled_cohorts_surviving", "disabled_cohorts_surviving", ["disabled_cohorts_open", "q_term_m", "q_mort_disabled_m"]),
+    ("disabled_surviving", "disabled_surviving", ["disabled_cohorts_surviving"]),
+    ("disabled_cohorts_close", "disabled_cohorts_close", ["disabled_cohorts_surviving", "new_disabled", "new_claim_dlr_factor"]),
+    ("disabled_prob_close", "disabled_probability_close", ["disabled_cohorts_close"]),
     ("expected_premium_inflow", "expected_premium_inflow", ["active_prob_close", "disabled_prob_close", "annual_premium", "waive_premium_on_disability"]),
-    ("expected_claim_benefit_outgo", "expected_claim_benefit_outgo", ["claim_elapsed_close", "elimination_months", "max_benefit_months", "monthly_benefit", "disabled_surviving"]),
+    ("expected_claim_benefit_outgo", "expected_claim_benefit_outgo", ["disabled_cohorts_surviving", "elimination_months", "max_benefit_months", "monthly_benefit"]),
     ("expected_expense_outgo", "expected_expense_outgo", ["active_prob_close", "disabled_prob_close", "expense_per_policy_monthly"]),
     ("expected_new_claim_incurred", "expected_new_claim_incurred", ["new_disabled", "monthly_benefit", "new_claim_dlr_factor"]),
     ("net_liability_cash_flow", "net_liability_cash_flow", ["expected_claim_benefit_outgo", "expected_expense_outgo", "expected_premium_inflow", "expected_new_claim_incurred"]),
@@ -321,10 +357,13 @@ _FORMULAS = [
     ("pv_net_cash_flow", "pv_net_cash_flow", ["net_liability_cash_flow", "discount_factor"]),
 ]
 
+_COHORT_STATE_VARS = {"disabled_cohorts_open", "disabled_cohorts_surviving", "disabled_cohorts_close"}
 for output, _function, _dependencies in _FORMULAS:
+    if output in _COHORT_STATE_VARS:
+        VARIABLES.append(_variable(output, "formula", data_type="string", unit=None, source={"type": "formula"}))
+        continue
     unit = (
         "probability" if output.startswith("q_") or "prob" in output or output in {"new_disabled", "disabled_surviving"}
-        else "month" if output in {"claim_elapsed_close", "claim_elapsed_open"}
         else "factor" if output == "discount_factor"
         else "USD"
     )

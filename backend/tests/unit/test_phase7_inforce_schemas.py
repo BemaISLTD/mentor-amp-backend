@@ -194,6 +194,52 @@ def test_life_multi_coverage_and_riders_validate_relationships():
     )
 
 
+def test_life_structured_nested_coverages_and_riders_validate_entries():
+    valid = life_row()
+    valid["coverages"] = [
+        {"coverage_id": "COV-NESTED-1", "plan_type": "TERM", "coverage_term_years": 10, "face_amount": 250_000.0},
+        {"coverage_id": "COV-NESTED-2", "life_plan_type": "WHOLE_LIFE", "face_amount": 100_000.0},
+    ]
+    valid["riders"] = [
+        {"rider_code": "ADB", "face_amount": 50_000.0, "premium": 12.5},
+        {"code": "WOP", "benefit_limit": 1_200.0, "premium": 0.0},
+    ]
+    assert errors(valid) == []
+
+    # Non-list rejected
+    bad_type = life_row()
+    bad_type["coverages"] = "not-a-list"
+    bad_type["riders"] = {"code": "ADB"}
+    bad_type_cols = {issue["column_name"] for issue in errors(bad_type)}
+    assert {"coverages", "riders"} <= bad_type_cols
+
+    # Malformed nested entries rejected (non-dict, duplicate IDs, non-positive face, invalid plan, missing TERM years, negative rider premium)
+    malformed = life_row()
+    malformed["coverages"] = [
+        "bad-entry",
+        {"coverage_id": "COV-1", "face_amount": -100.0, "plan_type": "BOGUS"},
+        {"coverage_id": "COV-TERM-NO-YRS", "plan_type": "TERM", "face_amount": 50_000.0},
+    ]
+    malformed["riders"] = [
+        123,
+        {"rider_code": "", "face_amount": 0.0, "premium": -5.0},
+        {"rider_code": "DUP", "face_amount": 10_000.0, "premium": 5.0},
+        {"rider_code": "DUP", "face_amount": 10_000.0, "premium": 5.0},
+    ]
+    found = errors(malformed)
+    cols = {issue["column_name"] for issue in found}
+    assert "coverages[0]" in cols
+    assert "coverages[1].coverage_id" in cols
+    assert "coverages[1].face_amount" in cols
+    assert "coverages[1].plan_type" in cols
+    assert "coverages[2].coverage_term_years" in cols
+    assert "riders[0]" in cols
+    assert "riders[1].rider_code" in cols
+    assert "riders[1].face_amount" in cols
+    assert "riders[1].premium" in cols
+    assert "riders[3].rider_code" in cols
+
+
 def test_term_requires_coverage_term_and_ul_cash_value_cannot_exceed_account_value():
     term = life_row()
     del term["coverage_term_years"]
